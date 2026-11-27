@@ -84,12 +84,13 @@ class TestIsTokenRevoked:
         assert result is True
 
     @pytest.mark.asyncio
-    async def test_redis_failure_returns_false(self, mock_redis):
-        """Redis 异常时返回 False，避免误杀 / Redis failure returns False to avoid false positives."""
+    @pytest.mark.behavioral
+    async def test_redis_failure_prevents_token_admission(self, mock_redis):
+        """Redis 异常时拒绝令牌 / Redis failure denies admission."""
         mock_redis.exists.side_effect = Exception("Redis unavailable")
         with patch("app.core.redis.get_redis_client", return_value=mock_redis):
             result = await is_token_revoked("jti-any")
-        assert result is False
+        assert result is True
 
 
 @pytest.mark.asyncio

@@ -6,7 +6,9 @@ Provides JWT token generation/verification, password hashing, token blacklist re
 """
 
 import uuid
-from datetime import timedelta
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from math import ceil
 from typing import Any
 
 import bcrypt
@@ -154,9 +156,138 @@ class TokenExpiredError(Exception):
 # Redis key prefix for token blacklist / Token 黑名单 Redis key 前缀
 TOKEN_BLACKLIST_PREFIX = "token_blacklist:"
 ACTIVE_TOKENS_PREFIX = "active_tokens:"
+REFRESH_TOKEN_FAMILY_CLAIM = "refresh_family_id"
+REFRESH_TOKEN_ROTATION_PREFIX = "refresh_token_rotation:"
+REFRESH_TOKEN_FAMILY_REVOKED_PREFIX = "refresh_token_family_revoked:"
+_REFRESH_ROTATION_INFLIGHT = "inflight"
+_REFRESH_ROTATION_COMPLETED = "completed"
+
+# 中文: claim 将 family 检查、旧 token 状态检查和占有写入放进一次 Redis 原子操作。
+# EN: Claim combines the family check, source-token state check, and ownership write atomically.
+_REFRESH_ROTATION_CLAIM_LUA = """-- refresh_rotation_claim
+if redis.call("EXISTS", KEYS[2]) == 1 then
+    return "revoked"
+end
+local state = redis.call("GET", KEYS[1])
+if not state then
+    redis.call("SET", KEYS[1], ARGV[1], "EX", ARGV[2])
+    return "claimed"
+end
+if state == ARGV[3] then
+    redis.call("SET", KEYS[2], "1", "EX", ARGV[4])
+    return "replayed"
+end
+return "inflight"
+"""
+
+# 中文: completion 同时检查族、来源 JTI 与 owner，登记后强退也不能提交后代。
+# EN: Completion checks family, source JTI and owner so logout after registration cannot commit descendants.
+_REFRESH_ROTATION_COMPLETE_LUA = """-- refresh_rotation_complete
+if redis.call("EXISTS", KEYS[2]) == 1 or redis.call("EXISTS", KEYS[3]) == 1 then
+    return 0
+end
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+redis.call("SET", KEYS[1], ARGV[2], "EX", ARGV[3])
+return 1
+"""
+
+# 中文: 并发撤族只延长有效期，不让较短后代覆盖较长会话的撤销期限。
+# EN: Concurrent family revocation only extends retention; a shorter child cannot shorten a longer session's fence.
+_REFRESH_FAMILY_REVOKE_LUA = """-- revoke_refresh_family
+local current_ttl = redis.call("TTL", KEYS[1])
+if current_ttl ~= -1 and current_ttl < tonumber(ARGV[1]) then
+    redis.call("SET", KEYS[1], "1", "EX", ARGV[1])
+end
+return 1
+"""
+
+# 中文: abort 同样按 owner 做 CAS，签发失败不会删除其他请求的 claim。
+# EN: Abort is owner-CAS as well, so mint failure never deletes another request's claim.
+_REFRESH_ROTATION_ABORT_LUA = """-- refresh_rotation_abort
+if redis.call("GET", KEYS[1]) ~= ARGV[1] then
+    return 0
+end
+return redis.call("DEL", KEYS[1])
+"""
 
 
-async def revoke_token(jti: str, ttl_seconds: int) -> None:
+@dataclass(frozen=True, slots=True)
+class RefreshTokenRotationClaim:
+    """中文: 一次 refresh 交换的独占凭据。
+
+    EN: Exclusive ownership proof for one refresh-token exchange attempt.
+    """
+
+    token_jti: str
+    family_id: str
+    ttl_seconds: int
+    owner_id: str
+
+    @property
+    def inflight_state(self) -> str:
+        """中文: 返回写入 Redis 的 owner-tagged 状态。
+
+        EN: Return the owner-tagged state persisted in Redis.
+        """
+        return f"{_REFRESH_ROTATION_INFLIGHT}:{self.owner_id}"
+
+
+def _normalize_refresh_family_id(value: object) -> str | None:
+    if not isinstance(value, str) or not 1 <= len(value) <= 128:
+        return None
+    if not all(char.isalnum() or char in {"-", "_", "."} for char in value):
+        return None
+    return value
+
+
+def _refresh_rotation_ttl(payload: dict[str, Any]) -> int | None:
+    exp = payload.get("exp")
+    if isinstance(exp, bool):
+        return None
+    try:
+        expires_at = datetime.fromtimestamp(float(exp), tz=timezone.utc)
+        ttl_seconds = ceil((expires_at - datetime.now(timezone.utc)).total_seconds())
+    except (TypeError, ValueError, OverflowError, OSError):
+        return None
+    return ttl_seconds if ttl_seconds > 0 else None
+
+
+def session_retention_seconds(minimum_seconds: int = 0) -> int:
+    """覆盖令牌寿命及后台可配置的一天会话上限。"""
+    return max(
+        minimum_seconds,
+        86400,
+        settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+        settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+    )
+
+
+def refresh_token_family_id(payload: dict[str, Any]) -> str | None:
+    """中文: 返回显式 family id，旧 refresh 则回退到 JTI。
+
+    EN: Return the explicit family id, falling back to a legacy refresh JTI.
+    """
+    explicit_family = payload.get(REFRESH_TOKEN_FAMILY_CLAIM)
+    if explicit_family is not None:
+        return _normalize_refresh_family_id(explicit_family)
+    if payload.get("type") != TOKEN_TYPE_REFRESH:
+        return None
+    return _normalize_refresh_family_id(payload.get("jti"))
+
+
+def create_refresh_token_family_id() -> str:
+    """中文: 创建一个 token 谱系共享的不透明 family id。
+
+    EN: Create a validated opaque family id shared by one token lineage.
+    """
+    return str(uuid.uuid4())
+
+
+async def revoke_token(
+    jti: str, ttl_seconds: int, *, raise_on_error: bool = False
+) -> None:
     """
     将 Token 加入黑名单（吊销）/ Revoke token by adding to blacklist.
 
@@ -171,9 +302,9 @@ async def revoke_token(jti: str, ttl_seconds: int) -> None:
         key = f"{TOKEN_BLACKLIST_PREFIX}{jti}"
         await client.setex(key, ttl_seconds, "1")
     except Exception as exc:
-        logger.debug(
-            "Token blacklist add failed: {}", exc
-        )  # Redis 不可用时静默失败，Token 将在自然过期后失效
+        logger.debug("Token blacklist add failed: {}", exc)
+        if raise_on_error:
+            raise
 
 
 def _decode_token_no_blacklist(token: str) -> dict[str, Any] | None:
@@ -204,8 +335,185 @@ async def is_token_revoked(jti: str | None) -> bool:
         client = get_redis_client()
         key = f"{TOKEN_BLACKLIST_PREFIX}{jti}"
         return bool(await client.exists(key))
-    except Exception:
-        return False  # Redis 不可用时视为未吊销，避免误杀
+    except Exception as exc:
+        logger.warning("Token revocation lookup failed closed: {}", type(exc).__name__)
+        return True
+
+
+async def is_refresh_token_family_revoked(
+    family_id: str | None,
+    *,
+    raise_on_error: bool = False,
+) -> bool:
+    """中文: 检查 refresh family 的持久 replay 撤销标记。
+
+    EN: Check the durable replay-revocation marker for a refresh family.
+    """
+    normalized_family_id = _normalize_refresh_family_id(family_id)
+    if normalized_family_id is None:
+        return True
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        return bool(
+            await client.exists(
+                f"{REFRESH_TOKEN_FAMILY_REVOKED_PREFIX}{normalized_family_id}"
+            )
+        )
+    except Exception as exc:
+        if raise_on_error:
+            raise
+        logger.warning(
+            "Refresh token family revocation lookup failed closed: {}",
+            type(exc).__name__,
+        )
+        return True
+
+
+async def revoke_refresh_token_family(
+    family_id: str,
+    *,
+    ttl_seconds: int | None = None,
+    raise_on_error: bool = False,
+) -> bool:
+    """中文: 同时失效同一 family 的 access 与 refresh 后代。
+
+    EN: Invalidate access and refresh descendants belonging to one family.
+    """
+    normalized_family_id = _normalize_refresh_family_id(family_id)
+    if normalized_family_id is None:
+        return False
+    effective_ttl = session_retention_seconds(ttl_seconds or 0)
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        committed = await client.eval(
+            _REFRESH_FAMILY_REVOKE_LUA,
+            1,
+            f"{REFRESH_TOKEN_FAMILY_REVOKED_PREFIX}{normalized_family_id}",
+            str(effective_ttl),
+        )
+        return bool(committed)
+    except Exception as exc:
+        logger.warning(
+            "Refresh token family revocation write failed: {}",
+            type(exc).__name__,
+        )
+        if raise_on_error:
+            raise
+        return False
+
+
+async def claim_refresh_token_rotation(
+    payload: dict[str, Any],
+) -> RefreshTokenRotationClaim | None:
+    """中文: 原子占有一次 refresh 交换。
+
+    EN: A simultaneous duplicate observes ``inflight`` and is denied without
+    penalizing the winner. A later replay observes ``completed`` and revokes
+    the whole family, including already-issued descendant access tokens. Redis
+    failure is fail-closed.
+    """
+    if payload.get("type") != TOKEN_TYPE_REFRESH:
+        return None
+    token_jti = _normalize_refresh_family_id(payload.get("jti"))
+    family_id = refresh_token_family_id(payload)
+    ttl_seconds = _refresh_rotation_ttl(payload)
+    if token_jti is None or family_id is None or ttl_seconds is None:
+        return None
+
+    rotation_key = f"{REFRESH_TOKEN_ROTATION_PREFIX}{token_jti}"
+    family_key = f"{REFRESH_TOKEN_FAMILY_REVOKED_PREFIX}{family_id}"
+    owner_id = str(uuid.uuid4())
+    inflight_state = f"{_REFRESH_ROTATION_INFLIGHT}:{owner_id}"
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        result = await client.eval(
+            _REFRESH_ROTATION_CLAIM_LUA,
+            2,
+            rotation_key,
+            family_key,
+            inflight_state,
+            str(ttl_seconds),
+            _REFRESH_ROTATION_COMPLETED,
+            str(session_retention_seconds(ttl_seconds)),
+        )
+        if isinstance(result, bytes):
+            result = result.decode("utf-8", errors="replace")
+        if result == "claimed":
+            return RefreshTokenRotationClaim(
+                token_jti=token_jti,
+                family_id=family_id,
+                ttl_seconds=ttl_seconds,
+                owner_id=owner_id,
+            )
+        return None
+    except Exception as exc:
+        logger.warning(
+            "Refresh token rotation claim failed closed: {}",
+            type(exc).__name__,
+        )
+        return None
+
+
+async def complete_refresh_token_rotation(
+    claim: RefreshTokenRotationClaim,
+) -> bool:
+    """中文: 仅由当前 owner 消耗 refresh；已撤族时返回 False。
+
+    EN: Mark the refresh spent only for its owner; return False for a revoked family.
+    """
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        completed = await client.eval(
+            _REFRESH_ROTATION_COMPLETE_LUA,
+            3,
+            f"{REFRESH_TOKEN_ROTATION_PREFIX}{claim.token_jti}",
+            f"{REFRESH_TOKEN_FAMILY_REVOKED_PREFIX}{claim.family_id}",
+            f"{TOKEN_BLACKLIST_PREFIX}{claim.token_jti}",
+            claim.inflight_state,
+            _REFRESH_ROTATION_COMPLETED,
+            str(max(1, claim.ttl_seconds)),
+        )
+        return bool(completed)
+    except Exception as exc:
+        logger.warning(
+            "Refresh token rotation completion failed closed: {}",
+            type(exc).__name__,
+        )
+        return False
+
+
+async def abort_refresh_token_rotation(
+    claim: RefreshTokenRotationClaim,
+) -> bool:
+    """中文: 签发失败时仅释放调用方仍持有的 claim。
+
+    EN: Release only the claim still owned by the caller after mint failure.
+    """
+    try:
+        from app.core.redis import get_redis_client
+
+        client = get_redis_client()
+        aborted = await client.eval(
+            _REFRESH_ROTATION_ABORT_LUA,
+            1,
+            f"{REFRESH_TOKEN_ROTATION_PREFIX}{claim.token_jti}",
+            claim.inflight_state,
+        )
+        return bool(aborted)
+    except Exception as exc:
+        logger.warning(
+            "Refresh token rotation abort failed closed: {}",
+            type(exc).__name__,
+        )
+        return False
 
 
 async def decode_token(
@@ -235,6 +543,11 @@ async def decode_token(
         if not jti:
             return None
         if await is_token_revoked(jti):
+            return None
+        if (
+            REFRESH_TOKEN_FAMILY_CLAIM in payload
+            and await is_refresh_token_family_revoked(refresh_token_family_id(payload))
+        ):
             return None
         return payload
     except ExpiredSignatureError as exc:
@@ -379,21 +692,24 @@ def create_token_pair(
     Args:
         subject: Token 主体 / Token subject
         scope: Token 作用域（用户类型） / Token scope (user type)
-        extra_claims: 附加访问声明，企业会话代际也写入刷新令牌 /
-            Extra access claims. The tenant session epoch also goes on the refresh token.
+        extra_claims: 附加访问声明，刷新令牌同时携带会话族和租户代际 /
+            Extra access claims. Both tokens carry the refresh family and tenant epoch.
 
     Returns:
         包含 access_token、refresh_token、access_jti、refresh_jti 的字典
         Dict with access_token, refresh_token, access_jti, refresh_jti
     """
+    pair_claims = dict(extra_claims or {})
+    if REFRESH_TOKEN_FAMILY_CLAIM not in pair_claims:
+        pair_claims[REFRESH_TOKEN_FAMILY_CLAIM] = create_refresh_token_family_id()
     access_token, access_jti = create_access_token(
-        subject, scope=scope, extra_claims=extra_claims
+        subject, scope=scope, extra_claims=pair_claims
     )
-    refresh_claims = None
-    if extra_claims is not None and TENANT_SESSION_EPOCH_CLAIM in extra_claims:
-        refresh_claims = {
-            TENANT_SESSION_EPOCH_CLAIM: extra_claims[TENANT_SESSION_EPOCH_CLAIM]
-        }
+    refresh_claims = {
+        claim: pair_claims[claim]
+        for claim in (REFRESH_TOKEN_FAMILY_CLAIM, TENANT_SESSION_EPOCH_CLAIM)
+        if claim in pair_claims
+    }
     refresh_token, refresh_jti = create_refresh_token(
         subject, scope=scope, extra_claims=refresh_claims
     )
@@ -551,5 +867,17 @@ __all__ = [
     "TOKEN_SCOPE_TENANT_USER",
     "TENANT_SESSION_EPOCH_CLAIM",
     "tenant_session_epoch_matches",
+    "REFRESH_TOKEN_FAMILY_CLAIM",
+    "REFRESH_TOKEN_ROTATION_PREFIX",
+    "REFRESH_TOKEN_FAMILY_REVOKED_PREFIX",
+    "RefreshTokenRotationClaim",
+    "refresh_token_family_id",
+    "session_retention_seconds",
+    "create_refresh_token_family_id",
+    "is_refresh_token_family_revoked",
+    "revoke_refresh_token_family",
+    "claim_refresh_token_rotation",
+    "complete_refresh_token_rotation",
+    "abort_refresh_token_rotation",
     "IMPERSONATE_TOKEN_EXPIRE_SECONDS",
 ]

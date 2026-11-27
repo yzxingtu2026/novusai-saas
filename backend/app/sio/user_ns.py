@@ -15,6 +15,7 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 
 from app.core.logging import LogManager
 from app.core.security import (
+    REFRESH_TOKEN_FAMILY_CLAIM,
     TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_TENANT_USER,
     TokenExpiredError,
@@ -148,6 +149,7 @@ class UserNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 TENANT_SESSION_EPOCH_CLAIM: session_epoch,
                 "token_jti": payload.get("jti"),
                 "token_exp": payload.get("exp"),
+                REFRESH_TOKEN_FAMILY_CLAIM: payload.get(REFRESH_TOKEN_FAMILY_CLAIM),
                 "trace_id": trace_id_var.get(),
             }
             await self.save_session(sid, session_data)

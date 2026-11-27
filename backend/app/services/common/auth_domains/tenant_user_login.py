@@ -30,6 +30,7 @@ from app.exceptions import (
 )
 from app.models import Tenant, TenantAdmin, TenantUser
 from app.services.common.auth_domains.login_security import password_login_query
+from app.services.common.auth_domains.refresh_rotation import rotate_refresh_token
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -373,19 +374,16 @@ class TenantUserTokenDomain:
             )
             raise AuthenticationException(message=_("auth.account_disabled"))
 
-        tokens = self._service._create_token_pair(
-            user.id,
+        tokens = await rotate_refresh_token(
+            self._service,
+            payload,
+            subject=user.id,
             scope=TOKEN_SCOPE_TENANT_USER,
+            user_type="tenant_user",
             extra_claims={
                 "tenant_id": user.tenant_id,
                 TENANT_SESSION_EPOCH_CLAIM: epoch,
             },
-        )
-        await self._service._record_active_tokens(
-            "tenant_user",
-            str(user.id),
-            tokens["access_jti"],
-            tokens["refresh_jti"],
         )
         self._service._log_auth_info(
             "tenant_user.token.refresh.success",

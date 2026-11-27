@@ -303,6 +303,7 @@ class TestAdminLogin:
                 "app.services.common.auth_service.create_refresh_token",
                 return_value=("refresh_tok", "refresh_jti_ok"),
             ),
+            patch.object(service, "_record_active_tokens", new_callable=AsyncMock),
         ):
             result = await service.authenticate_admin("admin", "correct_password")
 
@@ -564,6 +565,9 @@ class TestTenantAdminLogin:
 
     @pytest.mark.asyncio
     async def test_issue_login_tokens_uses_tenant_session_timeout(self, mock_db):
+        from uuid import UUID
+
+        from app.core.security import REFRESH_TOKEN_FAMILY_CLAIM
         from app.services.common.auth_service import AuthService
 
         tenant_admin = _make_tenant_admin(id=7, tenant_id=3)
@@ -606,12 +610,17 @@ class TestTenantAdminLogin:
             default=None,
         )
         mock_platform_config.assert_not_awaited()
+        family_id = mock_create_access_token.call_args.kwargs["extra_claims"][
+            REFRESH_TOKEN_FAMILY_CLAIM
+        ]
+        assert str(UUID(family_id)) == family_id
         mock_create_access_token.assert_called_once_with(
             subject=tenant_admin.id,
             scope="tenant_admin",
             expires_delta=timedelta(minutes=45),
             extra_claims={
                 "tenant_id": tenant_admin.tenant_id,
+                REFRESH_TOKEN_FAMILY_CLAIM: family_id,
                 "tenant_session_epoch": tenant.session_revocation_epoch,
             },
         )
@@ -620,6 +629,7 @@ class TestTenantAdminLogin:
             scope="tenant_admin",
             extra_claims={
                 "tenant_id": tenant_admin.tenant_id,
+                REFRESH_TOKEN_FAMILY_CLAIM: family_id,
                 "tenant_session_epoch": tenant.session_revocation_epoch,
             },
         )
@@ -629,7 +639,7 @@ class TestTenantAdminImpersonation:
     """企业管理员一键登录测试 / Tenant admin impersonation tests."""
 
     @pytest.mark.asyncio
-    async def test_impersonate_accepts_real_one_click_token(self, mock_db):
+    async def test_impersonate_accepts_real_one_click_token(self, mock_db, mock_redis):
         from app.core.security import (
             TOKEN_SCOPE_TENANT_ADMIN,
             create_impersonate_token,
@@ -653,6 +663,7 @@ class TestTenantAdminImpersonation:
         )
 
         with (
+            patch("app.core.redis.get_redis_client", return_value=mock_redis),
             patch.object(
                 service,
                 "_create_token_pair",

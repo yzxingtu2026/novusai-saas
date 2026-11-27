@@ -6,9 +6,13 @@ from typing import Any
 
 from socketio import AsyncRedisManager
 
-from app.sio.socket_trace import tenant_socket_session_is_current
+from app.sio.socket_trace import (
+    socket_token_is_current,
+    tenant_socket_session_is_current,
+)
 
 _NAMESPACE_SCOPES = {
+    "/admin": "admin",
     "/tenant": "tenant_admin",
     "/user": "tenant_user",
 }
@@ -45,16 +49,18 @@ class SessionValidatedRedisManager(AsyncRedisManager):
                 if not isinstance(session, dict):
                     continue
                 user_type = session.get("user_type")
-                if scope is None and user_type == "admin":
-                    eligible.add(sid)
-                    continue
                 if scope is not None and user_type != scope:
                     continue
                 # 强退事件用于结束已撤销的会话 / Force-logout tells revoked sessions to close.
                 force_logout = (
                     event == "force_logout" and room == f"user:{session.get('user_id')}"
                 )
-                if force_logout or await tenant_socket_session_is_current(session):
+                is_current = (
+                    socket_token_is_current
+                    if user_type == "admin"
+                    else tenant_socket_session_is_current
+                )
+                if force_logout or await is_current(session):
                     eligible.add(sid)
             except Exception:
                 continue

@@ -12,9 +12,11 @@ from sqlalchemy.orm import selectinload
 from app.core.config import settings
 from app.core.i18n import _
 from app.core.security import (
+    REFRESH_TOKEN_FAMILY_CLAIM,
     TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_TENANT_ADMIN,
     TOKEN_TYPE_REFRESH,
+    create_refresh_token_family_id,
     get_token_payload_with_scope,
     normalize_positive_subject_id,
     tenant_session_epoch_matches,
@@ -23,6 +25,7 @@ from app.enums import ErrorCode
 from app.exceptions import AuthenticationException, BusinessException, NotFoundException
 from app.models import Admin, Tenant, TenantAdmin
 from app.services.common.auth_domains.login_security import password_login_query
+from app.services.common.auth_domains.refresh_rotation import rotate_refresh_token
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -102,6 +105,7 @@ class AuthTenantAdminDomain:
 
         extra_claims = {
             "tenant_id": tenant_admin.tenant_id,
+            REFRESH_TOKEN_FAMILY_CLAIM: create_refresh_token_family_id(),
             TENANT_SESSION_EPOCH_CLAIM: tenant.session_revocation_epoch,
         }
         access_token, access_jti = self._service._create_access_token(
@@ -418,19 +422,16 @@ class AuthTenantAdminDomain:
             )
             raise AuthenticationException(message=_("auth.account_disabled"))
 
-        tokens = self._service._create_token_pair(
-            tenant_admin.id,
+        tokens = await rotate_refresh_token(
+            self._service,
+            payload,
+            subject=tenant_admin.id,
             scope=TOKEN_SCOPE_TENANT_ADMIN,
+            user_type="tenant_admin",
             extra_claims={
                 "tenant_id": tenant_admin.tenant_id,
                 TENANT_SESSION_EPOCH_CLAIM: epoch,
             },
-        )
-        await self._service._record_active_tokens(
-            "tenant_admin",
-            str(tenant_admin.id),
-            tokens["access_jti"],
-            tokens["refresh_jti"],
         )
         self._service._log_auth_info(
             "tenant_admin.token.refresh.success",
