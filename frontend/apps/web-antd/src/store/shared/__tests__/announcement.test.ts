@@ -2,10 +2,14 @@
 // Test type: behavioral
 // Scope: Pending announcement queue ordering and submit progression.
 // Mock strategy: API modules and notification unread refresh transport are mocked; Pinia store logic runs real.
-import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { useAccessStore, useUserStore } from '@vben/stores';
+
+import { createPinia, disposePinia, setActivePinia } from 'pinia';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { useAnnouncementStore, useNotificationStore } from '#/store';
+
+import { TokenStorage } from '../token-storage';
 
 const {
   adminPendingMock,
@@ -13,6 +17,7 @@ const {
   adminSubmitMock,
   adminMineMock,
   requestGetMock,
+  requestMeMock,
   tenantMineMock,
   tenantPendingMock,
   tenantReadMock,
@@ -23,6 +28,7 @@ const {
   adminReadMock: vi.fn(),
   adminSubmitMock: vi.fn(),
   requestGetMock: vi.fn(),
+  requestMeMock: vi.fn(),
   tenantMineMock: vi.fn(),
   tenantPendingMock: vi.fn(),
   tenantReadMock: vi.fn(),
@@ -44,10 +50,29 @@ vi.mock('#/api/tenant/announcement', () => ({
 }));
 
 vi.mock('#/utils/request', () => ({
+  baseRequestClient: { instance: { get: requestMeMock } },
   requestClient: {
     get: requestGetMock,
   },
 }));
+
+function authenticate(endpoint: 'admin' | 'tenant') {
+  const token = `fixture-${endpoint}-token`;
+  TokenStorage.setToken(endpoint, token);
+  useAccessStore().setAccessToken(token);
+  useUserStore().setUserInfo({
+    avatar: '',
+    realName: 'Fixture user',
+    userId: '1',
+    username: 'fixture-user',
+  });
+  requestMeMock.mockResolvedValue({
+    data: {
+      code: 0,
+      data: { id: 1, tenant_id: endpoint === 'tenant' ? 10 : undefined },
+    },
+  });
+}
 
 function pending(id: number, publishedAt: string) {
   return {
@@ -79,8 +104,12 @@ function optionalPending(id: number, publishedAt: string) {
 }
 
 describe('useAnnouncementStore', () => {
+  let pinia: ReturnType<typeof createPinia>;
   beforeEach(() => {
-    setActivePinia(createPinia());
+    pinia = createPinia();
+    setActivePinia(pinia);
+    localStorage.clear();
+    TokenStorage.init('announcement-test');
     window.history.pushState({}, '', '/admin/system/announcements');
     adminMineMock.mockReset();
     adminPendingMock.mockReset();
@@ -92,7 +121,10 @@ describe('useAnnouncementStore', () => {
     tenantSubmitMock.mockReset();
     requestGetMock.mockReset();
     requestGetMock.mockResolvedValue({ count: 0 });
+    requestMeMock.mockReset();
   });
+
+  afterEach(() => disposePinia(pinia));
 
   it('loads pending admin announcements from old to new', async () => {
     adminPendingMock.mockResolvedValue([
@@ -147,6 +179,7 @@ describe('useAnnouncementStore', () => {
 
   it('submits current tenant announcement and advances the queue', async () => {
     window.history.pushState({}, '', '/tenant/system/announcements');
+    authenticate('tenant');
     tenantPendingMock.mockResolvedValue([
       pending(10, '2026-04-28T16:00:00Z'),
       pending(11, '2026-04-28T17:00:00Z'),
@@ -163,12 +196,13 @@ describe('useAnnouncementStore', () => {
 
     expect(tenantSubmitMock).toHaveBeenCalledWith(10, { agree: true });
     expect(store.pendingQueue.map((item) => item.id)).toEqual([11]);
-    expect(requestGetMock).toHaveBeenCalledWith(
+    expect(requestGetMock.mock.calls.map(([url]) => url)).toContain(
       '/tenant/notifications/unread-count',
     );
   });
 
   it('marks optional announcements read and advances the global modal queue', async () => {
+    authenticate('admin');
     adminPendingMock.mockResolvedValue([
       optionalPending(20, '2026-04-28T16:00:00Z'),
       pending(21, '2026-04-28T17:00:00Z'),
@@ -185,7 +219,7 @@ describe('useAnnouncementStore', () => {
 
     expect(adminReadMock).toHaveBeenCalledWith(20);
     expect(store.pendingQueue.map((item) => item.id)).toEqual([21]);
-    expect(requestGetMock).toHaveBeenCalledWith(
+    expect(requestGetMock.mock.calls.map(([url]) => url)).toContain(
       '/admin/notifications/unread-count',
     );
   });

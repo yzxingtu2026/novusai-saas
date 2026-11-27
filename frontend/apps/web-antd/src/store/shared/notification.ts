@@ -1,21 +1,18 @@
-/**
- * Notification store / 通知 Store
- *
- * Manages notification data, unread count, and integrates Socket.IO real-time push.
- * 管理通知数据、未读计数，集成 Socket.IO 实时推送。
- */
+import type { HttpResponse } from '#/utils/request';
 
-import { ref } from 'vue';
+import { onScopeDispose, ref, watch } from 'vue';
+
+import { useAccessStore, useUserStore } from '@vben/stores';
 
 import { defineStore } from 'pinia';
 
 import { useNotificationToast } from '#/composables/use-notification-toast';
 import { resolveEndpointByPath } from '#/constants/endpoints';
-import { requestClient } from '#/utils/request';
+import { baseRequestClient, requestClient } from '#/utils/request';
 
 import { useSocketIOStore } from './socketio';
+import { TokenStorage } from './token-storage';
 
-/** Notification item / 通知项 */
 export interface NotificationItem {
   id: number;
   template_code?: null | string;
@@ -30,7 +27,6 @@ export interface NotificationItem {
   created_at?: null | string;
 }
 
-/** Notification list API response / 通知列表 API 响应 */
 interface NotificationListResponse {
   items: NotificationItem[];
   total: number;
@@ -38,7 +34,6 @@ interface NotificationListResponse {
   page_size: number;
 }
 
-/** Socket.IO pushed notification data / Socket.IO 推送的通知数据 */
 interface NotificationPushData {
   id?: null | number;
   type: string;
@@ -50,75 +45,250 @@ interface NotificationPushData {
   priority: string;
 }
 
-const LOCAL_NOTIF_KEY = 'novus_local_notifications';
+type NotificationEndpoint = 'admin' | 'tenant';
 
-/** Load local notifications from localStorage / 从 localStorage 恢复本地通知 */
-function _loadLocalNotifications(): NotificationItem[] {
+interface NotificationSession {
+  cacheKey: null | string;
+  controller: AbortController;
+  endpoint: NotificationEndpoint;
+  token: string;
+  userId: string;
+}
+
+const LEGACY_CACHE_KEY = 'novus_local_notifications';
+
+function loadLocalNotifications(key: string): NotificationItem[] {
   try {
-    const raw = localStorage.getItem(LOCAL_NOTIF_KEY);
-    return raw ? (JSON.parse(raw) as NotificationItem[]) : [];
+    const raw = localStorage.getItem(key);
+    const items: unknown = raw ? JSON.parse(raw) : null;
+    return Array.isArray(items)
+      ? items.filter(
+          (item) =>
+            item &&
+            Number.isSafeInteger(item.id) &&
+            item.id < 0 &&
+            typeof item.title === 'string' &&
+            typeof item.is_read === 'boolean',
+        )
+      : [];
   } catch {
     return [];
   }
 }
 
-/** Save local notifications to localStorage / 保存本地通知到 localStorage */
-function _saveLocalNotifications(items: NotificationItem[]) {
+function removeLocalNotifications(key: string) {
   try {
-    const local = items.filter((n) => n.id < 0);
-    if (local.length > 0) {
-      localStorage.setItem(LOCAL_NOTIF_KEY, JSON.stringify(local));
-    } else {
-      localStorage.removeItem(LOCAL_NOTIF_KEY);
-    }
+    localStorage.removeItem(key);
   } catch {
-    // Silent failure / 静默失败 (Silent failure)
+    // 浏览器可能禁用了本地缓存。
   }
 }
 
-export const useNotificationStore = defineStore('notification', () => {
-  // ============================================================
-  // State / 状态
-  // ============================================================
+function identityPart(value: unknown): null | string {
+  if (typeof value === 'number' && Number.isSafeInteger(value) && value > 0) {
+    return String(value);
+  }
+  return typeof value === 'string' && /^[1-9]\d*$/.test(value) ? value : null;
+}
 
-  const notifications = ref<NotificationItem[]>(_loadLocalNotifications());
-  const unreadCount = ref(notifications.value.filter((n) => !n.is_read).length);
+export const useNotificationStore = defineStore('notification', () => {
+  const accessStore = useAccessStore();
+  const userStore = useUserStore();
+  const notifications = ref<NotificationItem[]>([]);
+  const unreadCount = ref(0);
   const loading = ref(false);
-  const initialized = ref(false);
+  const confirmedReads = new Map<number, null | string | undefined>();
+  const deletedIds = new Set<number>();
   const seenPushIds = new Set<number>();
   const pendingPushIds = new Set<number>();
-  let sessionGeneration = 0;
-  let listGeneration = 0;
+  const pendingReads = new Set<number>();
+  const pendingDeletes = new Set<number>();
+  let pendingWrites = 0;
+  let countMutation = 0;
+  let countRequest = 0;
+  let listRequest = 0;
+  let temporaryId = -Date.now();
+  let currentEndpoint: NotificationEndpoint | null = null;
+  let verifiedPrincipal: null | string = null;
+  let session: NotificationSession | null = null;
+  let verification: null | Promise<void> = null;
+  let wantsSocket = false;
+  let socketHandler: ((data: unknown) => void) | null = null;
 
-  /** Explicit endpoint override (fallback only) / 显式端覆盖（仅作为兜底） */
-  let currentEndpoint: 'admin' | 'tenant' | null = null;
-  /** Fixed reference for unregister, avoiding handler leak / 固定引用避免泄漏 */
-  const handleSocketNotification = (raw: unknown) => {
-    const data = raw as NotificationPushData;
-    if (!data?.title) return;
+  function resolveNotificationEndpoint(): NotificationEndpoint | null {
+    if (typeof window === 'undefined') return currentEndpoint;
+    const { hash, hostname, pathname } = window.location;
+    const hashRoute = hash.match(/^#(\/.*)$/)?.[1];
+    const endpoint = resolveEndpointByPath(hashRoute ?? pathname, hostname);
+    return endpoint === 'admin' || endpoint === 'tenant' ? endpoint : null;
+  }
 
-    const id =
-      typeof data.id === 'number' &&
-      Number.isSafeInteger(data.id) &&
-      data.id > 0
-        ? data.id
-        : null;
-    if (id !== null) {
-      if (seenPushIds.has(id)) return;
-      seenPushIds.add(id);
-      if (notifications.value.some((item) => item.id === id)) {
-        void loadUnreadCount();
-        return;
-      }
-      pendingPushIds.add(id);
+  function currentToken(endpoint: NotificationEndpoint) {
+    const token = accessStore.accessToken;
+    return !accessStore.loginExpired &&
+      token &&
+      TokenStorage.getToken(endpoint) === token
+      ? token
+      : null;
+  }
+
+  function isCurrent(context: NotificationSession) {
+    return (
+      session === context &&
+      context.endpoint === resolveNotificationEndpoint() &&
+      context.token === currentToken(context.endpoint) &&
+      context.userId === identityPart(userStore.userInfo?.userId)
+    );
+  }
+
+  function resetSession() {
+    const previous = session;
+    const previousHandler = socketHandler;
+    session = null;
+    verification = null;
+    socketHandler = null;
+    previous?.controller.abort();
+
+    if (previousHandler) {
+      useSocketIOStore().unregisterHandler('notification', previousHandler);
     }
 
-    // Increment unread count / 增加未读计数
-    unreadCount.value++;
+    pendingPushIds.clear();
+    pendingReads.clear();
+    pendingDeletes.clear();
+    pendingWrites = 0;
+    countMutation++;
+    notifications.value = [];
+    unreadCount.value = 0;
+    loading.value = false;
+    useNotificationToast().clearAll();
+  }
 
-    // Use the inbox ID when the push has a persisted row. / 有站内信时使用其 ID。
-    notifications.value.unshift({
-      id: id ?? -Date.now(),
+  function clearVerifiedPrincipal() {
+    verifiedPrincipal = null;
+    confirmedReads.clear();
+    deletedIds.clear();
+    seenPushIds.clear();
+  }
+
+  function setEndpoint(endpoint: NotificationEndpoint) {
+    if (currentEndpoint === endpoint) return;
+    currentEndpoint = endpoint;
+    if (session && session.endpoint !== endpoint) resetSession();
+  }
+
+  async function verifyPrincipal(context: NotificationSession) {
+    try {
+      const { data: response } = await baseRequestClient.instance.get<
+        HttpResponse<{ id: number | string; tenant_id?: number | string }>
+      >(`/${context.endpoint}/auth/me`, {
+        headers: { Authorization: `Bearer ${context.token}` },
+        signal: context.controller.signal,
+        timeout: 5000,
+      });
+      const userId = identityPart(response.data?.id);
+      const tenantId = identityPart(response.data?.tenant_id);
+      const expectedTenantId = identityPart(userStore.userInfo?.tenantId);
+      if (
+        !isCurrent(context) ||
+        response.code !== 0 ||
+        userId !== context.userId ||
+        (context.endpoint === 'tenant' &&
+          (!tenantId || (expectedTenantId && expectedTenantId !== tenantId)))
+      ) {
+        return;
+      }
+
+      const key = `${LEGACY_CACHE_KEY}:v2:${JSON.stringify([
+        context.endpoint,
+        userId,
+        context.endpoint === 'tenant' ? tenantId : null,
+      ])}`;
+      if (verifiedPrincipal !== key) {
+        clearVerifiedPrincipal();
+        verifiedPrincipal = key;
+      }
+      context.cacheKey = key;
+      removeLocalNotifications(LEGACY_CACHE_KEY);
+      const local = loadLocalNotifications(key);
+      notifications.value = local;
+      unreadCount.value = local.filter((item) => !item.is_read).length;
+      for (const item of local) temporaryId = Math.min(temporaryId, item.id);
+      if (wantsSocket) bindSocket(context);
+    } catch {
+      // 下次请求或网络恢复时可重新核验会话。
+    } finally {
+      if (session === context) {
+        verification = null;
+        if (!context.cacheKey) session = null;
+      }
+    }
+  }
+
+  async function requireSession(): Promise<NotificationSession | null> {
+    if (session && !isCurrent(session)) resetSession();
+    const endpoint = resolveNotificationEndpoint();
+    const userId = identityPart(userStore.userInfo?.userId);
+    const token = endpoint && currentToken(endpoint);
+    if (!endpoint || !userId || !token) return null;
+
+    if (!session) {
+      const context = {
+        cacheKey: null,
+        controller: new AbortController(),
+        endpoint,
+        token,
+        userId,
+      };
+      session = context;
+      verification = verifyPrincipal(context);
+    }
+    const context = session;
+    if (verification) await verification;
+    return context.cacheKey && isCurrent(context) ? context : null;
+  }
+
+  function saveLocalNotifications(context: NotificationSession) {
+    if (!context.cacheKey) return;
+    try {
+      const local = notifications.value.filter((item) => item.id < 0);
+      if (local.length > 0) {
+        localStorage.setItem(context.cacheKey, JSON.stringify(local));
+      } else {
+        removeLocalNotifications(context.cacheKey);
+      }
+    } catch {
+      // 浏览器可能禁用了本地缓存。
+    }
+  }
+
+  function notify(item: NotificationItem) {
+    if (item.category !== 'announcement')
+      useNotificationToast().pushToast(item);
+  }
+
+  function addLocalNotification(
+    item: Omit<NotificationItem, 'created_at' | 'id' | 'is_read'>,
+  ) {
+    const context = session;
+    if (!context?.cacheKey || !isCurrent(context)) return;
+    const local = {
+      ...item,
+      id: --temporaryId,
+      is_read: false,
+      created_at: new Date().toISOString(),
+    };
+    notifications.value.unshift(local);
+    unreadCount.value++;
+    countMutation++;
+    saveLocalNotifications(context);
+    notify(local);
+  }
+
+  function handlePush(raw: unknown) {
+    const data = raw as NotificationPushData;
+    if (!data?.title) return;
+    const item = {
       template_code: data.type,
       category: data.category,
       title: data.title,
@@ -126,290 +296,304 @@ export const useNotificationStore = defineStore('notification', () => {
       data: data.data,
       link: data.link,
       priority: data.priority,
-      is_read: false,
-      created_at: new Date().toISOString(),
-    });
-
-    _saveLocalNotifications(notifications.value);
-
-    if (data.category !== 'announcement') {
-      // Trigger toast popup / 触发 Toast 弹窗
-      try {
-        const { pushToast } = useNotificationToast();
-        pushToast({
-          template_code: data.type,
-          category: data.category,
-          title: data.title,
-          body: data.body,
-          data: data.data,
-          link: data.link,
-          priority: data.priority,
-        });
-      } catch {
-        // Silent if toast not initialized / toast 未初始化时静默
-      }
-    }
-  };
-
-  // ============================================================
-  // API prefix / API 前缀
-  // ============================================================
-
-  function resolveNotificationEndpoint(): 'admin' | 'tenant' | null {
-    if (typeof window !== 'undefined') {
-      const endpoint = resolveEndpointByPath(
-        window.location.pathname,
-        window.location.hostname,
-      );
-      if (endpoint === 'admin' || endpoint === 'tenant') {
-        return endpoint;
-      }
-    }
-    return currentEndpoint;
-  }
-
-  function getApiPrefix(): null | string {
-    const endpoint = resolveNotificationEndpoint();
-    if (!endpoint) {
-      return null;
-    }
-    return endpoint === 'tenant' ? '/tenant' : '/admin';
-  }
-
-  function setEndpoint(endpoint: 'admin' | 'tenant') {
-    currentEndpoint = endpoint;
-  }
-
-  // ============================================================
-  // Loading / 加载
-  // ============================================================
-
-  async function loadUnreadCount(): Promise<void> {
-    const apiPrefix = getApiPrefix();
-    if (!apiPrefix) {
+    };
+    const id = data.id;
+    if (typeof id !== 'number' || !Number.isSafeInteger(id) || id <= 0) {
+      addLocalNotification(item);
       return;
     }
-    const generation = sessionGeneration;
+    if (seenPushIds.has(id) || deletedIds.has(id)) return;
+    seenPushIds.add(id);
+    if (notifications.value.some((row) => row.id === id)) {
+      void loadUnreadCount();
+      return;
+    }
+
+    const notification = {
+      ...item,
+      id,
+      is_read: confirmedReads.has(id),
+      created_at: new Date().toISOString(),
+    };
+    pendingPushIds.add(id);
+    if (!notification.is_read) unreadCount.value++;
+    countMutation++;
+    notifications.value.unshift(notification);
+    notify(notification);
+    void loadUnreadCount();
+  }
+
+  function bindSocket(context: NotificationSession) {
+    if (socketHandler || !context.cacheKey || !isCurrent(context)) return;
+    const socket = useSocketIOStore();
+    socket.connect(context.endpoint, {
+      principal: context.cacheKey,
+      token: context.token,
+    });
+    socketHandler = (data) => {
+      if (isCurrent(context) && socket.currentEndpoint === context.endpoint) {
+        handlePush(data);
+      }
+    };
+    socket.registerHandler('notification', socketHandler);
+  }
+
+  function initSocketHandlers() {
+    wantsSocket = true;
+    void requireSession().then((context) => {
+      if (context && wantsSocket) bindSocket(context);
+    });
+  }
+
+  async function loadUnreadCount(): Promise<void> {
+    const context = await requireSession();
+    if (!context || !isCurrent(context) || pendingWrites > 0) return;
+    const request = ++countRequest;
+    const mutation = countMutation;
     try {
       const data = await requestClient.get<{ count: number }>(
-        `${apiPrefix}/notifications/unread-count`,
+        `/${context.endpoint}/notifications/unread-count`,
+        { signal: context.controller.signal },
       );
       if (
-        generation === sessionGeneration &&
-        apiPrefix === getApiPrefix() &&
-        data &&
-        typeof data.count === 'number'
+        isCurrent(context) &&
+        request === countRequest &&
+        mutation === countMutation &&
+        Number.isSafeInteger(data?.count) &&
+        data.count >= 0
       ) {
-        unreadCount.value = data.count;
+        const localUnread = notifications.value.filter(
+          (item) => item.id < 0 && !item.is_read,
+        ).length;
+        unreadCount.value = data.count + localUnread;
       }
     } catch {
-      // Silent failure / 静默失败
+      // 保留当前计数，后续读取时重试。
     }
   }
 
   async function loadNotifications(
     category?: string,
-    page: number = 1,
-    pageSize: number = 20,
+    page = 1,
+    pageSize = 20,
   ): Promise<void> {
-    const apiPrefix = getApiPrefix();
-    if (!apiPrefix) {
-      return;
-    }
-    const generation = sessionGeneration;
-    if (page === 1) listGeneration++;
-    const list = listGeneration;
+    const context = await requireSession();
+    if (!context || !isCurrent(context)) return;
+    const request = ++listRequest;
     loading.value = true;
     try {
-      const params = new URLSearchParams();
+      const params = new URLSearchParams({
+        page: String(page),
+        page_size: String(pageSize),
+      });
       if (category) params.set('category', category);
-      params.set('page', String(page));
-      params.set('page_size', String(pageSize));
-
       const data = await requestClient.get<NotificationListResponse>(
-        `${apiPrefix}/notifications?${params.toString()}`,
+        `/${context.endpoint}/notifications?${params.toString()}`,
+        { signal: context.controller.signal },
       );
-      if (
-        generation !== sessionGeneration ||
-        list !== listGeneration ||
-        apiPrefix !== getApiPrefix()
-      )
+      if (!isCurrent(context) || request !== listRequest || !data?.items)
         return;
-      if (data?.items) {
-        if (page === 1) {
-          for (const item of data.items) pendingPushIds.delete(item.id);
-        }
-        // A list snapshot taken before delivery can omit a just-pushed inbox row.
-        const retained = notifications.value.filter(
-          (item) => page !== 1 || item.id < 0 || pendingPushIds.has(item.id),
-        );
-        const incoming = new Map(data.items.map((item) => [item.id, item]));
-        const merged = retained.map((item) => {
-          const current = incoming.get(item.id) ?? item;
-          incoming.delete(item.id);
-          return current;
-        });
-        notifications.value = [...merged, ...incoming.values()];
+      for (const item of data.items) {
+        if (item.is_read) confirmedReads.set(item.id, item.read_at);
+        pendingPushIds.delete(item.id);
       }
+
+      // 保留列表请求发出后才投递的条目，去除已经被当前会话删除的条目。
+      const retained = notifications.value.filter(
+        (item) => page !== 1 || item.id < 0 || pendingPushIds.has(item.id),
+      );
+      const rows = new Map(
+        [...retained, ...data.items].map((item) => [item.id, item]),
+      );
+      notifications.value = [...rows.values()]
+        .filter((item) => !deletedIds.has(item.id))
+        .map((item) => {
+          const readAt = confirmedReads.get(item.id);
+          if (item.is_read || !confirmedReads.has(item.id)) return item;
+          return {
+            ...item,
+            is_read: true,
+            ...(readAt ? { read_at: readAt } : {}),
+          };
+        });
     } catch {
-      console.error('[Notification] Failed to load notifications');
+      // 保留当前页，允许重试。
     } finally {
-      if (generation === sessionGeneration && list === listGeneration) {
-        loading.value = false;
-      }
+      if (isCurrent(context) && request === listRequest) loading.value = false;
     }
   }
 
-  // ============================================================
-  // Local notifications / 本地通知
-  // ============================================================
-
-  /** Add local temp notification (no backend, persisted to localStorage) / 添加本地临时通知 */
-  function addLocalNotification(
-    item: Omit<NotificationItem, 'created_at' | 'id' | 'is_read'>,
-  ) {
-    const notif: NotificationItem = {
-      ...item,
-      id: -Date.now(),
-      is_read: false,
-      created_at: new Date().toISOString(),
-    };
-    notifications.value.unshift(notif);
-    unreadCount.value++;
-    _saveLocalNotifications(notifications.value);
-
-    if (item.category !== 'announcement') {
-      // Trigger toast popup / 触发 Toast 弹窗
-      try {
-        const { pushToast } = useNotificationToast();
-        pushToast({
-          template_code: item.template_code,
-          category: item.category,
-          title: item.title,
-          body: item.body,
-          data: item.data,
-          link: item.link,
-          priority: item.priority,
-        });
-      } catch {
-        // Silent / 静默
-      }
+  function confirmRead(id: number) {
+    const item = notifications.value.find((row) => row.id === id);
+    if (id > 0 && !confirmedReads.has(id))
+      confirmedReads.set(id, item?.read_at);
+    if (item && !item.is_read) {
+      item.is_read = true;
+      unreadCount.value = Math.max(0, unreadCount.value - 1);
     }
   }
 
-  // ============================================================
-  // Operations / 操作
-  // ============================================================
+  function finishWrite(context: NotificationSession) {
+    if (!isCurrent(context)) return;
+    pendingWrites--;
+    countMutation++;
+    if (pendingWrites === 0) return loadUnreadCount();
+  }
 
   async function markRead(id: number): Promise<void> {
-    const apiPrefix = getApiPrefix();
-    const item = notifications.value.find((n) => n.id === id);
-    if (item) {
-      item.is_read = true;
-    }
-    if (unreadCount.value > 0) {
-      unreadCount.value--;
-    }
-    // Local temp notifications (negative ID) don't call backend API / 本地临时通知不调后端
+    const context = session;
+    const item = notifications.value.find((row) => row.id === id);
+    if (!context?.cacheKey || !isCurrent(context) || !item || item.is_read)
+      return;
     if (id < 0) {
-      _saveLocalNotifications(notifications.value);
+      confirmRead(id);
+      countMutation++;
+      saveLocalNotifications(context);
       return;
     }
-    if (!apiPrefix) {
-      return;
-    }
+    if (pendingReads.has(id) || pendingDeletes.has(id)) return;
+
+    pendingReads.add(id);
+    pendingWrites++;
+    countMutation++;
     try {
-      await requestClient.put(`${apiPrefix}/notifications/${id}/read`);
+      await requestClient.put(
+        `/${context.endpoint}/notifications/${id}/read`,
+        undefined,
+        {
+          signal: context.controller.signal,
+          skipAuthRecovery: true,
+        },
+      );
+      if (isCurrent(context)) confirmRead(id);
     } catch {
-      // Silent / 静默
+      // 保留原有已读状态；请求客户端会提示失败。
+    } finally {
+      if (isCurrent(context)) pendingReads.delete(id);
+      await finishWrite(context);
     }
   }
 
   async function markAllRead(category?: string): Promise<void> {
-    const apiPrefix = getApiPrefix();
-    if (!apiPrefix) {
-      return;
-    }
+    const context = await requireSession();
+    if (!context || !isCurrent(context)) return;
+    const eligibleIds = notifications.value
+      .filter(
+        (item) => !item.is_read && (!category || item.category === category),
+      )
+      .map((item) => item.id);
+    pendingWrites++;
+    countMutation++;
     try {
-      const params = category ? `?category=${category}` : '';
-      await requestClient.put(`${apiPrefix}/notifications/read-all${params}`);
-      for (const n of notifications.value) {
-        if (!category || n.category === category) {
-          n.is_read = true;
-        }
+      const query = category ? `?category=${encodeURIComponent(category)}` : '';
+      await requestClient.put(
+        `/${context.endpoint}/notifications/read-all${query}`,
+        undefined,
+        {
+          signal: context.controller.signal,
+          skipAuthRecovery: true,
+        },
+      );
+      if (isCurrent(context)) {
+        for (const id of eligibleIds) confirmRead(id);
+        saveLocalNotifications(context);
       }
-      unreadCount.value = 0;
     } catch {
-      // Silent / 静默
+      // 保留原有已读状态；请求客户端会提示失败。
+    } finally {
+      // 分类操作也会影响未加载的条目，需要读取服务器的全局计数。
+      await finishWrite(context);
     }
+  }
+
+  function removeItem(id: number) {
+    const index = notifications.value.findIndex((item) => item.id === id);
+    if (index === -1) return;
+    const [item] = notifications.value.splice(index, 1);
+    if (item && !item.is_read)
+      unreadCount.value = Math.max(0, unreadCount.value - 1);
   }
 
   async function deleteNotification(id: number): Promise<void> {
-    const apiPrefix = getApiPrefix();
-    const idx = notifications.value.findIndex((n) => n.id === id);
-    if (idx !== -1) {
-      const removed = notifications.value[idx];
-      notifications.value.splice(idx, 1);
-      pendingPushIds.delete(id);
-      if (!removed?.is_read && unreadCount.value > 0) {
-        unreadCount.value--;
-      }
+    const context = session;
+    if (
+      !context?.cacheKey ||
+      !isCurrent(context) ||
+      !notifications.value.some((item) => item.id === id)
+    ) {
+      return;
     }
-    // Local temp notifications (negative ID) don't call backend API / 本地临时通知不调后端
     if (id < 0) {
-      _saveLocalNotifications(notifications.value);
+      removeItem(id);
+      countMutation++;
+      saveLocalNotifications(context);
       return;
     }
-    if (!apiPrefix) {
-      return;
-    }
+    if (pendingDeletes.has(id)) return;
+
+    pendingDeletes.add(id);
+    pendingWrites++;
+    countMutation++;
     try {
-      await requestClient.delete(`${apiPrefix}/notifications/${id}`);
+      await requestClient.delete(`/${context.endpoint}/notifications/${id}`, {
+        signal: context.controller.signal,
+        skipAuthRecovery: true,
+      });
+      if (isCurrent(context)) {
+        deletedIds.add(id);
+        pendingPushIds.delete(id);
+        removeItem(id);
+      }
     } catch {
-      // Silent / 静默
+      // 删除失败保留条目，允许重试。
+    } finally {
+      if (isCurrent(context)) pendingDeletes.delete(id);
+      await finishWrite(context);
     }
   }
-
-  // ============================================================
-  // Socket.IO real-time push / Socket.IO 实时推送
-  // ============================================================
-
-  function initSocketHandlers(): void {
-    if (initialized.value) return;
-    initialized.value = true;
-
-    const sioStore = useSocketIOStore();
-    sioStore.unregisterHandler('notification', handleSocketNotification);
-    sioStore.registerHandler('notification', handleSocketNotification);
-  }
-
-  // ============================================================
-  // Reset / 重置
-  // ============================================================
 
   function $reset() {
-    try {
-      useSocketIOStore().unregisterHandler(
-        'notification',
-        handleSocketNotification,
-      );
-    } catch {
-      // Silent / 静默
-    }
-    notifications.value = [];
-    unreadCount.value = 0;
-    loading.value = false;
-    initialized.value = false;
-    seenPushIds.clear();
-    pendingPushIds.clear();
-    sessionGeneration++;
-    localStorage.removeItem(LOCAL_NOTIF_KEY);
-    try {
-      useNotificationToast().clearAll();
-    } catch {
-      // 静默 / Swallow toast clear errors
-    }
+    if (verifiedPrincipal) removeLocalNotifications(verifiedPrincipal);
+    wantsSocket = false;
+    currentEndpoint = null;
+    resetSession();
+    clearVerifiedPrincipal();
   }
+
+  function onStorageChange() {
+    if (session && !isCurrent(session)) resetSession();
+  }
+
+  function retryUnreadCount() {
+    if (wantsSocket) void loadUnreadCount();
+  }
+
+  watch(
+    [
+      () => userStore.userInfo?.userId,
+      () => userStore.userInfo?.tenantId,
+      () => accessStore.accessToken,
+      () => accessStore.loginExpired,
+    ],
+    () => {
+      if (session) resetSession();
+      retryUnreadCount();
+    },
+    { flush: 'sync' },
+  );
+
+  if (typeof window !== 'undefined') {
+    window.addEventListener('storage', onStorageChange);
+    window.addEventListener('online', retryUnreadCount);
+  }
+  onScopeDispose(() => {
+    if (typeof window !== 'undefined') {
+      window.removeEventListener('storage', onStorageChange);
+      window.removeEventListener('online', retryUnreadCount);
+    }
+    resetSession();
+    clearVerifiedPrincipal();
+  });
 
   return {
     notifications,
