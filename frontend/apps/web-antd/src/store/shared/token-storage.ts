@@ -138,8 +138,12 @@ class TokenStorageClass {
    * @param endpoint API endpoint type / API 端类型
    */
   getRefreshToken(endpoint: ApiEndpoint): null | string {
-    const key = this.getFullKey(REFRESH_TOKEN_KEYS[endpoint]);
+    const key = this.getRefreshTokenKey(endpoint);
     return key ? localStorage.getItem(key) : null;
+  }
+
+  getRefreshTokenKey(endpoint: ApiEndpoint): null | string {
+    return this.getFullKey(REFRESH_TOKEN_KEYS[endpoint]);
   }
 
   /**
@@ -193,7 +197,7 @@ class TokenStorageClass {
    * @param token Refresh Token
    */
   setRefreshToken(endpoint: ApiEndpoint, token: string): void {
-    const key = this.getFullKey(REFRESH_TOKEN_KEYS[endpoint]);
+    const key = this.getRefreshTokenKey(endpoint);
     if (key) {
       localStorage.setItem(key, token);
     }

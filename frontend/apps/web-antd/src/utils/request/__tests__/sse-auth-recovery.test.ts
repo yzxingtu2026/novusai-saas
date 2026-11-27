@@ -47,7 +47,10 @@ describe('sse 401 auth recovery', () => {
     client.setRefreshTokenHandler(doRefreshToken);
     client.setReAuthenticateHandler(doReAuthenticate);
     getToken.mockReturnValue('old-token');
-    doRefreshToken.mockResolvedValue('new-token');
+    doRefreshToken.mockImplementation(async () => {
+      getToken.mockReturnValue('new-token');
+      return 'new-token';
+    });
     doReAuthenticate.mockResolvedValue(undefined);
   });
 

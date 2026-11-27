@@ -6,6 +6,8 @@
  */
 import type { AxiosRequestConfig, AxiosResponse } from 'axios';
 
+import type { ApiEndpoint } from '#/types/endpoint';
+
 // ============================================================
 // Request configuration types / 请求配置类型
 // ============================================================
@@ -229,6 +231,11 @@ export interface RefreshTokenResultRaw {
   refresh_token?: string;
 }
 
+export interface AuthRequestSession {
+  accessToken: null | string;
+  endpoint: ApiEndpoint;
+}
+
 // ============================================================
 // Error handling types / 错误处理类型
 // ============================================================
@@ -307,4 +314,4 @@ export interface RequestClientOptions extends RequestOptions {
   headers?: Record<string, string>;
 }
 
-export { type ApiEndpoint } from '#/types/endpoint';
+export type { ApiEndpoint };

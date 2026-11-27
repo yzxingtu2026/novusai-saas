@@ -29,6 +29,7 @@ import type {
 
 import type {
   ApiEndpoint,
+  AuthRequestSession,
   HttpResponse,
   ParamsSerializer,
   RequestClientConfig,
@@ -43,6 +44,8 @@ import type {
 
 import axios from 'axios';
 import qs from 'qs';
+
+import { readBearerToken } from '#/store/shared/token-refresh';
 
 import { notifyAIAccessDenied } from './ai-availability-events';
 import {
@@ -118,10 +121,13 @@ function getPendingKey(config: InternalAxiosRequestConfig): string {
 
 export class RequestClient {
   /** Re-authenticate function (used by interceptors) / 重新认证函数（拦截器使用） */
-  public doReAuthenticate?: () => Promise<void>;
+  public doReAuthenticate?: (
+    session?: AuthRequestSession,
+    cause?: unknown,
+  ) => Promise<void>;
 
   /** Token refresh function (used by interceptors) / Token 刷新函数（拦截器使用） */
-  public doRefreshToken?: () => Promise<string>;
+  public doRefreshToken?: (session: AuthRequestSession) => Promise<string>;
 
   /** Refresh Token getter function (used by interceptors) / Refresh Token 获取函数（拦截器使用） */
   public getRefreshToken?: (endpoint: ApiEndpoint) => null | string;
@@ -130,11 +136,11 @@ export class RequestClient {
   public readonly instance: AxiosInstance;
 
   /** Currently refreshing Token / 正在刷新 Token */
-  public isRefreshing = false;
+  private refreshingSession?: AuthRequestSession;
 
   /** Token refresh queue (stores resolve/reject callbacks) / Token 刷新队列（存储 resolve/reject 回调） */
-  public refreshTokenQueue: Array<{
-    reject: (error: any) => void;
+  private refreshTokenQueue: Array<{
+    reject: (error: unknown) => void;
     resolve: (token: string) => void;
   }> = [];
 
@@ -399,13 +405,13 @@ export class RequestClient {
         ? `${baseUrl.replace(/\/+$/, '')}/${url.replace(/^\/+/, '')}`
         : url;
 
+      const endpoint = getEndpointByUrl(url);
       const buildSseHeaders = (): Headers => {
         const headers = new Headers();
         headers.set('Accept', 'text/event-stream');
         headers.set('Content-Type', 'application/json');
 
         if (this.getToken) {
-          const endpoint = getEndpointByUrl(url);
           const token = this.getToken(endpoint);
           if (token) {
             headers.set('Authorization', `Bearer ${token}`);
@@ -430,19 +436,28 @@ export class RequestClient {
         body = typeof data === 'string' ? data : JSON.stringify(data);
       }
 
-      const doFetch = () =>
+      const headers = buildSseHeaders();
+      const doFetch = (requestHeaders: Headers) =>
         fetch(fullUrl, {
           ...fetchOptions,
           method: fetchOptions?.method || 'GET',
-          headers: buildSseHeaders(),
+          headers: requestHeaders,
           body,
           signal: abortController?.signal,
         });
 
-      let response = await doFetch();
+      let response = await doFetch(headers);
 
       if (response.status === 401) {
-        response = await this._handleSse401(response, doFetch);
+        const session = {
+          accessToken: readBearerToken(headers.get('Authorization')),
+          endpoint,
+        };
+        response = await this._handleSse401(response, session, (newToken) => {
+          const retryHeaders = new Headers(headers);
+          retryHeaders.set('Authorization', `Bearer ${newToken}`);
+          return doFetch(retryHeaders);
+        });
       }
 
       if (!response.ok) {
@@ -501,13 +516,44 @@ export class RequestClient {
     }
   }
 
+  /** Share the existing page-local queue only with requests from the same login. */
+  async refreshForRequest(
+    session: AuthRequestSession,
+    refresh: (session: AuthRequestSession) => Promise<string>,
+  ): Promise<string> {
+    const active = this.refreshingSession;
+    if (
+      active?.endpoint === session.endpoint &&
+      active.accessToken === session.accessToken
+    ) {
+      return new Promise((resolve, reject) => {
+        this.refreshTokenQueue.push({ resolve, reject });
+      });
+    }
+    if (active) return refresh(session);
+
+    this.refreshingSession = session;
+    try {
+      const token = await refresh(session);
+      this.refreshTokenQueue.forEach((item) => item.resolve(token));
+      return token;
+    } catch (error) {
+      this.refreshTokenQueue.forEach((item) => item.reject(error));
+      throw error;
+    } finally {
+      this.refreshTokenQueue = [];
+      this.refreshingSession = undefined;
+    }
+  }
+
   /**
    * Handle SSE 401 by attempting token refresh, then retrying.
    * Returns a fresh Response on success; throws on unrecoverable auth failure.
    */
   private async _handleSse401(
     originalResponse: Response,
-    retryFetch: () => Promise<Response>,
+    session: AuthRequestSession,
+    retryFetch: (token: string) => Promise<Response>,
   ): Promise<Response> {
     let responseBody: null | Record<string, unknown> = null;
     try {
@@ -545,40 +591,22 @@ export class RequestClient {
     const refreshTokenHandler = this.doRefreshToken;
 
     if (businessCode === 4010 || !refreshTokenHandler) {
-      await this.doReAuthenticate?.();
-      throwOriginal();
+      await this.doReAuthenticate?.(session);
+      return throwOriginal();
     }
-    const guaranteedRefreshTokenHandler =
-      refreshTokenHandler ??
-      (async () => {
-        throw new Error('refresh token handler missing');
-      });
 
+    let token: string;
     try {
-      if (this.isRefreshing) {
-        await new Promise<string>((resolve, reject) => {
-          this.refreshTokenQueue.push({ resolve, reject });
-        });
-      } else {
-        this.isRefreshing = true;
-        try {
-          const newToken = await guaranteedRefreshTokenHandler();
-          this.refreshTokenQueue.forEach((item) => item.resolve(newToken));
-          this.refreshTokenQueue = [];
-        } catch (refreshError) {
-          this.refreshTokenQueue.forEach((item) => item.reject(refreshError));
-          this.refreshTokenQueue = [];
-          throw refreshError;
-        } finally {
-          this.isRefreshing = false;
-        }
-      }
-    } catch {
-      await this.doReAuthenticate?.();
-      throwOriginal();
+      token = await this.refreshForRequest(session, refreshTokenHandler);
+    } catch (refreshError) {
+      await this.doReAuthenticate?.(session, refreshError);
+      return throwOriginal();
     }
 
-    return await retryFetch();
+    if (this.getToken && this.getToken(session.endpoint) !== token) {
+      return throwOriginal();
+    }
+    return retryFetch(token);
   }
 
   /** Set i18n function / 设置国际化函数 */
@@ -600,7 +628,7 @@ export class RequestClient {
   }
 
   /** Set re-authenticate handler / 设置重新认证函数 */
-  setReAuthenticateHandler(fn: () => Promise<void>) {
+  setReAuthenticateHandler(fn: NonNullable<RequestClient['doReAuthenticate']>) {
     this.doReAuthenticate = fn;
     return this;
   }
@@ -620,7 +648,7 @@ export class RequestClient {
   // ============================================================
 
   /** Set Token refresh handler / 设置 Token 刷新函数 */
-  setRefreshTokenHandler(fn: () => Promise<string>) {
+  setRefreshTokenHandler(fn: NonNullable<RequestClient['doRefreshToken']>) {
     this.doRefreshToken = fn;
     return this;
   }
