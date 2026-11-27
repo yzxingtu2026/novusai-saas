@@ -2,15 +2,8 @@
 
 - **GitHub 仓库**：https://github.com/yzxingtu2026/novusai-saas.git
 - **默认分支**：`main`（受保护，仅接受 PR 合入）
-- **Issue/PR 规范/开发规范**：参见 .agent/rules/*
+- **Issue/PR 规范/开发规范**：参见 .agents/rules/main.md
 
-## 当前使用者
-
-- **姓名**：你的名字
-- **GitHub 用户名**：your-github-username
-- **GitHub 邮箱**：your-email@example.com
-- **角色**：开发者
-- **常用语言**：简体中文
 
 ## 启动规范
 - 检查远端新动态：`gh pr list`、`gh issue list --state open`，关注未读评论
