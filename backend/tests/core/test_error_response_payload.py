@@ -1,6 +1,9 @@
 import json
 
-from app.core.config import settings
+import pytest
+from pydantic import ValidationError
+
+from app.core.config import Settings, settings
 from app.core.response import (
     build_exception_debug,
     build_public_error_text,
@@ -49,6 +52,33 @@ def test_error_response_hides_debug_in_production_mode() -> None:
     payload = json.loads(response.body)
     assert payload["trace_id"] == "trace-error-prod"
     assert "debug" not in payload
+
+
+def test_production_settings_reject_debug() -> None:
+    with pytest.raises(ValidationError, match="DEBUG.*production"):
+        Settings(APP_ENV=" Production ", DEBUG=True, _env_file=None)
+
+
+def test_production_errors_hide_debug_after_settings_mutation(monkeypatch) -> None:
+    monkeypatch.setattr(settings, "APP_ENV", " Production ")
+    monkeypatch.setattr(settings, "DEBUG", True)
+    response = error(code=5000, status_code=500, debug={"detail": "fixture"})
+    assert response.status_code == 500
+    assert "debug" not in json.loads(response.body)
+
+
+def test_production_app_disables_debug_documentation(monkeypatch) -> None:
+    from app.main import create_application
+
+    monkeypatch.setattr(settings, "APP_ENV", " Production ")
+    monkeypatch.setattr(settings, "DEBUG", True)
+    application = create_application().other_asgi_app
+
+    assert (application.docs_url, application.redoc_url, application.openapi_url) == (
+        None,
+        None,
+        None,
+    )
 
 
 def test_socket_connect_error_carries_structured_payload() -> None:

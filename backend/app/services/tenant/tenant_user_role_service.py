@@ -15,6 +15,7 @@ from sqlalchemy import select
 from app.core.base_service import TenantService
 from app.core.i18n import _
 from app.enums import ErrorCode
+from app.enums.rbac import PermissionScope
 from app.exceptions import BusinessException, NotFoundException
 from app.models.auth.permission import Permission
 from app.models.auth.tenant_user_role import TenantUserRole
@@ -99,11 +100,14 @@ class TenantUserRoleService(TenantService[TenantUserRole, TenantUserRoleReposito
             "sort_order": sort_order,
         }
 
+        selection = (
+            await self._resolve_permissions(permission_ids) if permission_ids else None
+        )
         role = await self.repo.create(data)
 
         # 分配权限 / Assign permissions
-        if permission_ids:
-            await self._assign_permissions(role, permission_ids)
+        if selection is not None:
+            await self._replace_permissions(role, selection)
 
         return role
 
@@ -163,13 +167,18 @@ class TenantUserRoleService(TenantService[TenantUserRole, TenantUserRoleReposito
                 code=ErrorCode.DUPLICATE_ENTRY,
             )
 
+        selection = (
+            await self._resolve_permissions(permission_ids)
+            if permission_ids is not None
+            else None
+        )
         result = await self.repo.update(role_id, data)
         if not result:
             raise NotFoundException(message=_("tenant_user_role.not_found"))
 
         # 更新权限 / Update permissions
-        if permission_ids is not None:
-            await self._assign_permissions(result, permission_ids)
+        if selection is not None:
+            await self._replace_permissions(result, selection)
 
         return result
 
@@ -225,7 +234,9 @@ class TenantUserRoleService(TenantService[TenantUserRole, TenantUserRoleReposito
         if not role:
             raise NotFoundException(message=_("tenant_user_role.not_found"))
 
-        await self._assign_permissions(role, permission_ids)
+        await self._replace_permissions(
+            role, await self._resolve_permissions(permission_ids)
+        )
         return role
 
     async def toggle_status(
@@ -263,31 +274,31 @@ class TenantUserRoleService(TenantService[TenantUserRole, TenantUserRoleReposito
 
         return result
 
-    async def _assign_permissions(
-        self,
-        role: TenantUserRole,
-        permission_ids: list[int],
-    ) -> None:
-        """
-        内部方法：分配权限给角色 / Internal: assign permissions to role.
-
-        Args:
-            role: 角色实例
-            permission_ids: 权限 ID 列表
-        """
+    async def _resolve_permissions(self, permission_ids: list[int]) -> list[Permission]:
+        """整组通过后才写入 / Validate the complete selection before writing."""
         if not permission_ids:
-            role.permissions = []
-            await self.db.flush()
-            await self.db.refresh(role)
-            return
+            return []
 
+        unique_ids = dict.fromkeys(permission_ids)
         query = select(Permission).where(
-            Permission.id.in_(permission_ids),
+            Permission.id.in_(list(unique_ids)),
+            Permission.scope == PermissionScope.USER.value,
+            Permission.is_enabled.is_(True),
             Permission.is_deleted.is_(False),
         )
         result = await self.db.execute(query)
-        permissions = list(result.scalars().all())
+        by_id = {permission.id: permission for permission in result.scalars().all()}
+        if by_id.keys() != unique_ids.keys():
+            raise BusinessException(
+                message=_("user_role_permission_admission.invalid_selection"),
+                code=ErrorCode.VALIDATION_ERROR,
+                data={"reason": "invalid_user_role_permissions"},
+            )
+        return [by_id[permission_id] for permission_id in unique_ids]
 
+    async def _replace_permissions(
+        self, role: TenantUserRole, permissions: list[Permission]
+    ) -> None:
         role.permissions = permissions
         await self.db.flush()
         await self.db.refresh(role)

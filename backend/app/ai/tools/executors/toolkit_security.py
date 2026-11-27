@@ -109,6 +109,22 @@ _BLOCKED_BUILTINS: frozenset[str] = frozenset(
         "breakpoint",
         "exit",
         "quit",
+        "globals",
+        "locals",
+        "vars",
+        "getattr",
+    }
+)
+
+_BLOCKED_REFLECTION_NAMES: frozenset[str] = frozenset(
+    {
+        "__builtins__",
+        "__builtin__",
+        "__import__",
+        "globals",
+        "locals",
+        "vars",
+        "getattr",
     }
 )
 
@@ -125,8 +141,8 @@ def scan_toolkit_security(
     security_level: str | None = None,
 ) -> list[str]:
     """
-    AST static analysis: detect dangerous imports and builtin function calls in Toolkit source code.
-    AST 静态分析：检测 Toolkit 源码中的危险 import 和内置函数调用。
+    Find blocked imports, builtin calls, and reflection markers in Toolkit source.
+    查找 Toolkit 源码中的受限导入、内置函数调用及反射标记。
 
     Args:
         source: Toolkit Python source code / Toolkit Python 源码
@@ -134,8 +150,8 @@ def scan_toolkit_security(
                         安全等级 (strict/normal/permissive)，None 使用 normal
 
     Returns:
-        List of violation descriptions (empty list means safe).
-        违规描述列表（空列表表示安全）。
+        List of matching policy violations.
+        命中的策略违规描述列表。
     """
     try:
         tree = ast.parse(source)
@@ -165,7 +181,20 @@ def scan_toolkit_security(
                     f"Blocked builtin '{func_name}()' at line {node.lineno}"
                 )
 
-    return violations
+        if isinstance(node, ast.Name) and node.id in _BLOCKED_REFLECTION_NAMES:
+            violations.append(
+                f"Blocked reflection name '{node.id}' at line {node.lineno}"
+            )
+        elif (
+            isinstance(node, ast.Constant)
+            and isinstance(node.value, str)
+            and node.value in _BLOCKED_REFLECTION_NAMES
+        ):
+            violations.append(
+                f"Blocked reflection key '{node.value}' at line {node.lineno}"
+            )
+
+    return list(dict.fromkeys(violations))
 
 
 def _check_module(

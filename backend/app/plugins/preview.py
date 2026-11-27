@@ -60,6 +60,10 @@ _CAPABILITY_DESCRIPTIONS: dict[str, dict[str, str]] = {
     "storage:read": {"zh-CN": "读取存储文件", "en": "Read storage files"},
     "storage:write": {"zh-CN": "写入存储文件", "en": "Write storage files"},
     "ai:call": {"zh-CN": "调用 AI 功能", "en": "Call AI features"},
+    "config:read": {
+        "zh-CN": "读取并解密插件自身配置",
+        "en": "Read and decrypt the plugin's own config",
+    },
     "config:write": {"zh-CN": "修改插件配置", "en": "Modify plugin config"},
     "notifications:send": {"zh-CN": "发送通知", "en": "Send notifications"},
 }

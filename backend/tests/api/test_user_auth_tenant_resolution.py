@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.datastructures import Headers
 
 
 def _token_pair() -> dict[str, str]:
@@ -56,6 +57,7 @@ def _auth_service_factory(calls: list[tuple[str, dict]]):
 
 class _Request:
     client = SimpleNamespace(host="198.51.100.7")
+    headers = Headers()
 
     async def form(self) -> dict[str, str]:
         return {
@@ -94,7 +96,9 @@ async def test_user_auth_routes_only_forward_explicit_tenant_code(monkeypatch):
 
     calls: list[tuple[str, dict]] = []
     monkeypatch.setattr(user_auth, "AuthService", _auth_service_factory(calls))
-    monkeypatch.setattr(user_auth, "check_login_rate_limit", lambda _request: None)
+    monkeypatch.setattr(
+        user_auth, "check_login_rate_limit", AsyncMock(return_value=None)
+    )
 
     db = SimpleNamespace(commit=AsyncMock())
     request = _Request()

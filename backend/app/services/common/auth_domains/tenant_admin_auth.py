@@ -5,18 +5,24 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.orm import selectinload
 
 from app.core.config import settings
 from app.core.i18n import _
 from app.core.security import (
+    TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_TENANT_ADMIN,
     TOKEN_TYPE_REFRESH,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
+    tenant_session_epoch_matches,
 )
 from app.enums import ErrorCode
 from app.exceptions import AuthenticationException, BusinessException, NotFoundException
 from app.models import Admin, Tenant, TenantAdmin
+from app.services.common.auth_domains.login_security import password_login_query
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -63,7 +69,12 @@ class AuthTenantAdminDomain:
         tenant_admin.last_login_ip = client_ip
 
         tenant_result = await self._service.db.execute(
-            select(Tenant).where(Tenant.id == tenant_admin.tenant_id)
+            select(Tenant)
+            .where(
+                Tenant.id == tenant_admin.tenant_id,
+                Tenant.is_deleted.is_(False),
+            )
+            .execution_options(populate_existing=True)
         )
         tenant = tenant_result.scalar_one_or_none()
 
@@ -89,7 +100,10 @@ class AuthTenantAdminDomain:
                 default=120,
             )
 
-        extra_claims = {"tenant_id": tenant_admin.tenant_id}
+        extra_claims = {
+            "tenant_id": tenant_admin.tenant_id,
+            TENANT_SESSION_EPOCH_CLAIM: tenant.session_revocation_epoch,
+        }
         access_token, access_jti = self._service._create_access_token(
             tenant_admin.id,
             scope=TOKEN_SCOPE_TENANT_ADMIN,
@@ -142,13 +156,7 @@ class AuthTenantAdminDomain:
             )
             raise AuthenticationException(message=_("auth.tenant_domain_required"))
 
-        query = select(TenantAdmin).where(
-            or_(
-                TenantAdmin.username == username,
-                TenantAdmin.email == username,
-            ),
-            TenantAdmin.is_deleted.is_(False),
-        )
+        query = select(TenantAdmin).where(TenantAdmin.is_deleted.is_(False))
 
         if tenant_code:
             query = query.join(Tenant, TenantAdmin.tenant_id == Tenant.id).where(
@@ -157,7 +165,9 @@ class AuthTenantAdminDomain:
                 Tenant.is_deleted.is_(False),
             )
 
-        result = await self._service.db.execute(query)
+        result = await self._service.db.execute(
+            password_login_query(query, TenantAdmin, username)
+        )
         results = result.scalars().all()
 
         if len(results) > 1:
@@ -324,13 +334,18 @@ class AuthTenantAdminDomain:
             select(TenantAdmin).where(
                 or_(
                     TenantAdmin.username == identifier,
-                    TenantAdmin.email == identifier,
+                    func.lower(TenantAdmin.email) == identifier.lower(),
                 ),
                 TenantAdmin.tenant_id == tenant.id,
                 TenantAdmin.is_deleted.is_(False),
             )
         )
-        tenant_admin = result.scalar_one_or_none()
+        try:
+            tenant_admin = result.scalar_one_or_none()
+        except MultipleResultsFound as exc:
+            raise AuthenticationException(
+                message=_("auth.credentials_invalid")
+            ) from exc
         if tenant_admin is None:
             self._service._log_auth_warning(
                 "tenant_admin.dev_bootstrap.failed",
@@ -361,11 +376,10 @@ class AuthTenantAdminDomain:
         )
 
     async def refresh_token(self, refresh_token: str) -> dict[str, Any]:
-        admin_id, _scope = await self._service._verify_token_with_scope(
-            refresh_token,
-            TOKEN_SCOPE_TENANT_ADMIN,
-            TOKEN_TYPE_REFRESH,
+        payload = await get_token_payload_with_scope(
+            refresh_token, TOKEN_SCOPE_TENANT_ADMIN, TOKEN_TYPE_REFRESH
         )
+        admin_id = normalize_positive_subject_id((payload or {}).get("sub"))
         if admin_id is None:
             self._service._log_auth_warning(
                 "tenant_admin.token.refresh.failed",
@@ -374,21 +388,26 @@ class AuthTenantAdminDomain:
             raise AuthenticationException(message=_("auth.refresh_token_invalid"))
 
         result = await self._service.db.execute(
-            select(TenantAdmin).where(
-                TenantAdmin.id == int(admin_id),
+            select(TenantAdmin, Tenant.session_revocation_epoch)
+            .join(Tenant, Tenant.id == TenantAdmin.tenant_id)
+            .where(
+                TenantAdmin.id == admin_id,
                 TenantAdmin.is_deleted.is_(False),
+                Tenant.is_active.is_(True),
+                Tenant.is_deleted.is_(False),
             )
         )
-        tenant_admin = result.scalar_one_or_none()
+        identity = result.one_or_none()
 
-        if tenant_admin is None:
+        if identity is None or not tenant_session_epoch_matches(payload, identity[1]):
             self._service._log_auth_warning(
                 "tenant_admin.token.refresh.failed",
                 user_id=admin_id,
-                reason="user_not_found",
+                reason="tenant_session_invalid",
             )
             raise AuthenticationException(message=_("auth.refresh_token_invalid"))
 
+        tenant_admin, epoch = identity
         if not tenant_admin.is_active:
             self._service._log_auth_warning(
                 "tenant_admin.token.refresh.failed",
@@ -402,7 +421,10 @@ class AuthTenantAdminDomain:
         tokens = self._service._create_token_pair(
             tenant_admin.id,
             scope=TOKEN_SCOPE_TENANT_ADMIN,
-            extra_claims={"tenant_id": tenant_admin.tenant_id},
+            extra_claims={
+                "tenant_id": tenant_admin.tenant_id,
+                TENANT_SESSION_EPOCH_CLAIM: epoch,
+            },
         )
         await self._service._record_active_tokens(
             "tenant_admin",
@@ -529,6 +551,7 @@ class AuthTenantAdminDomain:
         extra_claims: dict[str, Any] = {
             "tenant_id": target_tenant_id,
             "impersonated_by": admin_id,
+            TENANT_SESSION_EPOCH_CLAIM: tenant.session_revocation_epoch,
         }
         if target_role_id:
             extra_claims["impersonate_role_id"] = target_role_id

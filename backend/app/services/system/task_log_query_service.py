@@ -4,9 +4,14 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
+from app.core.response import resolve_public_error_message
 from app.models.system.task_definition import TaskDefinition
 from app.models.tenant.tenant import Tenant
 from app.schemas.system import TaskLogDetailResponse, TaskLogResponse
+from app.services.system.task_log_payload_redaction import (
+    redact_task_arguments,
+    redact_task_payload,
+)
 
 
 class TaskLogRelationService:
@@ -80,6 +85,9 @@ class TaskLogRelationService:
         tenant_map: dict[int, str] | None = None,
     ) -> dict:
         args, kwargs = self.unpack_args_kwargs(task_run.args_summary)
+        args, kwargs = redact_task_arguments(
+            task_run.handler_path_snapshot, args, kwargs
+        )
         definition_info = (
             definition_map.get(task_run.task_definition_id, {})
             if definition_map and task_run.task_definition_id is not None
@@ -113,9 +121,15 @@ class TaskLogRelationService:
             status=task_run.status,
             args=args,
             kwargs=kwargs,
-            result=task_run.result_summary,
-            error_message=task_run.error_message_public
-            or task_run.error_message_internal,
+            result=redact_task_payload(task_run.result_summary),
+            # 中文: 历史公开错误字段也保存异常原文，因此统一返回安全文案。
+            # EN: Historical public error fields also contain raw exception
+            # text, so return the standard safe message.
+            error_message=(
+                resolve_public_error_message(expose_detail=False)
+                if task_run.error_message_public or task_run.error_message_internal
+                else None
+            ),
             trigger_source=task_run.trigger_source,
             run_kind=task_run.run_kind,
             trace_id=task_run.trace_id,
@@ -133,52 +147,13 @@ class TaskLogRelationService:
         definition_map: dict[int, dict[str, str]] | None = None,
         tenant_map: dict[int, str] | None = None,
     ) -> dict:
-        args, kwargs = self.unpack_args_kwargs(task_run.args_summary)
-        definition_info = (
-            definition_map.get(task_run.task_definition_id, {})
-            if definition_map and task_run.task_definition_id is not None
-            else {}
-        )
-        owner_tenant_name = (
-            tenant_map.get(task_run.owner_tenant_id)
-            if tenant_map and task_run.owner_tenant_id is not None
-            else None
-        )
-        effective_tenant_name = (
-            tenant_map.get(task_run.effective_tenant_id)
-            if tenant_map and task_run.effective_tenant_id is not None
-            else None
-        )
         return TaskLogDetailResponse(
-            id=task_run.id,
-            task_id=task_run.celery_task_id,
-            run_key=task_run.run_key,
-            task_name=task_run.task_name_snapshot,
-            handler_path=task_run.handler_path_snapshot,
-            task_definition_id=task_run.task_definition_id,
-            binding_id=task_run.binding_id,
-            task_definition_name=definition_info.get("name"),
-            task_scope=definition_info.get("scope"),
-            owner_tenant_id=task_run.owner_tenant_id,
-            owner_tenant_name=owner_tenant_name,
-            effective_tenant_id=task_run.effective_tenant_id,
-            effective_tenant_name=effective_tenant_name,
-            queue=task_run.queue,
-            status=task_run.status,
-            args=args,
-            kwargs=kwargs,
-            result=task_run.result_summary,
-            error_message=task_run.error_message_public
-            or task_run.error_message_internal,
-            trigger_source=task_run.trigger_source,
-            run_kind=task_run.run_kind,
-            trace_id=task_run.trace_id,
-            started_at=task_run.started_at,
-            finished_at=task_run.finished_at,
-            duration_ms=task_run.duration_ms,
-            retry_count=task_run.retry_count,
-            created_at=task_run.created_at,
-            traceback=task_run.traceback_internal,
+            **self.serialize_task_run(
+                task_run,
+                definition_map=definition_map,
+                tenant_map=tenant_map,
+            ),
+            traceback=None,
         ).model_dump()
 
 

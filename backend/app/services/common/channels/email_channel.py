@@ -1,205 +1,63 @@
-"""
-邮件通知渠道 / Email Notification Channel
-
-通过 Celery 异步任务发送邮件通知。使用专门的 notification 队列。
-Sends email notifications via Celery async tasks. Uses dedicated notification queue.
-"""
+"""中文: 邮件渠道仅保存加密投递意图。 EN: Email channel persists encrypted delivery intent only."""
 
 from __future__ import annotations
 
-from typing import Any
-
-from sqlalchemy.ext.asyncio import AsyncSession
-
-from app.configs.service import PLATFORM_TENANT_ID
-from app.core.logging import LogManager
 from app.services.common.channels.base import NotificationChannel
-
-logger = LogManager.get_logger("app")
 
 
 class EmailChannel(NotificationChannel):
-    """邮件渠道 — 通过 Celery notification 队列异步发送 / Email channel — async via Celery notification queue."""
+    """中文: SMTP 外发由已提交记录驱动。 EN: Committed records drive SMTP submission."""
 
     @property
-    def channel_code(self) -> str:
+    def channel_code(self):
         return "email"
 
     @property
-    def channel_name(self) -> str:
+    def channel_name(self):
         return "Email"
 
-    async def is_enabled(self) -> bool:
-        """检查 SMTP 邮件发送是否启用 / Check if SMTP email sending is enabled."""
-        try:
-            from app.core.database import sync_session_factory
-            from app.models.system.config import SystemConfig, SystemConfigValue
+    async def is_enabled(self):
+        from app.core.database import sync_session_factory
+        from app.services.common.email_service import _load_smtp_config_sync
 
-            session = sync_session_factory()
-            try:
-                row = (
-                    session.query(SystemConfigValue.value)
-                    .join(SystemConfig, SystemConfigValue.config_id == SystemConfig.id)
-                    .filter(
-                        SystemConfig.key == "email_enabled",
-                        SystemConfigValue.tenant_id == PLATFORM_TENANT_ID,
-                    )
-                    .first()
-                )
-                if not row:
-                    return False
-                val = row[0]
-                # 处理 JSON 编码的值（如 '"true"'）
-                if isinstance(val, str) and val.startswith('"') and val.endswith('"'):
-                    val = val.strip('"')
-                return val == "true" or val is True
-            finally:
-                session.close()
-        except Exception:
-            return False
+        with sync_session_factory() as db:
+            return bool(_load_smtp_config_sync(db).enabled)
 
     async def deliver(
         self,
-        db: AsyncSession,
-        user_type: str,
-        user_id: int,
-        title: str,
-        body: str | None,
-        data: dict[str, Any] | None,
-        link: str | None,
-        priority: str,
-        template_code: str,
-        tenant_id: int | None = None,
-        **kwargs: Any,
-    ) -> bool:
-        """
-        通过邮件发送通知 / Deliver notification via email.
+        db,
+        user_type,
+        user_id,
+        title,
+        body,
+        data,
+        link,
+        priority,
+        template_code,
+        tenant_id=None,
+        **kwargs,
+    ):
+        from app.services.common.notification_delivery_service import (
+            prepare_external_delivery,
+        )
 
-        支持 kwargs:
-            email_html: 自定义 HTML 邮件正文（富文本邮件场景）
-            email_subject: 自定义邮件主题（默认用 title）
-            email_text: 自定义纯文本正文
-        """
-        _ = data
-        delivery_record = kwargs.get("delivery_record")
-        try:
-            # 企业级邮件通知开关检查 / Tenant-level email notification switch check
-            if tenant_id:
-                try:
-                    from app.configs.service import ConfigService
-
-                    config_service = ConfigService(db)
-                    email_enabled = await config_service.get_tenant_config(
-                        tenant_id=tenant_id,
-                        key="tenant_email_notification",
-                    )
-                    if email_enabled is False:
-                        logger.debug(
-                            "EmailChannel: tenant {} email notification disabled, skip",
-                            tenant_id,
-                        )
-                        if delivery_record is not None:
-                            delivery_record.status = "skipped"
-                            delivery_record.last_error = (
-                                "tenant_email_notification_disabled"
-                            )
-                        return False
-                except Exception as cfg_err:
-                    logger.warning(
-                        "EmailChannel: tenant config check failed: {}", cfg_err
-                    )
-
-            email = await self._get_user_email(db, user_type, user_id)
-            if not email:
-                logger.debug(
-                    "EmailChannel: no email for {}:{}, skip", user_type, user_id
-                )
-                if delivery_record is not None:
-                    delivery_record.status = "skipped"
-                    delivery_record.last_error = "recipient_email_missing"
-                return False
-
-            from app.tasks.notification import send_notification_email
-
-            email_subject = kwargs.get("email_subject") or title
-            email_html = kwargs.get("email_html")
-            email_text = kwargs.get("email_text")
-
-            # 没有自定义 HTML 时，自动使用通知 HTML 模板包装
-            if not email_html:
-                try:
-                    from app.services.common.email_templates import (
-                        render_notification_html,
-                    )
-
-                    email_html, email_text = render_notification_html(
-                        title=title,
-                        body=body,
-                        priority=priority,
-                        link=link,
-                    )
-                    logger.debug(
-                        "EmailChannel: rendered HTML template OK, len={}",
-                        len(email_html),
-                    )
-                except Exception as tpl_err:
-                    logger.error(
-                        "EmailChannel: render_notification_html failed: {}",
-                        tpl_err,
-                        exc_info=True,
-                    )
-                    # 降级为纯文本 / Degrade to plain text
-                    email_html = body or title
-
-            async_result = send_notification_email.delay(
-                to=[email],
-                subject=email_subject,
-                html_body=email_html,
-                text_body=email_text,
-                triggered_by=template_code,
-                tenant_id=tenant_id,
-                delivery_id=getattr(delivery_record, "id", None),
-            )
-            if delivery_record is not None:
-                delivery_record.status = "queued"
-                delivery_record.attempt = (delivery_record.attempt or 0) + 1
-                delivery_record.task_id = getattr(async_result, "id", None)
-                delivery_record.last_error = None
-            return True
-        except Exception as e:
-            logger.warning("EmailChannel deliver failed: {}", str(e))
-            if delivery_record is not None:
-                delivery_record.status = "failed"
-                delivery_record.attempt = (delivery_record.attempt or 0) + 1
-                delivery_record.last_error = str(e)[:2000]
-            return False
-
-    @staticmethod
-    async def _get_user_email(
-        db: AsyncSession, user_type: str, user_id: int
-    ) -> str | None:
-        """获取用户邮箱 / Get user email address."""
-        from sqlalchemy import select
-
-        if user_type == "admin":
-            from app.models import Admin
-
-            result = await db.execute(select(Admin.email).where(Admin.id == user_id))
-        elif user_type == "tenant_admin":
-            from app.models import TenantAdmin
-
-            result = await db.execute(
-                select(TenantAdmin.email).where(TenantAdmin.id == user_id)
-            )
-        elif user_type == "tenant_user":
-            from app.models import TenantUser
-
-            result = await db.execute(
-                select(TenantUser.email).where(TenantUser.id == user_id)
-            )
-        else:
-            return None
-        return result.scalar_one_or_none()
+        delivery = kwargs.pop("delivery_record", None)
+        if delivery is None or delivery.channel != "email":
+            raise ValueError("notification_delivery_record_required")
+        return await prepare_external_delivery(
+            db,
+            delivery,
+            user_type=user_type,
+            user_id=user_id,
+            title=title,
+            body=body,
+            data=data,
+            link=link,
+            priority=priority,
+            template_code=template_code,
+            tenant_id=tenant_id,
+            **kwargs,
+        )
 
 
 __all__ = ["EmailChannel"]

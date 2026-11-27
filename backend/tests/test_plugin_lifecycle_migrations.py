@@ -1,4 +1,6 @@
-"""Test type: structural
+"""中文: structural；验证插件迁移命令装配，不宣称真实数据库升级验收。
+
+EN: Test type: structural.
 Scope: plugin lifecycle Alembic migration execution.
 Real dependencies: LifecycleMigrationMixin script generation.
 Mocked dependencies: subprocess runner and migration path discovery.
@@ -15,6 +17,8 @@ import pytest
 
 import app.plugins.lifecycle_migrations as lifecycle_migrations
 from app.plugins.lifecycle_migrations import LifecycleMigrationMixin
+
+pytestmark = pytest.mark.structural
 
 
 class _LifecycleHarness(LifecycleMigrationMixin):
@@ -33,11 +37,22 @@ async def test_run_alembic_upgrade_does_not_stamp_duplicate_table_failures(
         captured_scripts.append(str(args[2]))
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
+    versions = (
+        tmp_path / "plugins" / "demo-plugin" / "backend" / "migrations" / "versions"
+    )
+    versions.mkdir(parents=True)
+    (tmp_path / "migrations").mkdir()
+    (versions / "001.py").write_text(
+        "revision='demo_001'\ndown_revision=None\n"
+        "def upgrade():\n pass\ndef downgrade():\n pass\n",
+        encoding="utf-8",
+    )
+
     monkeypatch.setattr(lifecycle_migrations, "PLUGINS_DIR", tmp_path / "plugins")
     monkeypatch.setattr(
         lifecycle_migrations,
         "build_migration_version_locations",
-        lambda **_kwargs: [str(tmp_path / "plugins" / "demo-plugin")],
+        lambda **_kwargs: [str(versions)],
     )
     monkeypatch.setattr(lifecycle_migrations, "run_subprocess_async", _fake_subprocess)
 
@@ -45,6 +60,7 @@ async def test_run_alembic_upgrade_does_not_stamp_duplicate_table_failures(
 
     assert captured_scripts
     script = captured_scripts[0]
+    assert "target = 'demo_001'" in script
     assert "command.upgrade(cfg, target)" in script
     assert "command.stamp" not in script
     assert "DuplicateTable" not in script

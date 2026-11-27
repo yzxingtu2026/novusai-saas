@@ -7,6 +7,7 @@ IMAGE_NAME=${IMAGE_NAME:-novusai-web-antd-local}
 CONTAINER_NAME=${CONTAINER_NAME:-novusai-web-antd-local}
 VITE_APP_TITLE=${VITE_APP_TITLE:-NovusAI SaaS}
 VITE_APP_NAMESPACE=${VITE_APP_NAMESPACE:-novusai-web-saas}
+VITE_GLOB_API_URL=${VITE_GLOB_API_URL:-/}
 
 function require_build_arg() {
     local name="$1"
@@ -19,8 +20,8 @@ function require_build_arg() {
 function require_https_url() {
     local name="$1"
     local value="${!name:-}"
-    if [[ -n "${value}" && "${value}" != https://* ]]; then
-        ERROR="${name} must start with https:// for a production frontend image"
+    if [[ -n "${value}" && "${value}" != / && "${value}" != https://* ]]; then
+        ERROR="${name} must be / or start with https:// for a production frontend image"
     fi
 }
 

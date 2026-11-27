@@ -751,7 +751,9 @@ async def test_context_engine_after_turn_refreshes_compaction_snapshot() -> None
 
 
 @pytest.mark.asyncio
-async def test_prepare_execution_exposes_memory_recall_context_tool_when_enabled() -> None:
+async def test_prepare_execution_exposes_memory_recall_context_tool_when_enabled() -> (
+    None
+):
     engine = ConversationEngine(
         db=MagicMock(), gateway=MagicMock(), sandbox=MagicMock()
     )
@@ -1077,7 +1079,7 @@ async def test_call_llm_runtime_errors_do_not_fallback_to_legacy() -> None:
 
 
 @pytest.mark.asyncio
-async def test_sync_io_adapter_fast_text_round_passes_low_reasoning_override() -> None:
+async def test_sync_io_adapter_fast_text_round_passes_low_reasoning_default() -> None:
     engine = ConversationEngine(
         db=MagicMock(), gateway=MagicMock(), sandbox=MagicMock()
     )
@@ -1118,7 +1120,7 @@ async def test_sync_io_adapter_fast_text_round_passes_low_reasoning_override() -
     assert engine._call_llm.await_count == 1
     kwargs = engine._call_llm.await_args.kwargs
     assert kwargs["execution_path"] == "fast"
-    assert kwargs["extra_kwargs"] == {"_runtime_reasoning_effort_override": "low"}
+    assert kwargs["extra_kwargs"] == {"_runtime_reasoning_effort_default": "low"}
 
 
 @pytest.mark.asyncio

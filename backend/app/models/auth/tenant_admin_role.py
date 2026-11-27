@@ -7,7 +7,18 @@ Tenant-level roles for tenant admin permission control, supports multi-level rol
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, Boolean, Column, ForeignKey, Integer, String, Table, Text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.base_model import Base, TenantModel
@@ -46,6 +57,29 @@ class TenantAdminRole(TenantModel):
     """
 
     __tablename__ = "tenant_admin_roles"
+
+    __table_args__ = (
+        Index(
+            "uq_tenant_admin_roles_flat_name",
+            "tenant_id",
+            "name",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND type = 'role' AND parent_id IS NULL "
+                "AND path IS NULL AND leader_id IS NULL AND level = 1"
+            ),
+        ),
+        Index(
+            "uq_tenant_admin_roles_flat_code",
+            "tenant_id",
+            "code",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND type = 'role' AND parent_id IS NULL "
+                "AND path IS NULL AND leader_id IS NULL AND level = 1"
+            ),
+        ),
+    )
 
     __delete_deps__ = [
         DeletionDep(

@@ -1,3 +1,5 @@
+FROM node:22.22.0-bookworm-slim AS plugin-toolchain
+
 FROM python:3.12-slim AS builder
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -29,6 +31,38 @@ COPY backend/app ./app
 # EN: Production dependencies must come from uv.lock to avoid unverified range resolution.
 RUN uv sync --frozen --no-dev
 
+FROM builder AS plugin-builder
+
+COPY --from=plugin-toolchain /usr/local/bin/node /usr/local/bin/node
+COPY --from=plugin-toolchain /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+    && npm install --global --no-audit --no-fund pnpm@10.28.2
+
+COPY backend/scripts ./scripts
+COPY --exclude=frontend/dist backend/plugins/novusdoc/ ./plugins/novusdoc/
+COPY --exclude=frontend/dist backend/plugins/slider-captcha/ ./plugins/slider-captcha/
+COPY --exclude=frontend/dist backend/plugins/storage-billing/ ./plugins/storage-billing/
+COPY --exclude=frontend/dist backend/plugins/storage-migration/ ./plugins/storage-migration/
+
+RUN set -eux; \
+    for plugin in novusdoc slider-captcha storage-billing storage-migration; do \
+        frontend="plugins/$plugin/frontend"; \
+        if [ -f "$frontend/pnpm-lock.yaml" ]; then \
+            pnpm --dir "$frontend" install --frozen-lockfile; \
+        else \
+            npm ci --prefix "$frontend" --no-audit --no-fund; \
+        fi; \
+        .venv/bin/novusai plugin build "plugins/$plugin"; \
+        .venv/bin/novusai plugin validate "plugins/$plugin"; \
+    done
+
+FROM scratch AS plugin-assets
+
+COPY --from=plugin-builder /app/plugins/novusdoc/frontend/dist/ /plugins/novusdoc/frontend/dist/
+COPY --from=plugin-builder /app/plugins/slider-captcha/frontend/dist/ /plugins/slider-captcha/frontend/dist/
+COPY --from=plugin-builder /app/plugins/storage-billing/frontend/dist/ /plugins/storage-billing/frontend/dist/
+COPY --from=plugin-builder /app/plugins/storage-migration/frontend/dist/ /plugins/storage-migration/frontend/dist/
+
 FROM python:3.12-slim AS runtime
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
@@ -54,7 +88,13 @@ WORKDIR /app
 COPY --from=builder --chown=novusai:novusai /app/.venv /app/.venv
 COPY --from=builder /VERSION /VERSION
 COPY --from=builder --chown=novusai:novusai /app/VERSION /app/VERSION
-COPY --chown=novusai:novusai backend/ .
+COPY --chown=novusai:novusai \
+    --exclude=plugins/novusdoc/frontend/dist \
+    --exclude=plugins/slider-captcha/frontend/dist \
+    --exclude=plugins/storage-billing/frontend/dist \
+    --exclude=plugins/storage-migration/frontend/dist \
+    backend/ .
+COPY --from=plugin-assets --chown=novusai:novusai /plugins/ ./plugins/
 
 RUN mkdir -p /app/logs /app/storage/uploads /app/storage/cache/images /app/var/celerybeat \
     && chown -R novusai:novusai /app
@@ -66,7 +106,7 @@ FROM runtime AS api
 EXPOSE 8000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/ready', timeout=5).read()" || exit 1
-CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000", "--workers", "2"]
+CMD ["sh", "-ec", "exec uvicorn app.main:app --host 0.0.0.0 --port 8000 --proxy-headers --forwarded-allow-ips \"${TRUSTED_PROXY_IPS:-}\" --workers 2"]
 
 FROM runtime AS worker
 

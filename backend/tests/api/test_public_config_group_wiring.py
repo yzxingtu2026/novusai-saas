@@ -71,9 +71,13 @@ async def test_platform_public_config_reads_domain_group(
         raising=False,
     )
 
+    monkeypatch.setattr(
+        "app.api.public.platform.settings.TENANT_DOMAIN_SUFFIX",
+        ".deployed.example.com",
+    )
     response = await get_platform_public_config(object())
 
-    assert response["data"]["tenant_domain_suffix"] == ".tenant.example.com"
+    assert response["data"]["tenant_domain_suffix"] == ".deployed.example.com"
     assert response["data"]["domain_verification_prefix"] == "_verify"
 
 

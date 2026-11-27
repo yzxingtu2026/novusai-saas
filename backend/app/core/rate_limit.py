@@ -1,72 +1,111 @@
 """
 IP 级速率限制 / IP-based rate limiting.
 
-In-memory sliding window for login and other public endpoints.
-内存滑动窗口，用于登录等公开端点防暴力破解。
+Redis-backed login throttling shared by API workers and replicas.
+登录限流由 API 进程和副本共享 Redis 计数。
 """
 
 from __future__ import annotations
 
-import time
-from collections import defaultdict
+from hashlib import sha256
+from ipaddress import IPv4Address, IPv6Address, ip_address, ip_network
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
+from redis.exceptions import RedisError
 
+from app.core.config import settings
 from app.core.i18n import _
+from app.core.redis import cache_increment
 from app.core.response import build_error_payload
+from app.exceptions import ServiceUnavailableException
 
-_login_buckets: dict[str, list[float]] = defaultdict(list)
 _LOGIN_WINDOW = 60  # seconds / 窗口秒数
 _LOGIN_MAX = 10  # requests per window / 窗口内最大请求数
-_eviction_last = 0.0
 
 
-def _get_client_ip(request: Request) -> str:
-    """
-    Get real client IP, respecting reverse proxy headers.
-    获取真实客户端 IP，支持反向代理头 X-Forwarded-For / X-Real-IP。
-    """
-    forwarded = request.headers.get("x-forwarded-for")
+def _canonical_ip(address: IPv4Address | IPv6Address) -> str:
+    """生成稳定的客户端 IP / Use one identity for an address regardless of IPv6 scope."""
+    return address.compressed.partition("%")[0]
+
+
+def _is_trusted_proxy(
+    address: IPv4Address | IPv6Address, configured: list[str]
+) -> bool:
+    for entry in configured:
+        try:
+            network = ip_network(entry)
+        except ValueError:
+            continue
+        if address in network:
+            return True
+    return False
+
+
+def resolve_client_ip(
+    peer: str,
+    forwarded: str | None = None,
+    real_ip: str | None = None,
+) -> str | None:
+    """仅信任明确配置的代理 / Accept forwarded client IPs from configured peers."""
+    try:
+        peer_address = ip_address(peer)
+    except ValueError:
+        # Uvicorn 可能已改写 ASGI 地址 / Uvicorn may have rewritten the ASGI address.
+        return None
+    peer_ip = _canonical_ip(peer_address)
+    trusted = settings.trusted_proxy_ips_list
+    if not _is_trusted_proxy(peer_address, trusted):
+        return peer_ip
+
     if forwarded:
-        return forwarded.split(",")[0].strip()
-    real_ip = request.headers.get("x-real-ip")
+        # 从最近的代理向外遍历 / Walk from the nearest proxy outward.
+        hops = forwarded.split(",")
+        for hop in reversed(hops):
+            try:
+                address = ip_address(hop.strip())
+            except ValueError:
+                return peer_ip
+            if not _is_trusted_proxy(address, trusted):
+                return _canonical_ip(address)
+        return _canonical_ip(ip_address(hops[0].strip()))
     if real_ip:
-        return real_ip.strip()
-    return request.client.host if request.client else "unknown"
+        try:
+            return _canonical_ip(ip_address(real_ip.strip()))
+        except ValueError:
+            return peer_ip
+    return peer_ip
 
 
-def check_login_rate_limit(request: Request) -> JSONResponse | None:
-    """
-    IP 维度限流：10 次/60 秒 / IP rate limit: 10 req / 60 sec.
+def get_request_client_ip(request: Request) -> str | None:
+    """登录和限流使用同一客户端 IP / Resolve the same client IP for login and limits."""
+    if request.client is None:
+        return None
+    return resolve_client_ip(
+        request.client.host,
+        ",".join(request.headers.getlist("x-forwarded-for")),
+        ",".join(request.headers.getlist("x-real-ip")),
+    )
 
-    Returns 429 JSONResponse if over limit, None otherwise.
-    超限返回 429，否则返回 None。
-    """
-    global _eviction_last
-    client_ip = _get_client_ip(request)
-    now = time.monotonic()
-    cutoff = now - _LOGIN_WINDOW
 
-    # Periodic eviction of stale IPs / 定期清理过期 IP
-    if now - _eviction_last > 300:
-        stale = [ip for ip, ts in _login_buckets.items() if not ts or ts[-1] < cutoff]
-        for ip in stale:
-            del _login_buckets[ip]
-        _eviction_last = now
+async def check_login_rate_limit(request: Request) -> JSONResponse | None:
+    """每 IP 60 秒允许 10 次登录请求 / Allow ten requests per IP in a 60-second window."""
+    client_ip = get_request_client_ip(request) or "unknown"
+    digest = sha256(client_ip.encode("utf-8", errors="replace")).hexdigest()
+    try:
+        count = await cache_increment(f"auth:login_rate:{digest}", ttl=_LOGIN_WINDOW)
+    except (RedisError, RuntimeError) as exc:
+        raise ServiceUnavailableException() from exc
 
-    bucket = [t for t in _login_buckets.get(client_ip, []) if t > cutoff]
-    if len(bucket) >= _LOGIN_MAX:
+    if count > _LOGIN_MAX:
         return JSONResponse(
             status_code=429,
-            headers={"Retry-After": str(int(_LOGIN_WINDOW))},
+            headers={"Retry-After": str(_LOGIN_WINDOW)},
             content=build_error_payload(
                 message=_("auth.rate_limited"),
                 code=4290,
-                extra={"retry_after": int(_LOGIN_WINDOW)},
+                extra={"retry_after": _LOGIN_WINDOW},
             ),
         )
 
-    bucket.append(now)
-    _login_buckets[client_ip] = bucket
     return None

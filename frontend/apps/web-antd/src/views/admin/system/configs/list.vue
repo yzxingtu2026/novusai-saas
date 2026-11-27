@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { AdminSslDnsReadiness } from '#/api/admin/configs';
+import type { ConfigGroupRequest } from '#/composables/use-config-group-request-owner';
 import type {
   ConfigGroupListItemMeta,
   ConfigItemMeta,
@@ -32,6 +33,7 @@ import {
 import { ConfigForm } from '#/components';
 import ConfigGroupSidebar from '#/components/business/config-group-sidebar/index.vue';
 import PluginSettingsTabs from '#/components/business/plugin-slots/PluginSettingsTabs.vue';
+import { useConfigGroupRequestOwner } from '#/composables/use-config-group-request-owner';
 import { $t as t } from '#/locales';
 
 // Platform storage config dedicated panel / 平台存储配置专用面板
@@ -61,9 +63,7 @@ const groups = ref<ConfigGroupListItemMeta[]>([]);
 const activeGroup = ref<string>('');
 const configs = ref<ConfigItemMeta[]>([]);
 const dnsReadiness = ref<AdminSslDnsReadiness | null>(null);
-const loading = ref(false);
 const groupLoading = ref(false);
-const saving = ref(false);
 interface ConfigFormExpose {
   isDirty: () => boolean;
   prepareSubmitData: () => ConfigSubmitPayload;
@@ -75,6 +75,15 @@ const storagePanelRef = ref<{
   onSave: () => Promise<void>;
   saving: { value: boolean };
 }>();
+const requestOwner = useConfigGroupRequestOwner({
+  activeGroup: () => activeGroup.value,
+  onInvalidate: () => {
+    configs.value = [];
+    dnsReadiness.value = null;
+    groupLoading.value = false;
+  },
+});
+const { loading, saving, ready: formReady } = requestOwner;
 
 function getQueryStringParam(key: string): string {
   const value = route.query[key];
@@ -119,27 +128,40 @@ async function syncRouteSelection(groupCode: string, configKey?: string) {
   await router.replace({ hash: route.hash, path: route.path, query });
 }
 
-async function scrollToConfigItem(configKey: string) {
+async function scrollToConfigItem(
+  configKey: string,
+  request: ConfigGroupRequest,
+) {
   await nextTick();
+  if (
+    !requestOwner.isCurrent(request) ||
+    !formReady.value ||
+    request.group !== getRequestedGroupCode() ||
+    configKey !== getRequestedConfigKey()
+  )
+    return;
   const target = document.querySelector<HTMLElement>(
     `#config-item-${CSS.escape(configKey)}`,
   );
   target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-async function focusRequestedConfig(groupCode: string) {
+async function focusRequestedConfig(request: ConfigGroupRequest) {
   const requestedConfigKey = getRequestedConfigKey();
   if (
+    !requestOwner.isCurrent(request) ||
+    !formReady.value ||
     !requestedConfigKey ||
-    groupCode !== getRequestedGroupCode() ||
+    request.group !== getRequestedGroupCode() ||
     !configs.value.some((cfg) => cfg.key === requestedConfigKey)
   ) {
     return;
   }
-  await scrollToConfigItem(requestedConfigKey);
+  await scrollToConfigItem(requestedConfigKey, request);
 }
 
 async function applyRouteSelection() {
+  if (!requestOwner.capturePage()) return;
   const requestedGroupCode = getResolvedRequestedGroupCode();
   if (!requestedGroupCode) return;
   const requestedConfigKey = getRequestedConfigKey() || undefined;
@@ -151,7 +173,8 @@ async function applyRouteSelection() {
     return;
   }
   if (requestedConfigKey) {
-    await focusRequestedConfig(requestedGroupCode);
+    const request = requestOwner.current();
+    if (request) await focusRequestedConfig(request);
   }
 }
 
@@ -210,22 +233,29 @@ async function activateGroup(
   code: string,
   options?: { configKey?: string; syncRoute?: boolean },
 ) {
+  const request = requestOwner.select(code, code !== 'platform_storage');
+  if (!request) return;
   activeGroup.value = code;
+  configs.value = [];
+  dnsReadiness.value = null;
   if (options?.syncRoute !== false) {
     await syncRouteSelection(code, options?.configKey);
   }
+  if (!requestOwner.isCurrent(request)) return;
   if (code === 'platform_storage') {
-    configs.value = [];
-    dnsReadiness.value = null;
     return;
   }
-  await loadGroupDetail(code);
+  await loadGroupDetail(request);
 }
 
 async function loadGroups() {
+  const owner = requestOwner.capturePage();
+  if (!owner) return;
   groupLoading.value = true;
   try {
-    groups.value = await getAdminConfigGroupsApi();
+    const result = await getAdminConfigGroupsApi();
+    if (!requestOwner.isPageCurrent(owner)) return;
+    groups.value = result;
     if (groups.value.length > 0) {
       // Pick first group by sort_order / 按 sort_order 取第一个组
       const sorted = groups.value.toSorted(
@@ -243,16 +273,18 @@ async function loadGroups() {
       });
     }
   } finally {
-    groupLoading.value = false;
+    if (requestOwner.isPageCurrent(owner)) groupLoading.value = false;
   }
 }
 
-async function loadGroupDetail(code: string) {
-  loading.value = true;
+async function loadGroupDetail(request: ConfigGroupRequest) {
+  if (!requestOwner.startLoad(request)) return;
+  configs.value = [];
+  dnsReadiness.value = null;
   try {
-    const detailPromise = getAdminConfigGroupDetailApi(code);
+    const detailPromise = getAdminConfigGroupDetailApi(request.group);
     const readinessPromise =
-      code === PLATFORM_SSL_GROUP_CODE
+      request.group === PLATFORM_SSL_GROUP_CODE
         ? getAdminSslDnsReadinessApi({
             showCodeMessage: false,
             showErrorMessage: false,
@@ -262,26 +294,32 @@ async function loadGroupDetail(code: string) {
       detailPromise,
       readinessPromise,
     ]);
+    if (!requestOwner.isCurrent(request)) return;
     configs.value = (detail.configs || []).toSorted(
       (a, b) => (a.sort_order || 0) - (b.sort_order || 0),
     );
     dnsReadiness.value = readiness;
-    await focusRequestedConfig(code);
+    requestOwner.acceptLoad(request);
+    await focusRequestedConfig(request);
   } finally {
-    loading.value = false;
+    requestOwner.finishLoad(request);
   }
 }
 
 async function onSelectGroup(code: string) {
+  const request = requestOwner.current();
+  if (!request) return;
   if (code === activeGroup.value) return;
+  const form = formRef.value;
   // Check if form has modifications / 检查表单是否有修改
-  if (formRef.value?.isDirty?.()) {
+  if (form?.isDirty?.()) {
     Modal.confirm({
       title: t('shared.config.page.unsaved_title'),
       content: t('shared.config.page.unsaved_content'),
       okText: t('shared.common.confirm'),
       cancelText: t('shared.common.cancel'),
       onOk: async () => {
+        if (!requestOwner.isCurrent(request) || formRef.value !== form) return;
         await activateGroup(code);
       },
     });
@@ -291,30 +329,29 @@ async function onSelectGroup(code: string) {
 }
 
 async function onSave() {
-  if (!activeGroup.value) return;
+  if (!requestOwner.current()) return;
   if (activeGroup.value === 'platform_storage') {
     await storagePanelRef.value?.onSave();
     return;
   }
+  const form = formRef.value;
+  if (!form) return;
+  const owner = requestOwner.beginSave();
+  if (!owner) return;
   try {
-    await formRef.value?.validate();
-  } catch {
-    // Form validation failed, do not submit / 表单验证失败
-    return;
-  }
-  const payload = formRef.value?.prepareSubmitData();
-  if (!payload) return;
-  saving.value = true;
-  try {
-    await updateAdminConfigGroupApi(activeGroup.value, payload, {
+    await form.validate();
+    if (!requestOwner.ownsSave(owner) || formRef.value !== form) return;
+    const payload = form.prepareSubmitData();
+    await updateAdminConfigGroupApi(owner.request.group, payload, {
       showSuccessMessage: true,
     });
     // Reload to reflect latest values / 重新加载以反显最新值
-    await loadGroupDetail(activeGroup.value);
+    if (!requestOwner.ownsSave(owner) || formRef.value !== form) return;
+    await loadGroupDetail(owner.request);
   } catch {
     // Error already handled and displayed by request interceptor / 错误已由拦截器处理
   } finally {
-    saving.value = false;
+    requestOwner.finishSave(owner);
   }
 }
 
@@ -335,6 +372,10 @@ onActivated(() => {
     isInitialMount = false;
     return;
   }
+  if (groups.value.length === 0) {
+    void loadGroups();
+    return;
+  }
   const requestedGroupCode = getResolvedRequestedGroupCode();
   if (requestedGroupCode) {
     activateGroup(requestedGroupCode, {
@@ -343,8 +384,8 @@ onActivated(() => {
     });
     return;
   }
-  if (activeGroup.value && activeGroup.value !== 'platform_storage') {
-    loadGroupDetail(activeGroup.value);
+  if (activeGroup.value) {
+    void activateGroup(activeGroup.value, { syncRoute: false });
   }
 });
 watch(
@@ -396,7 +437,11 @@ onBeforeUnmount(() => {
                 ? storagePanelRef?.saving?.value
                 : saving
             "
-            :disabled="!activeGroup"
+            :disabled="
+              !activeGroup ||
+              (activeGroup !== 'platform_storage' &&
+                (!formReady || loading || saving))
+            "
             @click="onSave"
           >
             <template #icon>
@@ -412,7 +457,7 @@ onBeforeUnmount(() => {
             v-if="activeGroup === 'platform_storage'"
             ref="storagePanelRef"
           />
-          <div v-else-if="activeGroup" class="max-w-[800px]">
+          <div v-else-if="activeGroup && formReady" class="max-w-[800px]">
             <Alert
               v-if="activeGroup === PLATFORM_SSL_GROUP_CODE && dnsReadiness"
               class="mb-4"
@@ -447,7 +492,7 @@ onBeforeUnmount(() => {
             <PluginSettingsTabs />
           </div>
           <Empty
-            v-else
+            v-else-if="!activeGroup"
             :description="t('shared.config.page.select_group')"
             class="py-16"
           />

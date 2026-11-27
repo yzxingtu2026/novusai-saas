@@ -17,6 +17,8 @@ tags:
 capabilities:
   - db:own_tables
   - platform:read
+  - storage:credential_use
+  - config:read
   - http:outbound
   - config:write
 

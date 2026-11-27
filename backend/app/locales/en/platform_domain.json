@@ -1,0 +1,29 @@
+{
+  "config": {
+    "platform": {
+      "tenant_domain_suffix": {
+        "name": "Tenant Default Domain Suffix",
+        "desc": "Tenant hostname suffix managed by deployment; update DNS, HTTPS and proxy configuration together before redeploying."
+      }
+    }
+  },
+  "domain": {
+    "binding_verification_required": "Bind this domain in the tenant admin and use its returned random TXT verification record to prove ownership; public routing guidance does not create verification tokens.",
+    "instructions_header": "Custom domain DNS setup",
+    "cname_record_required": "Point your domain to the tenant entry",
+    "host_record": "Host record",
+    "record_type": "Record type",
+    "record_value": "Record value",
+    "dns_propagation_note": "DNS changes may take time to propagate. Follow the ownership verification instructions in domain management.",
+    "invalid_format": "Enter a hostname without a URL scheme, path or port.",
+    "custom_only_routing": "Use the custom-domain DNS target provided by your deployment operator."
+  },
+  "error": {
+    "config": {
+      "domain_suffix_deployment_managed": "Tenant domain suffix is managed by deployment TENANT_DOMAIN_SUFFIX; change DNS, HTTPS and proxy configuration together and redeploy."
+    }
+  },
+  "tenant_domain": {
+    "default_domain_remark": "Default tenant domain managed by the platform"
+  }
+}

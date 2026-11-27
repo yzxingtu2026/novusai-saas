@@ -1721,6 +1721,7 @@
         "has_users": "Role has associated users and cannot be deleted"
     },
     "enum": {
+        "task_status": {"unknown": "Outcome pending confirmation"},
         "status": {"active": "Active", "inactive": "Inactive"},
         "bool": {"yes": "Yes", "no": "No"},
         "gender": {"unknown": "Unknown", "male": "Male", "female": "Female"},
@@ -3337,7 +3338,13 @@
             "handler_kwargs_invalid": "Handler '{handler}' does not accept parameters: {fields}"
         }
     },
-    "task_log": {"error": {"not_found": "Task log not found"}},
+    "task_log": {
+        "error": {
+            "not_found": "Task log not found",
+            "retry_failed_only": "Only failed tasks can be retried.",
+            "retry_outcome_unknown": "Task outcome is unconfirmed. Verify the original execution before further action."
+        }
+    },
     "quota": {
         "no_limit": "No limit",
         "storage_exceeded": "Storage exceeded, currently used {current}GB, limit {limit}GB",

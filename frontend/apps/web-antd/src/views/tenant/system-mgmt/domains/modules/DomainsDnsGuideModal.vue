@@ -9,7 +9,7 @@
  */
 import type { DnsGuideData } from './domains-types';
 
-import { ref } from 'vue';
+import { onScopeDispose, ref } from 'vue';
 
 import { useVbenModal } from '@vben/common-ui';
 import { IconifyIcon } from '@vben/icons';
@@ -37,20 +37,32 @@ const emits = defineEmits<{
 const guideData = ref<DnsGuideData | null>(null);
 const currentStep = ref(0);
 const verifying = ref(false);
+let disposed = false;
+let generation = 0;
+
+function resetView() {
+  generation++;
+  guideData.value = null;
+  currentStep.value = 0;
+  verifying.value = false;
+}
+
+onScopeDispose(() => {
+  disposed = true;
+  resetView();
+});
 
 // Modal / 弹窗
 const [Modal, modalApi] = useVbenModal({
   onOpenChange(isOpen) {
+    if (disposed) return;
+    resetView();
     if (isOpen) {
       const data = modalApi.getData<DnsGuideData>();
       if (data) {
         guideData.value = data;
         currentStep.value = 0;
       }
-    } else {
-      guideData.value = null;
-      currentStep.value = 0;
-      verifying.value = false;
     }
   },
   footer: false,
@@ -80,24 +92,32 @@ function onPrev() {
 
 /** Initiate verification / 发起验证 */
 async function onVerify() {
+  if (disposed || verifying.value) return;
   if (!guideData.value?.domainId) {
     modalApi.close();
     return;
   }
 
   verifying.value = true;
+  const owner = { ...guideData.value, generation };
+  const ownsView = () =>
+    !disposed &&
+    generation === owner.generation &&
+    guideData.value?.domainId === owner.domainId;
   try {
-    const result = await verifyTenantDomainApi(guideData.value.domainId);
+    const result = await verifyTenantDomainApi(owner.domainId);
+    if (disposed) return;
     if (result.verificationStatus === 'verified') {
-      message.success($t('tenant.system.domain.messages.verifySuccess'));
       emits('success');
+      if (!ownsView()) return;
+      message.success($t('tenant.system.domain.messages.verifySuccess'));
       modalApi.close();
-    } else {
+    } else if (ownsView()) {
       message.warning($t('tenant.system.domain.messages.verifyFailed'));
     }
   } catch {
   } finally {
-    verifying.value = false;
+    if (ownsView()) verifying.value = false;
   }
 }
 
@@ -107,23 +127,6 @@ function open(data: DnsGuideData) {
 }
 
 defineExpose({ open });
-
-/**
- * Get DNS host record / 获取 DNS 主机记录
- * - Second-level domain (e.g. example.com) returns @
- * - 二级域名（如 example.com）返回 @
- * - Third-level+ domain (e.g. www.example.com) returns first part
- * - 三级及以上域名（如 www.example.com）返回第一部分
- */
-function getDnsHostRecord(domain: string): string {
-  const parts = domain.split('.');
-  if (parts.length >= 3) {
-    // Third-level+ domain, return subdomain part / 三级及以上域名，返回子域名部分
-    return parts[0] || '';
-  }
-  // Second-level domain, return @ / 二级域名，返回 @
-  return '@';
-}
 </script>
 
 <template>
@@ -151,7 +154,9 @@ function getDnsHostRecord(domain: string): string {
             <Descriptions.Item
               :label="$t('tenant.system.domain.dns.recordType')"
             >
-              <Tag color="blue">TXT</Tag>
+              <Tag color="blue">
+                {{ guideData.verificationInfo?.type || 'TXT' }}
+              </Tag>
             </Descriptions.Item>
             <Descriptions.Item
               :label="$t('tenant.system.domain.dns.hostRecord')"
@@ -160,14 +165,12 @@ function getDnsHostRecord(domain: string): string {
                 <code
                   class="break-all rounded bg-accent px-2 py-1 text-xs text-foreground"
                 >
-                  {{ guideData.verificationInfo?.host || '_verification' }}
+                  {{ guideData.verificationInfo?.host || '-' }}
                 </code>
                 <Button
                   type="link"
                   size="small"
-                  @click="
-                    onCopy(guideData.verificationInfo?.host || '_verification')
-                  "
+                  @click="onCopy(guideData.verificationInfo?.host || '')"
                 >
                   <IconifyIcon icon="lucide:copy" class="size-4" />
                 </Button>
@@ -180,22 +183,12 @@ function getDnsHostRecord(domain: string): string {
                 <code
                   class="break-all rounded bg-accent px-2 py-1 text-xs text-foreground"
                 >
-                  {{
-                    guideData.verificationInfo?.value ||
-                    guideData.verificationToken ||
-                    '-'
-                  }}
+                  {{ guideData.verificationInfo?.value || '-' }}
                 </code>
                 <Button
                   type="link"
                   size="small"
-                  @click="
-                    onCopy(
-                      guideData.verificationInfo?.value ||
-                        guideData.verificationToken ||
-                        '',
-                    )
-                  "
+                  @click="onCopy(guideData.verificationInfo?.value || '')"
                 >
                   <IconifyIcon icon="lucide:copy" class="size-4" />
                 </Button>
@@ -206,6 +199,11 @@ function getDnsHostRecord(domain: string): string {
 
         <!-- 步骤 2: CNAME 记录 -->
         <template v-if="currentStep === 1">
+          <Alert
+            :message="$t('shared.domain.dnsFqdnHint')"
+            type="info"
+            class="mb-4"
+          />
           <Alert
             :message="$t('tenant.system.domain.dns.step2Desc')"
             type="info"
@@ -226,12 +224,12 @@ function getDnsHostRecord(domain: string): string {
                 <code
                   class="break-all rounded bg-accent px-2 py-1 text-xs text-foreground"
                 >
-                  {{ getDnsHostRecord(guideData.domain) }}
+                  {{ guideData.domain }}
                 </code>
                 <Button
                   type="link"
                   size="small"
-                  @click="onCopy(getDnsHostRecord(guideData.domain))"
+                  @click="onCopy(guideData.domain)"
                 >
                   <IconifyIcon icon="lucide:copy" class="size-4" />
                 </Button>

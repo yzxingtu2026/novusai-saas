@@ -7,7 +7,7 @@ Provides tenant business-user permission role CRUD, permission assignment, statu
 
 from __future__ import annotations
 
-from fastapi import Query, Request
+from fastapi import HTTPException, Query, Request, status
 
 from app.core.base_controller import TenantController
 from app.core.deps import ActiveTenantAdmin, DbSession, QueryParams
@@ -29,6 +29,10 @@ from app.rbac.decorators import (
     action_read,
     action_update,
     permission_resource,
+)
+from app.rbac.services import PermissionService
+from app.rbac.services.permission_domains.presentation import (
+    PermissionPresentationDomain,
 )
 from app.schemas.tenant.user_role import (
     TenantUserRoleCreateRequest,
@@ -118,12 +122,40 @@ class TenantUserRoleController(TenantController):
             db: DbSession,
             current_admin: ActiveTenantAdmin,
             role_id: int,
+            include_permission_options: bool = False,
         ):
             service = TenantUserRoleService(db, current_admin.tenant_id)
             role = await service.get_by_id(role_id)
             if not role:
                 raise NotFoundException(message=_("tenant_user_role.not_found"))
-            return success(data=_serialize_role_detail(role))
+
+            detail = _serialize_role_detail(role)
+            if include_permission_options:
+                permission_service = PermissionService(db)
+                required = "tenant_user_role:assign_permissions"
+                # Use the same effective request grants that guard the assignment PUT.
+                if not permission_service.check_permission(
+                    request.state.user_permissions, required
+                ):
+                    raise HTTPException(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        detail={
+                            "code": "PERMISSION_DENIED",
+                            "message": _(
+                                "rbac.permission_denied_with_code", code=required
+                            ),
+                            "permission_code": required,
+                        },
+                    )
+                options = await permission_service.get_enabled_permissions_by_scope(
+                    PermissionScope.USER.value
+                )
+                detail["permission_options"] = [
+                    PermissionPresentationDomain.serialize_permission(permission)
+                    for permission in options
+                ]
+
+            return success(data=detail)
 
         @router.post("", summary="创建用户角色")
         @action_create("action.tenant_user_role.create")

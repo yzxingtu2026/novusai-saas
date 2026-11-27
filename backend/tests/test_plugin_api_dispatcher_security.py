@@ -10,6 +10,7 @@ import pytest
 from fastapi.responses import JSONResponse, StreamingResponse
 from starlette.requests import Request
 
+from app.core.i18n import translate
 from app.core.security import TOKEN_SCOPE_ADMIN, TOKEN_SCOPE_TENANT_ADMIN
 from app.plugins.api_dispatcher import (
     _check_plugin_permission,
@@ -327,7 +328,7 @@ async def test_dispatch_raises_app_exception_on_handler_runtime_error(
 
     assert getattr(exc_info.value, "code", None) == 5000
     assert getattr(exc_info.value, "status_code", None) == 500
-    assert str(exc_info.value) == "服务器内部错误"
+    assert str(exc_info.value) == translate("common.server_error")
     assert "boom" not in str(exc_info.value)
 
 
@@ -385,7 +386,7 @@ async def test_dispatch_raises_app_exception_on_error_json_response(
 
     assert getattr(exc_info.value, "code", None) == 5000
     assert getattr(exc_info.value, "status_code", None) == 500
-    assert str(exc_info.value) == "服务器内部错误"
+    assert str(exc_info.value) == translate("common.server_error")
 
 
 @pytest.mark.asyncio

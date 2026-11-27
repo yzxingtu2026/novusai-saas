@@ -118,6 +118,21 @@ def test_validate_provider_payload_rejects_invalid_base_url() -> None:
         )
 
 
+def test_removing_private_network_permission_revalidates_saved_base_url() -> None:
+    provider = SimpleNamespace(
+        type="openai_compatible",
+        base_url="http://127.0.0.1:8010/v1",
+        config={"allow_private_network": True},
+    )
+    assert AIProviderService._validate_provider_payload(
+        {"base_url": provider.base_url}, existing_provider=provider
+    ) == {"base_url": provider.base_url}
+    with pytest.raises(ValidationException):
+        AIProviderService._validate_provider_payload(
+            {"config": None}, existing_provider=provider
+        )
+
+
 def test_validate_provider_payload_normalizes_blank_base_url_to_null() -> None:
     payload = {
         "type": "openai_compatible",

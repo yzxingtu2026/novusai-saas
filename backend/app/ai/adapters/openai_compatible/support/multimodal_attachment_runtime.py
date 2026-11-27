@@ -4,13 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-import httpx
-
 from app.ai.adapters.openai_compatible.support.audio_inputs import (
     fetch_audio_bytes,
 )
 from app.ai.text_semantics import extract_data_url_payload
-from app.ai.tools.security import UrlValidator
 from app.ai.utils.chat_attachment_media import resolve_image_url_for_llm
 
 
@@ -21,8 +18,6 @@ async def fetch_audio_bytes_for_adapter(url: str) -> bytes | None:
             value,
             media_prefix="audio",
         ),
-        validate_url=UrlValidator.validate,
-        async_client_factory=httpx.AsyncClient,
     )
 
 

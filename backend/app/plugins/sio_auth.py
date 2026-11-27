@@ -18,22 +18,35 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 
 from app.core.logging import LogManager
 from app.core.response import build_error_event, build_exception_debug
+from app.core.security import (
+    TENANT_SESSION_EPOCH_CLAIM,
+    TOKEN_SCOPE_ADMIN,
+    TOKEN_SCOPE_TENANT_ADMIN,
+    TOKEN_SCOPE_TENANT_USER,
+    TOKEN_TYPE_ACCESS,
+    TokenExpiredError,
+    decode_token,
+    normalize_positive_subject_id,
+    tenant_session_epoch_matches,
+)
 from app.middleware.trace import (
     extract_optional_trace_id,
     normalize_trace_id,
     trace_id_var,
 )
 from app.sio.error_utils import socket_connect_refusal
+from app.sio.socket_trace import (
+    register_tenant_socket_session,
+    tenant_socket_session_is_current,
+    unregister_tenant_socket_session,
+)
+from app.sio.tenant_boundary import socket_matches_authenticated_tenant
 
 logger = LogManager.get_logger("plugin.sio")
 
 # Scope constant mapping (consistent with app.core.security)
 # / scope 常量映射
-_SCOPE_MAP = {
-    "admin": "admin",
-    "tenant_admin": "tenant_admin",
-    "tenant_user": "tenant_user",
-}
+_TOKEN_SCOPES = (TOKEN_SCOPE_ADMIN, TOKEN_SCOPE_TENANT_ADMIN, TOKEN_SCOPE_TENANT_USER)
 
 
 def _extract_trace_id(payload: dict[str, Any] | None = None) -> str | None:
@@ -104,6 +117,8 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
             _extract_trace_id(auth), default=str(uuid.uuid4())
         )
         trace_id_var.set(trace_id)
+        session_data = None
+        connected = False
         try:
             # 1. WS master switch / WS 总开关
             from app.sio.ws_config import get_ws_configs
@@ -120,48 +135,20 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
             if not token:
                 raise socket_connect_refusal("token_required")
 
-            from app.core.security import TokenExpiredError, verify_token_with_scope
-
-            user_id_str = None
-            matched_scope = None
-
-            for scope_name in self._auth_scopes:
-                scope_const = _SCOPE_MAP.get(scope_name)
-                if not scope_const:
-                    continue
-                try:
-                    from app.core.security import (
-                        TOKEN_SCOPE_ADMIN,
-                        TOKEN_SCOPE_TENANT_ADMIN,
-                        TOKEN_SCOPE_TENANT_USER,
-                    )
-
-                    scope_value = {
-                        "admin": TOKEN_SCOPE_ADMIN,
-                        "tenant_admin": TOKEN_SCOPE_TENANT_ADMIN,
-                        "tenant_user": TOKEN_SCOPE_TENANT_USER,
-                    }.get(scope_const)
-                    if scope_value is None:
-                        continue
-
-                    uid, _ = await verify_token_with_scope(
-                        token,
-                        scope_value,
-                        raise_on_expired=True,
-                    )
-                    if uid:
-                        user_id_str = uid
-                        matched_scope = scope_name
-                        break
-                except TokenExpiredError as exc:
-                    raise socket_connect_refusal("token_expired") from exc
-                except Exception:
-                    continue
-
-            if not user_id_str or not matched_scope:
+            try:
+                payload = await decode_token(token, raise_on_expired=True)
+            except TokenExpiredError as exc:
+                raise socket_connect_refusal("token_expired") from exc
+            if payload is None or payload.get("type") != TOKEN_TYPE_ACCESS:
                 raise socket_connect_refusal("authentication_failed")
-
-            user_id = int(user_id_str)
+            matched_scope = payload.get("scope")
+            user_id = normalize_positive_subject_id(payload.get("sub"))
+            if (
+                user_id is None
+                or matched_scope not in _TOKEN_SCOPES
+                or matched_scope not in self._auth_scopes
+            ):
+                raise socket_connect_refusal("authentication_failed")
 
             # 3. Connection rate limiting / 连接频率限制
             from app.sio.presence import check_connect_rate
@@ -173,26 +160,17 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
             # 4. Per-user max connection limit / 单用户最大连接数限制
             from app.sio.presence import PresenceManager
 
-            max_conn = int(ws_cfg.get("ws_max_connections_per_user", 5))
-            current_conn = await PresenceManager.get_user_connection_count(
-                rate_key,
-                user_id,
-            )
-            if current_conn >= max_conn:
-                raise socket_connect_refusal("max_connections_exceeded")
-
             # 5. Query user + tenant_id / 查询用户
             tenant_id = None
-            username = ""
+            session_epoch = None
 
             from sqlalchemy import select
 
             from app.core.database import async_session_factory
+            from app.models import Admin, Tenant, TenantAdmin, TenantUser
 
             async with async_session_factory() as db:
-                if matched_scope == "admin":
-                    from app.models import Admin
-
+                if matched_scope == TOKEN_SCOPE_ADMIN:
                     result = await db.execute(
                         select(Admin).where(
                             Admin.id == user_id,
@@ -205,37 +183,47 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
                         raise socket_connect_refusal("account_not_found")
                     username = admin.username
 
-                elif matched_scope == "tenant_admin":
-                    from app.models import TenantAdmin
-
+                else:
+                    identity_model = (
+                        TenantAdmin
+                        if matched_scope == TOKEN_SCOPE_TENANT_ADMIN
+                        else TenantUser
+                    )
                     result = await db.execute(
-                        select(TenantAdmin).where(
-                            TenantAdmin.id == user_id,
-                            TenantAdmin.is_deleted.is_(False),
-                            TenantAdmin.is_active.is_(True),
+                        select(identity_model, Tenant.session_revocation_epoch)
+                        .join(Tenant, Tenant.id == identity_model.tenant_id)
+                        .where(
+                            identity_model.id == user_id,
+                            identity_model.is_deleted.is_(False),
+                            identity_model.is_active.is_(True),
+                            Tenant.is_active.is_(True),
+                            Tenant.is_deleted.is_(False),
                         )
                     )
-                    ta = result.scalar_one_or_none()
-                    if not ta:
+                    row = result.one_or_none()
+                    if row is None:
                         raise socket_connect_refusal("account_not_found")
-                    tenant_id = ta.tenant_id
-                    username = ta.username
+                    identity, session_epoch = row
+                    tenant_id = identity.tenant_id
+                    username = identity.username
+                    if normalize_positive_subject_id(
+                        payload.get("tenant_id")
+                    ) != tenant_id or not tenant_session_epoch_matches(
+                        payload, session_epoch
+                    ):
+                        raise socket_connect_refusal("authentication_failed")
 
-                elif matched_scope == "tenant_user":
-                    from app.models import TenantUser
+            if tenant_id is not None and not await socket_matches_authenticated_tenant(
+                environ, tenant_id
+            ):
+                raise socket_connect_refusal("authentication_failed")
 
-                    result = await db.execute(
-                        select(TenantUser).where(
-                            TenantUser.id == user_id,
-                            TenantUser.is_deleted.is_(False),
-                            TenantUser.is_active.is_(True),
-                        )
-                    )
-                    tu = result.scalar_one_or_none()
-                    if not tu:
-                        raise socket_connect_refusal("account_not_found")
-                    tenant_id = tu.tenant_id
-                    username = tu.username
+            max_conn = int(ws_cfg.get("ws_max_connections_per_user", 5))
+            current_conn = await PresenceManager.get_user_connection_count(
+                rate_key, user_id, tenant_id
+            )
+            if current_conn >= max_conn:
+                raise socket_connect_refusal("max_connections_exceeded")
 
             # 6. Save session / 保存 session
             session_data = {
@@ -245,9 +233,18 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
                 "username": username,
                 "plugin_name": self._plugin_name,
                 "trace_id": trace_id,
+                TENANT_SESSION_EPOCH_CLAIM: session_epoch,
+                "token_jti": payload.get("jti"),
+                "token_exp": payload.get("exp"),
             }
             await self.save_session(sid, session_data)
             self._sid_sessions[sid] = session_data
+            if tenant_id is not None:
+                await register_tenant_socket_session(
+                    tenant_id, self.namespace, sid, session_epoch
+                )
+                if not await tenant_socket_session_is_current(session_data):
+                    raise socket_connect_refusal("authentication_failed")
 
             # Join standard rooms / 加入标准 rooms
             await self.enter_room(sid, f"user:{user_id}")
@@ -256,6 +253,7 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
 
             # Online status / 在线状态
             await PresenceManager.set_online(rate_key, user_id, tenant_id)
+            session_data["presence_online"] = True
 
             logger.info(
                 "Plugin SIO {} connected: sid={} user_id={} scope={} tenant_id={}",
@@ -270,6 +268,7 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
             # / 委托给插件 handler
             if hasattr(self._delegate, "on_connect"):
                 await self._delegate.on_connect(sid, environ, auth)
+            connected = True
         except SocketConnectionRefusedError:
             raise
         except Exception as exc:
@@ -282,6 +281,16 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
             )
             raise socket_connect_refusal("connection_failed", exc=exc) from exc
         finally:
+            if not connected and session_data is not None:
+                self._sid_sessions.pop(sid, None)
+                if tenant_id is not None:
+                    with contextlib.suppress(Exception):
+                        await unregister_tenant_socket_session(
+                            tenant_id, self.namespace, sid, session_epoch
+                        )
+                if session_data.pop("presence_online", False):
+                    with contextlib.suppress(Exception):
+                        await PresenceManager.set_offline(rate_key, user_id, tenant_id)
             trace_id_var.set("")
 
     async def on_disconnect(self, sid: str, reason: str = "") -> None:
@@ -303,7 +312,16 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
                 matched_scope = session.get("user_type", "")
                 rate_key = f"plugin_{self._plugin_name}_{matched_scope}"
 
-                if user_id:
+                if tenant_id is not None:
+                    with contextlib.suppress(Exception):
+                        await unregister_tenant_socket_session(
+                            tenant_id,
+                            self.namespace,
+                            sid,
+                            session[TENANT_SESSION_EPOCH_CLAIM],
+                        )
+
+                if user_id and session.pop("presence_online", False):
                     try:
                         from app.sio.presence import PresenceManager
 
@@ -366,6 +384,14 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
                 await self.save_session(sid, session)
             self._sid_sessions[sid] = session
         try:
+            if session is None:
+                return None
+            if session.get("user_type") != TOKEN_SCOPE_ADMIN and not (
+                await tenant_socket_session_is_current(session)
+            ):
+                if sid:
+                    await self.disconnect(sid)
+                return None
             # Delegate to plugin handler (compatible with async/sync)
             # / 委托给插件 handler
             handler = getattr(self._delegate, f"on_{event}", None)

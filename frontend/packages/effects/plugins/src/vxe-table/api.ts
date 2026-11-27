@@ -4,7 +4,7 @@ import type { ExtendedFormApi } from '@vben-core/form-ui';
 
 import type { VxeGridProps } from './types';
 
-import { toRaw } from 'vue';
+import { toRaw, watch } from 'vue';
 
 import { Store } from '@vben-core/shared/store';
 import {
@@ -38,7 +38,13 @@ export class VxeGridApi<T extends Record<string, any> = any> {
 
   private isMounted = false;
 
+  private readSequence = 0;
+
+  private readWaiters = new Set<() => void>();
+
   private stateHandler: StateHandler;
+
+  private stopNativeReadWatcher: (() => void) | null = null;
 
   constructor(options: VxeGridProps = {}) {
     const storeState = { ...options };
@@ -65,23 +71,36 @@ export class VxeGridApi<T extends Record<string, any> = any> {
       this.formApi = formApi;
       this.stateHandler.setConditionTrue();
       this.isMounted = true;
+      // 中文: 原生分页/排序先修改状态再发查询；仅在旧读取占用时排队，空闲操作仍由 VXE 单独发送。
+      // EN: Native paging/sorting changes state before querying; queue only behind an older read so idle actions remain VXE-owned.
+      // 中文: 稳定签名忽略 VXE 内部同值数组替换，避免旧查询再次排队。
+      // EN: A stable signature ignores VXE's same-value array replacement and prevents requeuing the current read.
+      this.stopNativeReadWatcher = watch(
+        () =>
+          JSON.stringify([
+            this.grid.reactData?.tablePage?.currentPage,
+            this.grid.reactData?.tablePage?.pageSize,
+            this.grid.reactData?.sortData?.map(({ field, order }) => [
+              field,
+              order,
+            ]),
+          ]),
+        () => {
+          if (this.isMounted && this.grid.reactData?.tableLoading) {
+            void this.runReadQuery('query', {});
+          }
+        },
+        { flush: 'sync' },
+      );
     }
   }
 
   async query(params: Record<string, any> = {}) {
-    try {
-      await this.grid.commitProxy('query', toRaw(params));
-    } catch (error) {
-      console.error('Error occurred while querying:', error);
-    }
+    return this.runReadQuery('query', params);
   }
 
   async reload(params: Record<string, any> = {}) {
-    try {
-      await this.grid.commitProxy('reload', toRaw(params));
-    } catch (error) {
-      console.error('Error occurred while reloading:', error);
-    }
+    return this.runReadQuery('reload', params);
   }
 
   setGridOptions(options: Partial<VxeGridProps['gridOptions']>) {
@@ -124,6 +143,51 @@ export class VxeGridApi<T extends Record<string, any> = any> {
 
   unmount() {
     this.isMounted = false;
+    this.stopNativeReadWatcher?.();
+    this.stopNativeReadWatcher = null;
+    this.readSequence += 1;
+    this.readWaiters.forEach((finish) => finish());
     this.stateHandler.reset();
+  }
+
+  private async runReadQuery(
+    code: 'query' | 'reload',
+    params: Record<string, unknown>,
+  ) {
+    const sequence = ++this.readSequence;
+    const requestParams = { ...toRaw(params) };
+    this.readWaiters.forEach((finish) => finish());
+    try {
+      // 中文: VXE 会忽略 loading 期间的提交；等待原生分页或搜索读取结束，再仅运行最新读取。
+      // EN: VXE ignores submissions while loading; wait for native paging or search reads and run only the newest read.
+      while (
+        this.isMounted &&
+        sequence === this.readSequence &&
+        this.grid.reactData?.tableLoading
+      ) {
+        await new Promise<void>((resolve) => {
+          const finish = () => {
+            stop();
+            this.readWaiters.delete(finish);
+            resolve();
+          };
+          const stop = watch(
+            () => this.grid.reactData?.tableLoading,
+            (loading) => {
+              if (!loading) finish();
+            },
+            { flush: 'sync' },
+          );
+          this.readWaiters.add(finish);
+        });
+      }
+      if (!this.isMounted || sequence !== this.readSequence) return;
+      await this.grid.commitProxy(code, requestParams);
+    } catch (error) {
+      console.error(
+        `Error occurred while ${code === 'query' ? 'querying' : 'reloading'}:`,
+        error,
+      );
+    }
   }
 }

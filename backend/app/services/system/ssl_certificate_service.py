@@ -17,6 +17,7 @@ from cryptography.x509.oid import NameOID
 from app.core.base_model import utc_now
 from app.core.base_service import GlobalService
 from app.core.config import settings
+from app.core.domains import normalize_hostname
 from app.core.i18n import _
 from app.enums import ErrorCode
 from app.enums.domain import DomainSslStatus, SslCertStatus, SslCertType
@@ -37,6 +38,66 @@ class SslCertificateService(
 
     model = DomainSslCertificate
     repository_class = SslCertificateRepository
+
+    async def export_publishable_certificates(self) -> dict:
+        """Privileged host publication snapshot. Fail closed on invalid material."""
+        from cryptography.hazmat.primitives import hashes
+
+        from app.services.system.tenant_domain_service import TenantDomainService
+
+        domains = TenantDomainService(self.db)
+        items = []
+        rows = await self.repo.get_publishable_certificates()
+        encryption_key = None
+        suffix = await domains._get_domain_suffix()
+        platform_hosts = {
+            normalize_hostname(item.strip())
+            for item in settings.PLATFORM_DOMAINS.split(",")
+            if item.strip()
+        }
+        seen = set()
+        for cert, domain in rows:
+            host = normalize_hostname(domain.domain)
+            if (
+                host in platform_hosts
+                or host == suffix.removeprefix(".")
+                or host.endswith(suffix)
+            ):
+                continue
+            try:
+                await self.ensure_domain_ssl_entitled(domain.id, domain.tenant_id)
+            except BusinessException as exc:
+                if exc.code == ErrorCode.FORBIDDEN:
+                    continue
+                raise
+            if cert.tenant_id != domain.tenant_id or host in seen:
+                raise ValueError("invalid_certificate_publication_identity")
+            seen.add(host)
+            if encryption_key is None:
+                encryption_key = await self._get_encryption_key()
+            key_pem = self._decrypt_private_key(
+                cert.private_key_encrypted, encryption_key
+            )
+            self._validate_certificate(cert.certificate, key_pem)
+            self._validate_domain_in_cert(cert.certificate, host)
+            parsed = x509.load_pem_x509_certificate(cert.certificate.encode())
+            info = self._parse_cert_info(cert.certificate)
+            if info["expires_at"] <= utc_now() or info["issued_at"] > utc_now():
+                raise ValueError("certificate_publication_outside_validity")
+            items.append(
+                {
+                    "domain_id": domain.id,
+                    "tenant_id": domain.tenant_id,
+                    "domain": host,
+                    "certificate_id": cert.id,
+                    "certificate_pem": cert.certificate,
+                    "private_key_pem": key_pem,
+                    "chain_pem": cert.certificate_chain,
+                    "expires_at": info["expires_at"].isoformat() + "Z",
+                    "fingerprint_sha256": parsed.fingerprint(hashes.SHA256()).hex(),
+                }
+            )
+        return {"version": 1, "certificates": items}
 
     # ==================== 查询 ==================== / ==================== Query ====================
 
@@ -94,31 +155,26 @@ class SslCertificateService(
         Args:
             check_quota: 是否检查套餐 allow_custom_ssl 配额（企业端传 True，管理端传 False） / Whether to check allow_custom_ssl quota.
         """
+        await self._lock_domain(domain_id)
+        domain = await self.ensure_domain_ssl_entitled(domain_id, tenant_id)
+
         # 套餐配额检查（仅企业端需要） / Plan quota check (tenant side only)
         if check_quota:
             await self._check_custom_ssl_quota(tenant_id)
-
-        # 获取域名信息 / Fetch domain info
-        domain = await self._get_domain(domain_id)
 
         # 验证证书与私钥 / Validate cert matches private key
         cert_info = self._parse_cert_info(cert_pem)
         self._validate_certificate(cert_pem, key_pem)
         self._validate_domain_in_cert(cert_pem, domain.domain)
 
-        # 检查证书是否过期 / Check cert expired
-        if cert_info["expires_at"] and cert_info["expires_at"] < utc_now():
-            raise BusinessException(
-                message=_("ssl_certificate.cert_expired"),
-                code=ErrorCode.VALIDATION_ERROR,
-            )
-
-        # 停用域名现有证书 / Deactivate existing domain certs
-        await self.repo.deactivate_domain_certs(domain_id)
+        self._validate_certificate_validity(cert_info)
 
         # 加密私钥 / Encrypt private key
         encryption_key = await self._get_encryption_key()
         encrypted_key = self._encrypt_private_key(key_pem, encryption_key)
+
+        # Validate/encrypt before modifying the certificate currently in use.
+        await self.repo.deactivate_domain_certs(domain_id)
 
         # 创建新证书记录 / Create new cert record
         cert = await self.create(
@@ -151,6 +207,7 @@ class SslCertificateService(
 
     async def delete_cert(self, domain_id: int) -> bool:
         """删除域名证书并重置 SSL 状态 / Delete domain cert and reset SSL status."""
+        await self._lock_domain(domain_id)
         cert = await self.repo.get_active_cert(domain_id)
         if not cert:
             cert = await self.repo.get_cert_by_domain(domain_id)
@@ -169,9 +226,16 @@ class SslCertificateService(
         self, domain_id: int, enabled: bool
     ) -> DomainSslCertificate:
         """开关自动续期（仅 platform 类型可开启） / Toggle auto-renew (platform type only)."""
-        cert = await self.repo.get_active_cert(domain_id)
+        if enabled:
+            await self.ensure_domain_ssl_entitled(domain_id)
+        await self._lock_domain(domain_id)
+        cert = await self.get_cert_detail(domain_id)
         if not cert:
             raise NotFoundException(message=_("ssl_certificate.not_found"))
+        if cert.status not in {SslCertStatus.ACTIVE.value, SslCertStatus.EXPIRED.value}:
+            raise BusinessException(
+                message=_("ssl_certificate.cert_not_current"), code=ErrorCode.CONFLICT
+            )
 
         if enabled and cert.cert_type == SslCertType.CUSTOM.value:
             raise BusinessException(
@@ -194,9 +258,39 @@ class SslCertificateService(
         key_pem: str,
         chain_pem: str | None = None,
         acme_order_url: str | None = None,
-    ) -> DomainSslCertificate:
+        *,
+        expected_certificate_id: int | None = None,
+        require_auto_renew: bool = False,
+        expected_domain: str | None = None,
+    ) -> DomainSslCertificate | None:
         """存储 ACME 签发的平台证书（由 Celery 任务调用） / Store ACME-issued platform cert (Celery)."""
+        await self._lock_domain(domain_id)
+        domain = await self.ensure_domain_ssl_entitled(domain_id, tenant_id)
+        if expected_domain is not None and normalize_hostname(
+            domain.domain
+        ) != normalize_hostname(expected_domain):
+            return None
+        current = await self.get_cert_detail(domain_id)
+        if expected_certificate_id is not None:
+            if (
+                not current
+                or current.id != expected_certificate_id
+                or current.status
+                not in {SslCertStatus.ACTIVE.value, SslCertStatus.EXPIRED.value}
+            ):
+                return None
+            if require_auto_renew and not current.auto_renew:
+                return None
+        elif current and current.status in {
+            SslCertStatus.ACTIVE.value,
+            SslCertStatus.EXPIRED.value,
+        }:
+            # A concurrent upload/issuance won; provisioning is not replacement.
+            return None
         cert_info = self._parse_cert_info(cert_pem)
+        self._validate_certificate(cert_pem, key_pem)
+        self._validate_domain_in_cert(cert_pem, domain.domain)
+        self._validate_certificate_validity(cert_info)
         encryption_key = await self._get_encryption_key()
         encrypted_key = self._encrypt_private_key(key_pem, encryption_key)
 
@@ -216,7 +310,9 @@ class SslCertificateService(
                 "serial_number": cert_info["serial_number"],
                 "issued_at": cert_info["issued_at"],
                 "expires_at": cert_info["expires_at"],
-                "auto_renew": True,
+                "auto_renew": current.auto_renew
+                if current and expected_certificate_id is not None
+                else True,
                 "acme_order_url": acme_order_url,
             }
         )
@@ -235,10 +331,36 @@ class SslCertificateService(
         self,
         domain_id: int,
         error: str,
+        *,
+        expected_certificate_id: int | None = None,
     ) -> None:
         """标记签发失败 / Mark provision failed."""
+        await self._lock_domain(domain_id)
+        current = await self.get_cert_detail(domain_id)
+        if expected_certificate_id is not None and (
+            not current or current.id != expected_certificate_id
+        ):
+            return
+        active_cert = await self.repo.get_active_cert(domain_id)
+        if (
+            active_cert
+            and active_cert.expires_at
+            and active_cert.expires_at > utc_now()
+        ):
+            await self.mark_renewal_failed(active_cert.id, error)
+            await self._update_domain_ssl_status(
+                domain_id, DomainSslStatus.ACTIVE.value, active_cert.expires_at
+            )
+            return
         cert = await self.repo.get_cert_by_domain(domain_id)
         if cert:
+            # A failed replacement is still eligible for later expiry recovery.
+            if cert.status == SslCertStatus.EXPIRED.value:
+                await self.mark_renewal_failed(cert.id, error)
+                await self._update_domain_ssl_status(
+                    domain_id, DomainSslStatus.EXPIRED.value, cert.expires_at
+                )
+                return
             await self.update(
                 cert.id,
                 {
@@ -288,6 +410,15 @@ class SslCertificateService(
 
     async def mark_expired(self, cert_id: int, domain_id: int) -> None:
         """标记证书过期 / Mark cert expired."""
+        await self._lock_domain(domain_id)
+        current = await self.get_cert_detail(domain_id)
+        if (
+            not current
+            or current.id != cert_id
+            or not current.expires_at
+            or current.expires_at > utc_now()
+        ):
+            return
         await self.update(cert_id, {"status": SslCertStatus.EXPIRED.value})
         await self._update_domain_ssl_status(
             domain_id, DomainSslStatus.EXPIRED.value, None
@@ -295,17 +426,36 @@ class SslCertificateService(
 
     # ==================== 内部方法 ==================== / ==================== Internal methods ====================
 
+    async def ensure_domain_ssl_entitled(
+        self, domain_id: int, tenant_id: int | None = None
+    ) -> TenantDomain:
+        """Recheck identity, verification and current plan in every write/worker."""
+        from app.services.system.tenant_domain_service import TenantDomainService
+
+        domain = await self._get_domain(domain_id)
+        if tenant_id is not None and tenant_id != domain.tenant_id:
+            raise BusinessException(
+                message=_("tenant_domain.not_found"), code=ErrorCode.FORBIDDEN
+            )
+        if not domain.is_verified:
+            raise BusinessException(
+                message=_("ssl_certificate.domain_not_verified"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+        await TenantDomainService(self.db).ensure_custom_domain_entitled(
+            domain.tenant_id, domain
+        )
+        return domain
+
     async def _get_domain(self, domain_id: int) -> TenantDomain:
         """获取域名实例 / Get domain instance."""
-        from sqlalchemy import select
+        domain = await self.repo.get_domain(domain_id)
+        if not domain:
+            raise NotFoundException(message=_("tenant_domain.not_found"))
+        return domain
 
-        result = await self.db.execute(
-            select(TenantDomain).where(
-                TenantDomain.id == domain_id,
-                TenantDomain.is_deleted.is_(False),
-            )
-        )
-        domain = result.scalar_one_or_none()
+    async def _lock_domain(self, domain_id: int) -> TenantDomain:
+        domain = await self.repo.lock_domain(domain_id)
         if not domain:
             raise NotFoundException(message=_("tenant_domain.not_found"))
         return domain
@@ -317,14 +467,7 @@ class SslCertificateService(
         expires_at: datetime | None,
     ) -> None:
         """更新域名 SSL 状态字段 / Update domain SSL status."""
-        from sqlalchemy import update
-
-        stmt = (
-            update(TenantDomain)
-            .where(TenantDomain.id == domain_id)
-            .values(ssl_status=status, ssl_expires_at=expires_at)
-        )
-        await self.db.execute(stmt)
+        await self.repo.update_domain_ssl_status(domain_id, status, expires_at)
 
     # ==================== 证书工具方法 ==================== / ==================== Certificate helpers ====================
 
@@ -390,6 +533,21 @@ class SslCertificateService(
         }
 
     @staticmethod
+    def _validate_certificate_validity(cert_info: dict) -> None:
+        """Reject unusable material before replacing the certificate in use."""
+        now = utc_now()
+        if cert_info["issued_at"] > now:
+            raise BusinessException(
+                message=_("ssl_certificate.cert_not_yet_valid"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+        if cert_info["expires_at"] <= now:
+            raise BusinessException(
+                message=_("ssl_certificate.cert_expired"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+
+    @staticmethod
     def _validate_certificate(cert_pem: str, key_pem: str) -> None:
         """验证证书与私钥是否匹配 / Validate cert and key match."""
         try:
@@ -425,24 +583,28 @@ class SslCertificateService(
         """验证证书是否包含指定域名（检查 SAN 和 CN） / Validate domain in cert (SAN and CN)."""
         cert = x509.load_pem_x509_certificate(cert_pem.encode())
 
-        # 检查 SAN (Subject Alternative Names)
+        host = normalize_hostname(domain)
+
+        def matches(name: str) -> bool:
+            try:
+                if name.startswith("*."):
+                    suffix = "." + normalize_hostname(name[2:])
+                    label = host.removesuffix(suffix)
+                    return host.endswith(suffix) and bool(label) and "." not in label
+                return normalize_hostname(name) == host
+            except ValueError:
+                return False
+
+        # SAN is authoritative when present; CN is only a legacy fallback.
         try:
             san = cert.extensions.get_extension_for_class(x509.SubjectAlternativeName)
             dns_names = san.value.get_values_for_type(x509.DNSName)
-            for name in dns_names:
-                if name == domain or (
-                    name.startswith("*.") and domain.endswith(name[1:])
-                ):
-                    return
         except x509.ExtensionNotFound:
-            pass
-
-        # 回退检查 CN
-        for attr in cert.subject:
-            if attr.oid == NameOID.COMMON_NAME:
-                cn = attr.value
-                if cn == domain or (cn.startswith("*.") and domain.endswith(cn[1:])):
-                    return
+            dns_names = [
+                attr.value for attr in cert.subject if attr.oid == NameOID.COMMON_NAME
+            ]
+        if any(matches(name) for name in dns_names):
+            return
 
         raise BusinessException(
             message=_("ssl_certificate.domain_not_in_cert"),

@@ -1,0 +1,29 @@
+{
+  "unavailable": "域名配置暂不可用",
+  "unavailableDescription": "暂时无法加载域名配置，请重试检查此地址。",
+  "unknown": "域名未登记",
+  "unknownDescription": "此地址未配置为平台域名，也不是已登记的企业域名。",
+  "retry": "重试",
+  "invalid": "请输入主机名，不含协议、端口、路径或通配符。",
+  "dnsFqdnHint": "下方显示完整 DNS 主机名。若 DNS 服务商要求相对主机名，仅移除它实际管理的域名区域后缀。",
+  "sslUnknown": "证书覆盖情况尚未确认",
+  "sslUnknownDescription": "默认域名使用平台通配符证书，证书覆盖、有效期及续期情况需由部署环境确认。",
+  "certificateDeploymentHint": "证书已签发或保存不代表网站已上线 HTTPS。平台运维人员仍需安装证书并配置此域名的反向代理。自动签发还需要平台配置 DNS 服务商凭据。",
+  "publicationUnconfirmed": "HTTPS 发布状态尚未记录",
+  "publicationInstallStep": "签发、上传或续期后，请平台运维人员将当前证书及域名路由发布到网站反向代理。切换自动续期仅保存证书续期偏好。",
+  "publicationVerifyStep": "发布后通过此域名的 HTTPS 地址验证访问，并检查证书主机名及证书链。本界面尚未确认当前证书已安装。",
+  "managedHttps": {
+    "label": "托管通配符 HTTPS",
+    "active": "有效",
+    "expiring": "即将到期",
+    "expired": "已到期",
+    "unconfigured": "未配置证书",
+    "uncovered": "证书未覆盖此域名",
+    "details": "HTTPS 详情",
+    "setup": "SSL 设置",
+    "description": "此状态来自部署环境已安装证书的域名覆盖及有效期，由平台统一管理。",
+    "expiresAt": "到期时间",
+    "autoRenew": "部署环境已启用自动续期。",
+    "manualRenew": "自动续期未启用，平台运维人员需在到期前续期并安装部署证书。"
+  }
+}

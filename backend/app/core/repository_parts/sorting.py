@@ -18,6 +18,13 @@ class RepositorySortingMixin(Generic[ModelType]):
     def _get_sortable_config(self) -> dict[str, Any] | None:
         return getattr(self.model, "__sortable__", None)
 
+    def _apply_sorting_scope(self, query: Any, scope_filters: dict[str, Any]):
+        sortable = self._get_sortable_config() or {}
+        for field in sortable.get("scope_fields", []):
+            if field in scope_filters and hasattr(self.model, field):
+                query = query.where(getattr(self.model, field) == scope_filters[field])
+        return query
+
     async def get_next_sort_order(self, **scope_filters: Any) -> int:
         sortable = self._get_sortable_config()
         if not sortable:
@@ -27,7 +34,6 @@ class RepositorySortingMixin(Generic[ModelType]):
 
         sort_field = sortable.get("field", "sort_order")
         step = sortable.get("step", 1000)
-        scope_fields = sortable.get("scope_fields", [])
 
         if not hasattr(self.model, sort_field):
             raise ValueError(
@@ -38,9 +44,7 @@ class RepositorySortingMixin(Generic[ModelType]):
         query = select(func.coalesce(func.max(sort_column), 0)).where(
             self.model.is_deleted.is_(False)
         )
-        for field in scope_fields:
-            if field in scope_filters and hasattr(self.model, field):
-                query = query.where(getattr(self.model, field) == scope_filters[field])
+        query = self._apply_sorting_scope(query, scope_filters)
 
         result = await self.db.execute(query)
         max_value = result.scalar() or 0
@@ -51,7 +55,6 @@ class RepositorySortingMixin(Generic[ModelType]):
         ordered_ids: list[int],
         **scope_filters: Any,
     ) -> int:
-        _ = scope_filters
         if not ordered_ids:
             return 0
 
@@ -82,5 +85,6 @@ class RepositorySortingMixin(Generic[ModelType]):
             )
             .values(**{sort_field: case(cases, value=self.model.id)})
         )
+        stmt = self._apply_sorting_scope(stmt, scope_filters)
         result = await self.db.execute(stmt)
         return result.rowcount

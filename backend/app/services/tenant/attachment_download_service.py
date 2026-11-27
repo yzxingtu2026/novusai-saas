@@ -7,6 +7,7 @@ from datetime import timedelta
 from typing import Any
 from urllib.parse import urlencode
 
+from fastapi.responses import Response
 from jose import JWTError, jwt
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -98,6 +99,15 @@ class AttachmentDownloadService:
                 filename,
                 disposition="inline",
             )
+        return self.apply_business_cache_policy(attachment, response)
+
+    @staticmethod
+    def apply_business_cache_policy(
+        attachment: Attachment, response: Response
+    ) -> Response:
+        """私有附件禁用缓存 / Prevent caching of private attachment responses."""
+        if attachment.visibility != AttachmentVisibility.PUBLIC.value:
+            response.headers["Cache-Control"] = "private, no-store"
         return response
 
     async def record_download(

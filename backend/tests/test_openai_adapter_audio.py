@@ -9,18 +9,58 @@ Covers:
 
 from __future__ import annotations
 
+import asyncio
 import base64
-from unittest.mock import AsyncMock, MagicMock
+import socket
+from unittest.mock import AsyncMock
 
+import httpx
 import pytest
 
 from app.ai.adapters.openai_adapter import SUPPORTS_NATIVE_AUDIO, OpenAIAdapter
+from app.ai.adapters.openai_compatible.support import audio_inputs
 from app.ai.types import ChatMessage
+
+MEDIA_HOST = "audio.fixture.invalid"
+MEDIA_URL = f"https://{MEDIA_HOST}:8443/sample.wav?tag=one&tag=two"
+# Only the in-memory MockTransport receives this address.
+MEDIA_ADDRESS = "93.184.216.34"
 
 
 @pytest.fixture
-def adapter() -> OpenAIAdapter:
-    return OpenAIAdapter(api_key="test-key", base_url="https://api.example.com")
+async def adapter():
+    instance = OpenAIAdapter(api_key="fixture-key")
+    try:
+        yield instance
+    finally:
+        await instance.client.close()
+
+
+@pytest.fixture
+def audio_http(monkeypatch):
+    real_client = httpx.AsyncClient
+
+    def serve(response, *, address=MEDIA_ADDRESS):
+        options = []
+        requests = []
+
+        def receive(request):
+            requests.append(request)
+            return response
+
+        def create_client(**kwargs):
+            options.append(kwargs)
+            return real_client(transport=httpx.MockTransport(receive), **kwargs)
+
+        async def resolve(host, port, *args, **kwargs):
+            assert host == MEDIA_HOST
+            return [(socket.AF_INET, socket.SOCK_STREAM, 0, "", (address, port))]
+
+        monkeypatch.setattr(asyncio.get_running_loop(), "getaddrinfo", resolve)
+        monkeypatch.setattr(httpx, "AsyncClient", create_client)
+        return options, requests
+
+    return serve
 
 
 def _make_audio_message(
@@ -37,86 +77,50 @@ def _make_audio_message(
     )
 
 
+@pytest.mark.behavioral
+@pytest.mark.parametrize(
+    ("mime_type", "expected_format"),
+    [("audio/wav", "wav"), ("audio/mpeg", "mp3")],
+)
 @pytest.mark.asyncio
 async def test_convert_messages_audio_http_url_yields_input_audio(
-    adapter: OpenAIAdapter,
+    adapter: OpenAIAdapter, audio_http, mime_type: str, expected_format: str
 ) -> None:
-    """When supports_audio and SUPPORTS_NATIVE_AUDIO, HTTP URL returning bytes → input_audio block. / 获取/返回"""
-    wav_bytes = b"fake-wav-bytes"
-    mock_response = MagicMock()
-    mock_response.content = wav_bytes
-    mock_response.headers = {"content-length": str(len(wav_bytes))}
-    mock_response.raise_for_status = MagicMock()
+    raw = b"fixture-audio-bytes"
+    options, requests = audio_http(httpx.Response(200, content=raw))
 
-    async def fake_get(_url: str):
-        return mock_response
+    result = await adapter._convert_messages(
+        [_make_audio_message(MEDIA_URL, mime_type=mime_type)],
+        supports_vision=True,
+        supports_audio=True,
+        supports_video=False,
+    )
 
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(side_effect=fake_get)
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=None)
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(
-            "app.ai.adapters.openai_compatible.support.multimodal_attachment_runtime.httpx.AsyncClient",
-            lambda *_args, **_kwargs: mock_cm,
-        )
-        messages = [
-            _make_audio_message("https://example.com/audio.wav", mime_type="audio/wav")
-        ]
-        result = await adapter._convert_messages(
-            messages,
-            supports_vision=True,
-            supports_audio=True,
-            supports_video=False,
-        )
     assert len(result) == 1
-    content = result[0]["content"]
-    assert isinstance(content, list)
-    # One text (empty user content) + one input_audio
-    parts = [p for p in content if p.get("type") == "input_audio"]
-    assert len(parts) == 1
-    assert parts[0]["input_audio"]["format"] == "wav"
-    assert isinstance(parts[0]["input_audio"]["data"], str)
-    assert base64.b64decode(parts[0]["input_audio"]["data"]) == wav_bytes
-
-
-@pytest.mark.asyncio
-async def test_convert_messages_audio_http_url_mp3_format(
-    adapter: OpenAIAdapter,
-) -> None:
-    """HTTP URL with audio/mpeg → format mp3 in input_audio. / 说明"""
-    mp3_bytes = b"fake-mp3"
-    mock_response = MagicMock()
-    mock_response.content = mp3_bytes
-    mock_response.headers = {"content-length": str(len(mp3_bytes))}
-    mock_response.raise_for_status = MagicMock()
-
-    async def fake_get(_url: str):
-        return mock_response
-
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(side_effect=fake_get)
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=None)
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(
-            "app.ai.adapters.openai_compatible.support.multimodal_attachment_runtime.httpx.AsyncClient",
-            lambda *_args, **_kwargs: mock_cm,
-        )
-        messages = [
-            _make_audio_message("https://example.com/a.mp3", mime_type="audio/mpeg")
-        ]
-        result = await adapter._convert_messages(
-            messages,
-            supports_vision=True,
-            supports_audio=True,
-            supports_video=False,
-        )
-    parts = [p for p in result[0]["content"] if p.get("type") == "input_audio"]
-    assert len(parts) == 1
-    assert parts[0]["input_audio"]["format"] == "mp3"
+    parts = [part for part in result[0]["content"] if part["type"] == "input_audio"]
+    assert parts == [
+        {
+            "type": "input_audio",
+            "input_audio": {
+                "data": base64.b64encode(raw).decode("ascii"),
+                "format": expected_format,
+            },
+        }
+    ]
+    assert options == [
+        {
+            "timeout": audio_inputs.AUDIO_FETCH_TIMEOUT_SEC,
+            "trust_env": False,
+            "follow_redirects": False,
+        }
+    ]
+    (request,) = requests
+    assert request.method == "GET"
+    assert request.url == httpx.URL(
+        f"https://{MEDIA_ADDRESS}:8443/sample.wav?tag=one&tag=two"
+    )
+    assert request.headers["host"] == f"{MEDIA_HOST}:8443"
+    assert request.extensions["sni_hostname"] == MEDIA_HOST
 
 
 @pytest.mark.asyncio
@@ -140,39 +144,71 @@ async def test_convert_messages_audio_data_url_yields_input_audio(
     assert parts[0]["input_audio"]["format"] == "wav"
 
 
+@pytest.mark.behavioral
+@pytest.mark.parametrize("status", [302, 502], ids=("redirect", "upstream-error"))
 @pytest.mark.asyncio
 async def test_convert_messages_audio_fetch_failure_fallback_to_text(
-    adapter: OpenAIAdapter,
+    adapter: OpenAIAdapter, audio_http, status: int
 ) -> None:
-    """When _fetch_audio_bytes fails (e.g. HTTP error), fallback to text hint. / 说明"""
-
-    async def fake_get(_url: str):
-        raise Exception("network error")
-
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(side_effect=fake_get)
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=None)
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(
-            "app.ai.adapters.openai_compatible.support.multimodal_attachment_runtime.httpx.AsyncClient",
-            lambda *_args, **_kwargs: mock_cm,
-        )
-        messages = [_make_audio_message("https://example.com/bad.wav")]
-        result = await adapter._convert_messages(
-            messages,
-            supports_vision=True,
-            supports_audio=True,
-            supports_video=False,
-        )
+    _, requests = audio_http(httpx.Response(status, headers={"location": "/next.wav"}))
+    result = await adapter._convert_messages(
+        [_make_audio_message(MEDIA_URL)],
+        supports_vision=True,
+        supports_audio=True,
+        supports_video=False,
+    )
     content = result[0]["content"]
-    text_parts = [
-        p for p in content if p.get("type") == "text" and "[Audio:" in p.get("text", "")
-    ]
-    assert len(text_parts) == 1
-    input_audio_parts = [p for p in content if p.get("type") == "input_audio"]
-    assert len(input_audio_parts) == 0
+    assert [part for part in content if part["type"] == "input_audio"] == []
+    hints = [part["text"] for part in content if part["type"] == "text"]
+    assert hints == ["[Audio: test.wav]"]
+    (request,) = requests
+    assert request.url.path == "/sample.wav"
+
+
+@pytest.mark.behavioral
+@pytest.mark.asyncio
+async def test_audio_fetch_keeps_nonpublic_addresses_out_of_transport(
+    adapter: OpenAIAdapter, audio_http
+) -> None:
+    options, requests = audio_http(
+        httpx.Response(200, content=b"unused"), address="127.0.0.1"
+    )
+
+    assert await adapter._fetch_audio_bytes(MEDIA_URL) is None
+    assert (options, requests) == ([], [])
+
+
+@pytest.mark.behavioral
+@pytest.mark.asyncio
+async def test_audio_fetch_stops_reading_when_stream_crosses_size_limit(
+    adapter: OpenAIAdapter, audio_http, monkeypatch
+) -> None:
+    read = []
+
+    class AudioStream(httpx.AsyncByteStream):
+        async def __aiter__(self):
+            for segment in (b"12", b"34", b"56"):
+                read.append(segment)
+                yield segment
+
+    monkeypatch.setattr(audio_inputs, "AUDIO_MAX_BYTES", 3)
+    _, requests = audio_http(httpx.Response(200, stream=AudioStream()))
+
+    assert await adapter._fetch_audio_bytes(MEDIA_URL) is None
+    assert read == [b"12", b"34"]
+    assert len(requests) == 1
+
+
+@pytest.mark.behavioral
+@pytest.mark.parametrize(
+    "payload", ["YQ==!", "YWJjZGU="], ids=("invalid", "over-limit")
+)
+@pytest.mark.asyncio
+async def test_audio_data_url_validates_bytes_before_building_input(
+    adapter: OpenAIAdapter, monkeypatch, payload: str
+) -> None:
+    monkeypatch.setattr(audio_inputs, "AUDIO_MAX_BYTES", 4)
+    assert await adapter._fetch_audio_bytes(f"data:audio/wav;base64,{payload}") is None
 
 
 @pytest.mark.asyncio
@@ -255,42 +291,22 @@ async def test_convert_messages_audio_url_key_missing_fallback_to_text(
 
 @pytest.mark.asyncio
 async def test_convert_messages_audio_supports_audio_false_yields_text(
-    adapter: OpenAIAdapter,
+    adapter: OpenAIAdapter, monkeypatch
 ) -> None:
-    """When supports_audio=False, always text hint even if URL would work. / 说明"""
-    wav_bytes = b"tiny"
-    mock_response = MagicMock()
-    mock_response.content = wav_bytes
-    mock_response.headers = {"content-length": "4"}
-    mock_response.raise_for_status = MagicMock()
-
-    async def fake_get(_url: str):
-        return mock_response
-
-    mock_client = MagicMock()
-    mock_client.get = AsyncMock(side_effect=fake_get)
-    mock_cm = AsyncMock()
-    mock_cm.__aenter__ = AsyncMock(return_value=mock_client)
-    mock_cm.__aexit__ = AsyncMock(return_value=None)
-    with pytest.MonkeyPatch.context() as m:
-        m.setattr(
-            "app.ai.adapters.openai_compatible.support.multimodal_attachment_runtime.httpx.AsyncClient",
-            lambda *_args, **_kwargs: mock_cm,
-        )
-        messages = [_make_audio_message("https://example.com/x.wav")]
-        result = await adapter._convert_messages(
-            messages,
-            supports_vision=True,
-            supports_audio=False,
-            supports_video=False,
-        )
+    fetch = AsyncMock()
+    monkeypatch.setattr(adapter, "_fetch_audio_bytes", fetch)
+    result = await adapter._convert_messages(
+        [_make_audio_message(MEDIA_URL)],
+        supports_vision=True,
+        supports_audio=False,
+        supports_video=False,
+    )
     content = result[0]["content"]
-    input_audio_parts = [p for p in content if p.get("type") == "input_audio"]
-    assert len(input_audio_parts) == 0
-    text_parts = [
-        p for p in content if p.get("type") == "text" and "[Audio:" in p.get("text", "")
+    assert [part for part in content if part["type"] == "input_audio"] == []
+    assert [part["text"] for part in content if part["type"] == "text"] == [
+        "[Audio: test.wav]"
     ]
-    assert len(text_parts) == 1
+    fetch.assert_not_awaited()
 
 
 @pytest.mark.asyncio

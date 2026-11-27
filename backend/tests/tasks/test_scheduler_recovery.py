@@ -4,7 +4,7 @@ from collections.abc import Iterator
 
 from celery import Celery
 
-from app.tasks.scheduler import ReloadingPersistentScheduler
+from app.tasks.scheduler import ReloadingPersistentScheduler, logger
 
 
 def _build_scheduler(
@@ -107,14 +107,16 @@ def test_reloading_scheduler_removes_db_entries_on_successful_empty_reload(
 def test_reloading_scheduler_recovers_when_create_schedule_hits_eoferror(
     tmp_path,
     monkeypatch,
+    caplog,
 ) -> None:
     original_create_schedule = ReloadingPersistentScheduler._create_schedule
     create_calls = {"count": 0}
+    error_detail = "fixture-private-beat-store-error"
 
     def flaky_create_schedule(self) -> None:
         create_calls["count"] += 1
         if create_calls["count"] == 1:
-            raise EOFError("Ran out of input")
+            raise EOFError(error_detail)
         original_create_schedule(self)
 
     monkeypatch.setattr(
@@ -123,9 +125,18 @@ def test_reloading_scheduler_recovers_when_create_schedule_hits_eoferror(
         flaky_create_schedule,
     )
 
-    scheduler = _build_scheduler(tmp_path, monkeypatch, [{}])
+    caplog.set_level("ERROR", logger="celery.beat")
+    diagnostics = []
+    sink_id = logger.add(diagnostics.append, level="DEBUG", format="{message}")
+    try:
+        scheduler = _build_scheduler(tmp_path, monkeypatch, [{}])
+    finally:
+        logger.remove(sink_id)
+
     try:
         assert create_calls["count"] == 2
-        assert isinstance(scheduler.schedule, dict)
+        assert scheduler.schedule == {}
+        assert "error_type=EOFError" in "".join(diagnostics)
+        assert error_detail not in "".join(diagnostics) + caplog.text
     finally:
         scheduler.close()

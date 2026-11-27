@@ -22,6 +22,7 @@ import asyncio
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.base_model import utc_now
+from app.core.config import settings
 from app.core.logging import LogManager
 from app.enums.error_code import ErrorCode
 from app.exceptions import BusinessException
@@ -31,13 +32,53 @@ from app.tasks.base import BaseTask, register_task
 logger = LogManager.get_logger("ssl")
 
 
+class SslInspectionError(RuntimeError):
+    """A partially blocked inspection must activate failure monitoring."""
+
+    def __init__(self, stats: dict):
+        self.stats = stats
+        super().__init__(f"SSL inspection incomplete: {stats['errors']} error(s)")
+
+    def __reduce__(self):
+        return (type(self), (self.stats,))
+
+
+async def _build_acme_client(db, ssl_service):
+    from app.configs.service import ConfigService
+    from app.services.system.acme_client import AcmeClient
+
+    config = ConfigService(db)
+    staging = await config.get_platform_config(
+        "acme_use_staging", default=settings.ACME_USE_STAGING
+    )
+    url_key = "acme_staging_url" if staging else "acme_directory_url"
+    default_url = settings.ACME_STAGING_URL if staging else settings.ACME_DIRECTORY_URL
+    url = await config.get_platform_config(url_key, default=default_url)
+    email = await config.get_platform_config(
+        "acme_account_email", default=settings.ACME_ACCOUNT_EMAIL
+    )
+    key = (
+        await ssl_service._get_encryption_key()
+        if settings.ACME_ACCOUNT_KEY_DIRECTORY
+        else None
+    )
+    return AcmeClient(
+        directory_url=url or default_url,
+        account_email=email or None,
+        use_staging=staging,
+        account_encryption_key=key,
+    )
+
+
 @register_task(
     queue="default",
     description="ACME SSL certificate issuance (auto-triggered after domain verification) / ACME SSL 证书签发（域名验证后自动触发）",
     max_retries=5,
     default_retry_delay=120,
 )
-def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
+def task_provision_ssl(
+    self: BaseTask, domain_id: int, *, expected_certificate_id: int | None = None
+) -> dict:
     """
     Async SSL certificate issuance / 异步签发 SSL 证书
 
@@ -51,8 +92,8 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
         from sqlalchemy import select
 
         from app.models.tenant.tenant_domain import TenantDomain
-        from app.services.system.acme_client import AcmeClient
         from app.services.system.ssl_certificate_service import SslCertificateService
+        from app.services.system.tenant_domain_service import TenantDomainService
 
         async with _task_async_session() as db:
             try:
@@ -73,42 +114,33 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
                     logger.warning("Domain {} not verified, skipping SSL", domain_id)
                     return {"error": "domain_not_verified", "domain_id": domain_id}
 
+                domain_service = TenantDomainService(db)
+                if await domain_service._is_default_domain(domain):
+                    await domain_service.ensure_custom_domain_entitled(
+                        domain.tenant_id, domain
+                    )
+                    return {"status": "managed_wildcard", "domain_id": domain_id}
+                await domain_service.ensure_custom_domain_entitled(
+                    domain.tenant_id, domain
+                )
+
                 logger.info(
                     "Starting SSL provisioning for domain {} (id={})",
                     domain.domain,
                     domain_id,
                 )
 
-                # 2. Read ACME params from platform config / 从平台配置读取 ACME 参数
-                from app.configs.service import ConfigService
-
-                config_svc = ConfigService(db)
-                acme_email = await config_svc.get_platform_config(
-                    "acme_account_email", default=""
-                )
-                acme_use_staging = await config_svc.get_platform_config(
-                    "acme_use_staging", default=True
-                )
-                acme_dir_url = await config_svc.get_platform_config(
-                    "acme_directory_url", default=None
-                )
-                acme_stg_url = await config_svc.get_platform_config(
-                    "acme_staging_url", default=None
-                )
-                dir_url = acme_stg_url if acme_use_staging else acme_dir_url
-
                 # 3. Build DNS provider + ACME client issuance / 构建 DNS 提供商 + ACME 客户端签发
                 from app.services.system.dns_provider import get_dns_provider
 
                 dns_provider = await get_dns_provider(db)
-
-                acme = AcmeClient(
-                    directory_url=dir_url or None,
-                    account_email=acme_email or None,
-                    use_staging=acme_use_staging,
-                )
+                ssl_service = SslCertificateService(db)
+                acme = await _build_acme_client(db, ssl_service)
+                # End preflight reads before waiting on DNS/CA network traffic.
+                domain_name, tenant_id = domain.domain, domain.tenant_id
+                await db.commit()
                 cert_pem, key_pem, chain_pem = await acme.provision_certificate(
-                    domain.domain,
+                    domain_name,
                     dns_setter=dns_provider.set_txt_record,
                     dns_deleter=dns_provider.delete_txt_record,
                 )
@@ -117,13 +149,17 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
                 ssl_service = SslCertificateService(db)
                 cert = await ssl_service.store_platform_cert(
                     domain_id=domain_id,
-                    tenant_id=domain.tenant_id,
+                    tenant_id=tenant_id,
                     cert_pem=cert_pem,
                     key_pem=key_pem,
                     chain_pem=chain_pem,
+                    expected_domain=domain_name,
+                    expected_certificate_id=expected_certificate_id,
                 )
 
                 await db.commit()
+                if cert is None:
+                    return {"domain_id": domain_id, "status": "superseded"}
 
                 logger.info(
                     "SSL certificate issued for {}, expires {}",
@@ -152,11 +188,27 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
                         domain_id,
                         str(exc),
                     )
+                    async with _task_async_session() as db2:
+                        await SslCertificateService(db2).mark_provision_failed(
+                            domain_id, str(exc)
+                        )
+                        await db2.commit()
                     return {
                         "error": "dns_setter_missing",
                         "domain_id": domain_id,
                         "message": str(exc),
                     }
+
+                if (
+                    isinstance(exc, BusinessException)
+                    and exc.code == ErrorCode.FORBIDDEN
+                ):
+                    async with _task_async_session() as db2:
+                        await SslCertificateService(db2).mark_provision_failed(
+                            domain_id, str(exc)
+                        )
+                        await db2.commit()
+                    return {"error": "domain_not_entitled", "domain_id": domain_id}
 
                 if (
                     isinstance(exc, BusinessException)
@@ -175,8 +227,12 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
                                 str(exc),
                             )
                             await db2.commit()
-                    except Exception:
-                        pass
+                    except Exception as state_exc:
+                        logger.error(
+                            "Failed to record provisioning failure for {}: {}",
+                            domain_id,
+                            str(state_exc),
+                        )
                     return {
                         "error": "dns_provider_not_ready",
                         "domain_id": domain_id,
@@ -198,8 +254,12 @@ def task_provision_ssl(self: BaseTask, domain_id: int) -> dict:
                             str(exc),
                         )
                         await db2.commit()
-                except Exception:
-                    pass
+                except Exception as state_exc:
+                    logger.error(
+                        "Failed to record provisioning failure for {}: {}",
+                        domain_id,
+                        str(state_exc),
+                    )
 
                 raise self.retry(
                     exc=exc,
@@ -265,19 +325,34 @@ def task_check_ssl_renewals(self: BaseTask) -> dict:
                 except (TypeError, ValueError):
                     renew_days = 30
 
+                renew_days = min(60, max(1, renew_days))
+                platform_certs = await repo.get_expiring_platform_certs(days=renew_days)
                 if readiness["ready"]:
-                    platform_certs = await repo.get_expiring_platform_certs(
-                        days=renew_days,
-                    )
                     for cert in platform_certs:
                         try:
-                            task_renew_ssl.delay(cert_id=cert.id)
+                            domain = await ssl_service.ensure_domain_ssl_entitled(
+                                cert.domain_id, cert.tenant_id
+                            )
+                            from app.services.system.tenant_domain_service import (
+                                TenantDomainService,
+                            )
+
+                            if await TenantDomainService(db)._is_default_domain(domain):
+                                continue
+                            task_renew_ssl.delay(cert_id=cert.id, automatic=True)
                             stats["platform_renewals_triggered"] += 1
                             logger.info(
                                 "Renewal triggered for cert {} (domain_id={}, expires={})",
                                 cert.id,
                                 cert.domain_id,
                                 cert.expires_at,
+                            )
+                        except BusinessException as e:
+                            stats["errors"] += 1
+                            logger.warning(
+                                "Skipping ineligible SSL renewal for {}: {}",
+                                cert.id,
+                                str(e),
                             )
                         except Exception as e:
                             stats["errors"] += 1
@@ -286,7 +361,7 @@ def task_check_ssl_renewals(self: BaseTask) -> dict:
                                 cert.id,
                                 str(e),
                             )
-                else:
+                elif platform_certs:
                     stats["errors"] += 1
                     logger.warning(
                         "Skipping platform SSL renewal trigger because DNS automation is not ready: {}",
@@ -345,12 +420,14 @@ def task_check_ssl_renewals(self: BaseTask) -> dict:
 
         logger.info(
             "SSL renewal check completed: {} renewals, {} custom warnings, "
-            "%d expired, %d errors",
+            "{} expired, {} errors",
             stats["platform_renewals_triggered"],
             stats["custom_expiring_notified"],
             stats["expired_marked"],
             stats["errors"],
         )
+        if stats["errors"]:
+            raise SslInspectionError(stats)
         return stats
 
     loop = asyncio.new_event_loop()
@@ -366,7 +443,7 @@ def task_check_ssl_renewals(self: BaseTask) -> dict:
     max_retries=3,
     default_retry_delay=120,
 )
-def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
+def task_renew_ssl(self: BaseTask, cert_id: int, *, automatic: bool = False) -> dict:
     """
     Single platform certificate renewal / 单个平台证书续期
 
@@ -378,8 +455,8 @@ def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
 
     async def _renew() -> dict:
         from app.enums.domain import SslCertType
-        from app.services.system.acme_client import AcmeClient
         from app.services.system.ssl_certificate_service import SslCertificateService
+        from app.services.system.tenant_domain_service import TenantDomainService
 
         async with _task_async_session() as db:
             try:
@@ -390,6 +467,8 @@ def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
                 if not cert:
                     logger.error("Cert {} not found for renewal", cert_id)
                     return {"error": "cert_not_found", "cert_id": cert_id}
+                if automatic and not cert.auto_renew:
+                    return {"error": "auto_renew_disabled", "cert_id": cert_id}
 
                 if cert.cert_type != SslCertType.PLATFORM.value:
                     logger.warning(
@@ -399,7 +478,21 @@ def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
                     return {"error": "custom_cert_no_renew", "cert_id": cert_id}
 
                 # 2. Get domain info / 获取域名信息
-                domain = await ssl_service._get_domain(cert.domain_id)
+                domain = await ssl_service.ensure_domain_ssl_entitled(
+                    cert.domain_id, cert.tenant_id
+                )
+                if await TenantDomainService(db)._is_default_domain(domain):
+                    return {"status": "managed_wildcard", "cert_id": cert_id}
+                from app.enums.domain import SslCertStatus
+
+                if cert.status not in {
+                    SslCertStatus.ACTIVE.value,
+                    SslCertStatus.EXPIRED.value,
+                }:
+                    return {"error": "cert_not_current", "cert_id": cert_id}
+                current_cert = await ssl_service.get_cert_detail(cert.domain_id)
+                if current_cert and current_cert.id != cert.id:
+                    return {"error": "cert_not_current", "cert_id": cert_id}
 
                 logger.info(
                     "Starting SSL renewal for cert {} (domain={})",
@@ -407,50 +500,39 @@ def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
                     domain.domain,
                 )
 
-                # 3. Read ACME params from platform config / 从平台配置读取 ACME 参数
-                from app.configs.service import ConfigService
-
-                config_svc = ConfigService(db)
-                acme_email = await config_svc.get_platform_config(
-                    "acme_account_email", default=""
-                )
-                acme_use_staging = await config_svc.get_platform_config(
-                    "acme_use_staging", default=True
-                )
-                acme_dir_url = await config_svc.get_platform_config(
-                    "acme_directory_url", default=None
-                )
-                acme_stg_url = await config_svc.get_platform_config(
-                    "acme_staging_url", default=None
-                )
-                dir_url = acme_stg_url if acme_use_staging else acme_dir_url
-
                 # 4. Build DNS provider + ACME re-issuance / 构建 DNS 提供商 + ACME 重新签发
                 from app.services.system.dns_provider import get_dns_provider
 
                 dns_provider = await get_dns_provider(db)
 
-                acme = AcmeClient(
-                    directory_url=dir_url or None,
-                    account_email=acme_email or None,
-                    use_staging=acme_use_staging,
-                )
-                cert_pem, key_pem, chain_pem = await acme.provision_certificate(
+                acme = await _build_acme_client(db, ssl_service)
+                domain_name, domain_id, tenant_id = (
                     domain.domain,
+                    cert.domain_id,
+                    cert.tenant_id,
+                )
+                await db.commit()
+                cert_pem, key_pem, chain_pem = await acme.provision_certificate(
+                    domain_name,
                     dns_setter=dns_provider.set_txt_record,
                     dns_deleter=dns_provider.delete_txt_record,
                 )
 
                 # 5. Store new certificate (auto-deactivates old one) / 存储新证书（会自动停用旧证书）
                 new_cert = await ssl_service.store_platform_cert(
-                    domain_id=cert.domain_id,
-                    tenant_id=cert.tenant_id,
+                    domain_id=domain_id,
+                    tenant_id=tenant_id,
                     cert_pem=cert_pem,
                     key_pem=key_pem,
                     chain_pem=chain_pem,
+                    expected_certificate_id=cert_id,
+                    require_auto_renew=automatic,
+                    expected_domain=domain_name,
                 )
 
                 await db.commit()
+                if new_cert is None:
+                    return {"cert_id": cert_id, "status": "superseded"}
 
                 logger.info(
                     "SSL certificate renewed for {}, new cert {} expires {}",
@@ -483,8 +565,18 @@ def task_renew_ssl(self: BaseTask, cert_id: int) -> dict:
                         ssl_service2 = SslCertificateService(db2)
                         await ssl_service2.mark_renewal_failed(cert_id, str(exc))
                         await db2.commit()
-                except Exception:
-                    pass
+                except Exception as state_exc:
+                    logger.error(
+                        "Failed to record renewal failure for {}: {}",
+                        cert_id,
+                        str(state_exc),
+                    )
+
+                if (
+                    isinstance(exc, BusinessException)
+                    and exc.code == ErrorCode.FORBIDDEN
+                ):
+                    return {"error": "domain_not_entitled", "cert_id": cert_id}
 
                 if (
                     isinstance(exc, BusinessException)

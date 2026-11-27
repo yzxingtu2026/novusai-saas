@@ -27,11 +27,16 @@ from app.core.database import (
 )
 from app.core.i18n import _, reload_translations
 from app.core.logging import get_logger, init_logging
-from app.core.response import build_exception_debug, error, validation_error
+from app.core.response import (
+    build_exception_debug,
+    error,
+    include_debug_payload,
+    validation_error,
+)
 from app.core.runtime_identity import get_runtime_identity_tag
 from app.exceptions import AppException
 from app.middleware.access_control import AccessControlMiddleware
-from app.middleware.audit_log import AuditLogMiddleware
+from app.middleware.audit_log import AuditLogMiddleware, complete_server_error_audit
 from app.middleware.dynamic_cors import DynamicCORSMiddleware
 from app.middleware.i18n import I18nMiddleware
 from app.middleware.permission import PermissionMiddleware
@@ -636,13 +641,14 @@ def create_application() -> FastAPI:
     """
     Create FastAPI application instance. / 创建 FastAPI 应用实例。
     """
+    debug_routes = include_debug_payload()
     app = FastAPI(
         title=settings.APP_NAME,
         version=settings.APP_VERSION,
         description="Modern AI-integrated SaaS development framework / 现代化 AI 集成 SaaS 开发框架",
-        docs_url="/docs" if settings.DEBUG else None,
-        redoc_url="/redoc" if settings.DEBUG else None,
-        openapi_url="/openapi.json" if settings.DEBUG else None,
+        docs_url="/docs" if debug_routes else None,
+        redoc_url="/redoc" if debug_routes else None,
+        openapi_url="/openapi.json" if debug_routes else None,
         default_response_class=JSONResponse,
         lifespan=lifespan,
     )
@@ -679,7 +685,7 @@ def create_application() -> FastAPI:
     # 审计日志中间件（记录所有 API 调用）
     # Note: Must be registered after PermissionMiddleware to access user info from state
     # 注意：必须在 PermissionMiddleware 之后注册，这样才能从 state 获取用户信息
-    app.add_middleware(AuditLogMiddleware)
+    app.add_middleware(AuditLogMiddleware, defer_server_errors=not app.debug)
 
     # Access control middleware (enforces "deny by default" security policy)
     # 访问控制中间件（实施“默认拒绝”安全策略）
@@ -784,18 +790,23 @@ def create_application() -> FastAPI:
         request: Request, exc: Exception
     ) -> JSONResponse:
         """Global exception handler - catches unhandled exceptions / 全局异常处理器 - 捕获未处理的异常"""
-        # Log exception / 记录异常日志
-        logger = get_logger(__name__)
-        logger.exception(f"Unhandled exception: {exc}")
-
-        response = error(
-            message=_("common.server_error"),
-            code=5000,
-            status_code=500,
-            debug=build_exception_debug(exc),
-        )
-        response.headers.update(await _get_error_response_headers(request))
-        return response
+        response = None
+        try:
+            get_logger(__name__).exception("Unhandled exception: {}", exc)
+            rendered = error(
+                message=_("common.server_error"),
+                code=5000,
+                status_code=500,
+                debug=build_exception_debug(exc),
+            )
+            rendered.headers.update(await _get_error_response_headers(request))
+            trace_id = getattr(request.state, "trace_id", None)
+            if trace_id:
+                rendered.raw_headers.append((b"x-trace-id", trace_id.encode("utf-8")))
+            response = rendered
+            return response
+        finally:
+            await complete_server_error_audit(request.scope, response)
 
     # ========================================
     # Register routes / 注册路由
@@ -1177,6 +1188,7 @@ def create_application() -> FastAPI:
     import socketio as _socketio
 
     from app.core.socketio_server import sio
+    from app.middleware.socketio_origin import SocketIOOriginMiddleware
     from app.sio import register_namespaces
 
     register_namespaces(sio)
@@ -1189,7 +1201,7 @@ def create_application() -> FastAPI:
         socketio_path="/sio",
     )
 
-    return sio_app
+    return SocketIOOriginMiddleware(sio_app)
 
 
 # Create application instance / 创建应用实例
@@ -1205,6 +1217,7 @@ if __name__ == "__main__":
         # EN: Running main.py directly is a local/container entrypoint; public exposure is controlled by deployment.
         host="0.0.0.0",  # nosec B104
         port=8000,
+        forwarded_allow_ips=settings.TRUSTED_PROXY_IPS,
         reload=settings.DEBUG,
         reload_dirs=["app"],
         reload_excludes=["plugins/.backups/*"],

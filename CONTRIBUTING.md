@@ -11,19 +11,19 @@ Thank you for your interest in improving this project. This document describes h
 
 ## Upstream-first contribution rules
 
-`novusai-saas-yudi` is the canonical multi-tenant SaaS upstream. Customer
-projects should remain thin forks or overlays, with customer-specific workflows,
-branding, deployment overlays, configuration, seed data, and plugins kept in the
-customer repository.
+`yzxingtu2026/novusai-saas` is the shared multi-tenant framework for
+`novusai-ecommerce-erp` and `novusai-saas-design`.
+Customer projects keep their workflows, branding, deployment overlays,
+configuration, seed data, and plugins in their own repositories.
 
-- Develop common platform bug fixes and shared SaaS features in Yudi first.
+- Develop common platform bug fixes and shared SaaS features in this repository first.
 - Keep customer-only workflows, branding, deployment overlays, and plugins in
   the customer repository.
 - Triage ambiguous changes explicitly before implementation so they land
   upstream or downstream intentionally.
-- Reproduce common bugs in Yudi with a focused regression test, fix and verify
-  them here, then synchronize customer repositories from the Yudi release or
-  hotfix line.
+- Reproduce common bugs here with a focused regression test. Record the source
+  revision when synchronizing a fix and verify the relevant regression in both
+  downstream repositories.
 - Do not keep long-lived downstream patches to auth, tenant isolation, task
   queues, notifications, AI runtime, plugin framework, migrations, Docker
   baseline, or shared UI.

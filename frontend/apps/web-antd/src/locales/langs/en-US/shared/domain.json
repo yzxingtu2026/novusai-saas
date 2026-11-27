@@ -1,0 +1,29 @@
+{
+  "unavailable": "Domain configuration unavailable",
+  "unavailableDescription": "Domain configuration could not be loaded. Retry to check this address again.",
+  "unknown": "Domain not registered",
+  "unknownDescription": "This address is not a configured platform or registered tenant domain.",
+  "retry": "Retry",
+  "invalid": "Enter a hostname without protocol, port, path or wildcard.",
+  "dnsFqdnHint": "The host below is the full DNS name. If your DNS provider expects a relative host, remove only the exact zone suffix it manages.",
+  "sslUnknown": "Certificate coverage not confirmed",
+  "sslUnknownDescription": "Default domains use the platform wildcard certificate. Deployment must confirm its coverage, expiry and renewal.",
+  "certificateDeploymentHint": "Certificate issuance or storage does not mean the website is serving HTTPS. A platform operator must install the certificate and configure the reverse proxy for this domain. Automatic issuance also requires platform DNS provider credentials.",
+  "publicationUnconfirmed": "HTTPS publication status is not recorded",
+  "publicationInstallStep": "After issuance, upload or renewal, ask a platform operator to publish the current certificate and domain route to the site's reverse proxy. Changing automatic renewal only saves the certificate renewal preference.",
+  "publicationVerifyStep": "After publication, verify this domain over HTTPS, including the certificate hostname and chain. This screen does not confirm that the current certificate has been installed.",
+  "managedHttps": {
+    "label": "Managed wildcard HTTPS",
+    "active": "Active",
+    "expiring": "Expiring soon",
+    "expired": "Expired",
+    "unconfigured": "Certificate not configured",
+    "uncovered": "Certificate does not cover this domain",
+    "details": "HTTPS details",
+    "setup": "SSL setup",
+    "description": "This status comes from the installed deployment certificate, including its domain coverage and expiry. The platform manages this certificate.",
+    "expiresAt": "Expires at",
+    "autoRenew": "Deployment automatic renewal is enabled.",
+    "manualRenew": "Automatic renewal is disabled. A platform operator must renew and install the deployment certificate before expiry."
+  }
+}

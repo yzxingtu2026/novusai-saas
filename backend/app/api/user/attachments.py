@@ -161,6 +161,26 @@ async def upload_attachment(
     )
 
 
+@router.get("/upload-rules", summary="获取上传规则 / Get upload rules")
+@auth_only
+async def get_upload_rules(
+    request: Request,
+    db: DbSession,
+    current_user: ActiveTenantUser,
+):
+    """
+    获取用户端上传规则 / Get user upload rules.
+    """
+    config_service = ConfigService(db)
+    return success(
+        data=await resolve_attachment_upload_rules(
+            config_service,
+            db=db,
+            tenant_id=current_user.tenant_id,
+        )
+    )
+
+
 @router.get("/{attachment_id}", summary="获取附件详情 / Get attachment detail")
 @auth_only
 async def get_attachment(
@@ -219,24 +239,4 @@ async def download_attachment(
         await service.record_download(attachment)
         return await service.get_download_response(attachment, preview=False)
     url = await service.get_redirect_url(attachment, expires=expires, preview=False)
-    return RedirectResponse(url=url)
-
-
-@router.get("/upload-rules", summary="获取上传规则 / Get upload rules")
-@auth_only
-async def get_upload_rules(
-    request: Request,
-    db: DbSession,
-    current_user: ActiveTenantUser,
-):
-    """
-    获取用户端上传规则 / Get user upload rules.
-    """
-    config_service = ConfigService(db)
-    return success(
-        data=await resolve_attachment_upload_rules(
-            config_service,
-            db=db,
-            tenant_id=current_user.tenant_id,
-        )
-    )
+    return service.apply_business_cache_policy(attachment, RedirectResponse(url=url))

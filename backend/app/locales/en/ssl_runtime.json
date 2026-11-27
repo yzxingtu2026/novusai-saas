@@ -1,0 +1,14 @@
+{
+  "ssl_certificate": {
+    "cert_not_yet_valid": "This certificate is not valid yet. Upload a currently valid certificate.",
+    "cert_not_current": "Only the current active or expired platform certificate can be renewed.",
+    "managed_wildcard": "This domain uses the deployment's shared wildcard certificate.",
+    "replace_required": "A current certificate exists. Use renewal or explicit replacement."
+  },
+  "tenant_domain": {
+    "cannot_delete_default": "The default domain cannot be deleted.",
+    "cannot_delete_primary": "The primary domain cannot be deleted.",
+    "primary_switch_busy": "Another operation is updating this enterprise's domains. Please try again shortly.",
+    "primary_switch_transaction_unsupported": "This domain operation cannot be completed safely right now. Please retry or contact an administrator."
+  }
+}

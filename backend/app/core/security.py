@@ -30,9 +30,40 @@ TOKEN_TYPE_IMPERSONATE = (
 TOKEN_SCOPE_ADMIN = "admin"  # 平台管理员 / Platform admin
 TOKEN_SCOPE_TENANT_ADMIN = "tenant_admin"  # 企业管理员 / Tenant admin
 TOKEN_SCOPE_TENANT_USER = "tenant_user"  # 企业业务用户 / Tenant business user
+TENANT_SESSION_EPOCH_CLAIM = "tenant_session_epoch"
 
 # Impersonate Token 过期时间（秒） / Impersonate token expiry (seconds)
 IMPERSONATE_TOKEN_EXPIRE_SECONDS = 60
+
+
+def normalize_nonnegative_integer(value: object) -> int | None:
+    """校验非负整数声明 / Normalize a non-negative integer claim."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, str) and value.isascii() and value.isdigit():
+        try:
+            value = int(value, 10)
+        except ValueError:
+            return None
+    if isinstance(value, int) and value >= 0:
+        return value
+    return None
+
+
+def normalize_positive_subject_id(value: object) -> int | None:
+    """校验正整数身份 / Normalize a positive account ID."""
+    account_id = normalize_nonnegative_integer(value)
+    return account_id if account_id and account_id <= 2**63 - 1 else None
+
+
+def tenant_session_epoch_matches(payload: dict[str, Any] | None, epoch: object) -> bool:
+    """无代际声明时仅接受初始版本 / Legacy credentials are valid at epoch zero."""
+    current = normalize_nonnegative_integer(epoch)
+    if current is None or payload is None:
+        return False
+    if TENANT_SESSION_EPOCH_CLAIM not in payload:
+        return current == 0
+    return normalize_nonnegative_integer(payload[TENANT_SESSION_EPOCH_CLAIM]) == current
 
 
 def create_access_token(
@@ -256,20 +287,30 @@ async def verify_token_with_scope(
     Raises:
         TokenExpiredError: raise_on_expired=True 且 Token 已过期 / when True and token is expired
     """
-    payload = await decode_token(token, raise_on_expired=raise_on_expired)
+    payload = await get_token_payload_with_scope(
+        token, expected_scope, token_type, raise_on_expired=raise_on_expired
+    )
     if payload is None:
         return None, None
+    return payload.get("sub"), expected_scope
 
-    # 检查 Token 类型 / Check token type
-    if payload.get("type") != token_type:
-        return None, None
 
-    # 检查 scope / Check scope
-    scope = payload.get("scope")
-    if scope != expected_scope:
-        return None, None
-
-    return payload.get("sub"), scope
+async def get_token_payload_with_scope(
+    token: str,
+    expected_scope: str,
+    token_type: str = TOKEN_TYPE_ACCESS,
+    *,
+    raise_on_expired: bool = False,
+) -> dict[str, Any] | None:
+    """验证后返回指定类型和范围的声明 / Return verified claims for scope and type."""
+    payload = await decode_token(token, raise_on_expired=raise_on_expired)
+    if (
+        payload is None
+        or payload.get("type") != token_type
+        or payload.get("scope") != expected_scope
+    ):
+        return None
+    return payload
 
 
 async def get_token_payload(
@@ -483,6 +524,7 @@ __all__ = [
     "decode_token",
     "verify_token",
     "verify_token_with_scope",
+    "get_token_payload_with_scope",
     "get_token_payload",
     "verify_password",
     "get_password_hash",
@@ -498,5 +540,7 @@ __all__ = [
     "TOKEN_SCOPE_ADMIN",
     "TOKEN_SCOPE_TENANT_ADMIN",
     "TOKEN_SCOPE_TENANT_USER",
+    "TENANT_SESSION_EPOCH_CLAIM",
+    "tenant_session_epoch_matches",
     "IMPERSONATE_TOKEN_EXPIRE_SECONDS",
 ]

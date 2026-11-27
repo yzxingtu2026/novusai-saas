@@ -97,7 +97,7 @@ def get_current_trace_id() -> str | None:
 
 def include_debug_payload() -> bool:
     """Whether current environment should expose debug payload / 当前环境是否应暴露调试载荷"""
-    return bool(settings.DEBUG)
+    return bool(settings.DEBUG and settings.APP_ENV.strip().lower() != "production")
 
 
 def build_exception_debug(

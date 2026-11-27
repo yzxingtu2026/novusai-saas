@@ -1,3 +1,5 @@
+ARG VITE_GLOB_API_URL=/
+
 FROM node:22-slim AS builder
 
 ENV PNPM_HOME="/pnpm"
@@ -6,7 +8,7 @@ ENV NODE_OPTIONS=--max-old-space-size=8192
 ENV TZ=Asia/Shanghai
 
 # Build-time args — baked into the JS bundle (import.meta.env.VITE_*)
-ARG VITE_GLOB_API_URL=https://api.novusai.example.com
+ARG VITE_GLOB_API_URL
 ARG VITE_PLATFORM_DOMAINS=localhost
 ARG VITE_APP_TITLE="NovusAI SaaS"
 ARG VITE_APP_NAMESPACE=novusai-web-saas
@@ -27,9 +29,6 @@ COPY VERSION /
 COPY backend/app /backend/app
 COPY backend/plugins /backend/plugins
 
-# Override VITE_GLOB_API_URL in .env.production (keep other build-time vars intact)
-RUN sed -i "s|^VITE_GLOB_API_URL=.*|VITE_GLOB_API_URL=$VITE_GLOB_API_URL|" /app/apps/web-antd/.env.production
-
 RUN --mount=type=cache,id=pnpm,target=/pnpm/store pnpm install --frozen-lockfile
 RUN pnpm --filter @vben/web-antd... build
 
@@ -46,7 +45,10 @@ COPY --from=builder --chown=nginx:nginx /app/apps/web-antd/dist /usr/share/nginx
 COPY --from=builder --chown=nginx:nginx /app/scripts/deploy/nginx.conf /etc/nginx/nginx.conf
 
 # Runtime config — override VITE_GLOB_* vars at container startup via docker-compose.yml
-ENV VITE_GLOB_API_URL=https://api.novusai.example.com
+ARG VITE_GLOB_API_URL
+ARG VITE_PLATFORM_DOMAINS=localhost
+ENV VITE_GLOB_API_URL="${VITE_GLOB_API_URL}" \
+    VITE_PLATFORM_DOMAINS="${VITE_PLATFORM_DOMAINS}"
 
 COPY --chmod=755 frontend/scripts/deploy/entrypoint.sh /entrypoint.sh
 

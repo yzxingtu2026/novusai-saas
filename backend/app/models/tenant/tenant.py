@@ -8,7 +8,7 @@ Multi-tenant SaaS tenant entity.
 from datetime import datetime
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship, validates
 
 from app.core.base_model import BaseModel
@@ -125,6 +125,13 @@ class Tenant(BaseModel):
         Boolean,
         default=True,
         comment="是否启用 / Active",
+    )
+    session_revocation_epoch: Mapped[int] = mapped_column(
+        Integer,
+        nullable=False,
+        default=0,
+        server_default=text("0"),
+        comment="租户会话生命周期版本 / Tenant session lifecycle epoch",
     )
 
     # 退役存储列：仅映射现有库表形态，应用写入会拒绝 /

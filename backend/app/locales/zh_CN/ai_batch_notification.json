@@ -1,0 +1,17 @@
+{
+  "ai": {
+    "batch_notification": {
+      "partial_failed": {
+        "title": "批处理部分失败",
+        "body": "批处理任务部分失败。已处理 {completed} 条，成功 {succeeded} 条，失败 {failed} 条。首个错误：{error}"
+      }
+    }
+  },
+  "enum": {
+    "agent": {
+      "batch_run_status": {
+        "unknown": "结果待确认"
+      }
+    }
+  }
+}

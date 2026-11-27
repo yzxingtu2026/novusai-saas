@@ -36,6 +36,7 @@ def test_public_image_endpoint_redirects_to_processed_url(
         tenant_id=23,
         driver="s3",
         path="images/demo.png",
+        visibility="public",
     )
     params = SimpleNamespace(is_empty=lambda: False)
 
@@ -113,6 +114,7 @@ def test_public_access_endpoint_returns_404_when_cloud_redirect_falls_back_to_ap
         tenant_id=7,
         driver="s3",
         path="private/demo.png",
+        visibility="private",
     )
 
     async def fake_get_attachment(self, attachment_id: int):
@@ -171,6 +173,7 @@ def test_public_access_endpoint_streams_local_preview_and_records_download(
         tenant_id=7,
         driver="local",
         path="uploads/demo.txt",
+        visibility="public",
     )
     record_download = AsyncMock()
     get_download_response = AsyncMock(
@@ -238,6 +241,7 @@ def test_public_image_endpoint_redirects_to_original_when_processing_disabled(
         tenant_id=5,
         driver="s3",
         path="images/original.png",
+        visibility="public",
     )
 
     async def fake_get_platform_config(self, key: str, default=None):
@@ -313,6 +317,7 @@ def test_public_image_endpoint_redirects_to_original_when_params_are_empty(
         tenant_id=5,
         driver="s3",
         path="images/original.png",
+        visibility="public",
     )
     params = SimpleNamespace(is_empty=lambda: True)
 

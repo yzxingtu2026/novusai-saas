@@ -12,6 +12,8 @@ Integrates with Let's Encrypt using DNS-01 validation to issue SSL certificates.
 
 import asyncio
 import time
+from datetime import datetime, timedelta
+from urllib.parse import urlsplit
 
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
@@ -22,6 +24,36 @@ from app.core.config import settings
 from app.core.logging import LogManager
 
 logger = LogManager.get_logger("ssl")
+
+_ACME_ALLOWED_HOSTS = frozenset(
+    {
+        "acme-v02.api.letsencrypt.org",
+        "acme-staging-v02.api.letsencrypt.org",
+    }
+)
+
+
+def validate_acme_directory_url(value: str) -> str:
+    """Accept only the two explicitly supported Let's Encrypt directories."""
+    raw = str(value or "").strip()
+    try:
+        parsed = urlsplit(raw)
+        hostname = (parsed.hostname or "").rstrip(".").lower()
+        port = parsed.port
+    except (TypeError, ValueError) as exc:
+        raise ValueError("acme_directory_url_not_allowed") from exc
+    if (
+        parsed.scheme.lower() != "https"
+        or hostname not in _ACME_ALLOWED_HOSTS
+        or parsed.username
+        or parsed.password
+        or parsed.query
+        or parsed.fragment
+        or port not in {None, 443}
+        or parsed.path.rstrip("/") != "/directory"
+    ):
+        raise ValueError("acme_directory_url_not_allowed")
+    return raw.rstrip("/")
 
 
 class AcmeDnsSetterMissingError(RuntimeError):
@@ -50,6 +82,8 @@ class AcmeClient:
         directory_url: str | None = None,
         account_email: str | None = None,
         use_staging: bool | None = None,
+        account_key_directory: str | None = None,
+        account_encryption_key: str | None = None,
     ):
         import josepy as jose
         from acme import client as acme_client
@@ -63,12 +97,25 @@ class AcmeClient:
         _use_staging = (
             use_staging if use_staging is not None else settings.ACME_USE_STAGING
         )
-        self._directory_url = directory_url or (
-            settings.ACME_STAGING_URL if _use_staging else settings.ACME_DIRECTORY_URL
+        self._directory_url = validate_acme_directory_url(
+            directory_url
+            or (
+                settings.ACME_STAGING_URL
+                if _use_staging
+                else settings.ACME_DIRECTORY_URL
+            )
         )
         self._account_email = account_email or settings.ACME_ACCOUNT_EMAIL
         self._client = None
         self._account_key = None
+        self._account_key_directory = (
+            account_key_directory
+            if account_key_directory is not None
+            else settings.ACME_ACCOUNT_KEY_DIRECTORY
+        )
+        self._account_encryption_key = (
+            account_encryption_key or settings.SSL_PRIVATE_KEY_ENCRYPTION_KEY
+        )
 
     async def provision_certificate(
         self,
@@ -105,60 +152,37 @@ class AcmeClient:
         await self._init_client()
 
         # 3. 创建订单 / 3. Create order
-        order = await asyncio.to_thread(self._create_order, domain)
+        csr = self._generate_csr(domain, domain_key)
+        order = await asyncio.to_thread(self._create_order, csr)
         logger.info("ACME order created for {}", domain)
 
         # 4. 获取 DNS-01 challenge
         authz, challenge, validation = self._get_dns01_challenge(order)
         record_name = f"_acme-challenge.{domain}"
 
-        logger.info(
-            "DNS-01 challenge: set TXT record {} = {}",
-            record_name,
-            validation,
-        )
+        logger.info("DNS-01 challenge for {}", record_name)
 
         # 5. 设置 DNS TXT 记录
         if dns_setter:
             await dns_setter(record_name, validation)
         else:
             raise AcmeDnsSetterMissingError(
-                f"DNS-01 challenge requires dns_setter callback. "
-                f"Set TXT record manually: {record_name} = {validation}"
+                "DNS-01 challenge requires a configured DNS provider"
             )
 
-        # 6. 等待 DNS 传播
-        await self._wait_for_dns_propagation(record_name, validation)
-
-        # 7. 响应 challenge
-        await asyncio.to_thread(self._respond_challenge, challenge)
-        logger.info("ACME challenge responded for {}", domain)
-
-        # 8. 等待验证完成 / 8. Wait for validation to finish
-        await self._poll_challenge_status(authz)
-
-        # 9. 生成 CSR 并完成订单
-        csr = self._generate_csr(domain, domain_key)
-        order = await asyncio.to_thread(self._finalize_order, order, csr)
-        logger.info("ACME order finalized for {}", domain)
-
-        # 10. 下载证书 / 10. Download certificate
-        cert_pem, chain_pem = self._extract_certificate(order)
-        logger.info("Certificate issued for {}", domain)
-
-        # 11. 清理 DNS TXT 记录（静默失败）
-        if dns_deleter:
-            try:
-                await dns_deleter(record_name, validation)
-                logger.info("DNS TXT record cleaned up: {}", record_name)
-            except Exception as e:
-                logger.warning(
-                    "Failed to clean up DNS TXT record {}: {}",
-                    record_name,
-                    str(e),
-                )
-
-        return cert_pem, domain_key_pem, chain_pem
+        try:
+            await self._wait_for_dns_propagation(record_name, validation)
+            await asyncio.to_thread(self._respond_challenge, challenge)
+            await self._poll_challenge_status(authz)
+            order = await asyncio.to_thread(self._finalize_order, order)
+            cert_pem, chain_pem = self._extract_certificate(order)
+            return cert_pem, domain_key_pem, chain_pem
+        finally:
+            if dns_deleter:
+                try:
+                    await dns_deleter(record_name, validation)
+                except Exception:
+                    logger.warning("DNS TXT cleanup failed for {}", record_name)
 
     # ==================== 内部方法 ==================== / ==================== Internal methods ====================
 
@@ -167,9 +191,20 @@ class AcmeClient:
         if self._client:
             return
 
-        self._account_key = self._jose.JWKRSA(
-            key=self._generate_private_key(),
-        )
+        if self._account_key_directory:
+            from app.services.system.acme_account_store import (
+                load_or_create_account_key,
+            )
+
+            key = await asyncio.to_thread(
+                load_or_create_account_key,
+                self._account_key_directory,
+                self._directory_url,
+                self._account_encryption_key,
+            )
+        else:
+            key = self._generate_private_key()
+        self._account_key = self._jose.JWKRSA(key=key)
 
         net = self._acme_module.ClientNetwork(
             self._account_key,
@@ -192,24 +227,18 @@ class AcmeClient:
         try:
             await asyncio.to_thread(self._client.new_account, registration)
             logger.info("ACME account registered: {}", self._account_email)
-        except Exception as e:
-            if "already" in str(e).lower():
-                logger.info("ACME account already exists: {}", self._account_email)
-            else:
-                raise
-
-    def _create_order(self, domain: str):
-        """创建证书订单 / Create certificate order."""
-        return self._client.new_order(
-            self._acme_module.crypto_util.make_csr(
-                self._generate_private_key().private_bytes(
-                    serialization.Encoding.PEM,
-                    serialization.PrivateFormat.PKCS8,
-                    serialization.NoEncryption(),
-                ),
-                [domain],
+        except self._acme_module.errors.ConflictError as exc:
+            registration_resource = self._messages.RegistrationResource(
+                body=self._messages.Registration(), uri=exc.location
             )
-        )
+            await asyncio.to_thread(
+                self._client.query_registration, registration_resource
+            )
+            logger.info("ACME account reused")
+
+    def _create_order(self, csr: bytes):
+        """创建证书订单 / Create certificate order."""
+        return self._client.new_order(csr)
 
     def _get_dns01_challenge(self, order) -> tuple:
         """从订单中提取 DNS-01 challenge，返回 (authz, challenge, validation) / Extract DNS-01 challenge from order."""
@@ -248,17 +277,19 @@ class AcmeClient:
             status = getattr(updated_authz, "status", None)
             if status is None and hasattr(updated_authz, "body"):
                 status = getattr(updated_authz.body, "status", None)
-            if status and str(status) == "valid":
+            if status == self._messages.STATUS_VALID:
                 return
-            if status and str(status) == "invalid":
-                raise RuntimeError(f"ACME challenge validation failed: {updated_authz}")
+            if status == self._messages.STATUS_INVALID:
+                raise RuntimeError("ACME challenge validation failed")
             await asyncio.sleep(interval)
 
         raise TimeoutError(f"ACME challenge verification timed out after {timeout}s")
 
-    def _finalize_order(self, order, csr) -> object:
+    def _finalize_order(self, order) -> object:
         """完成订单 / Finalize order."""
-        return self._client.finalize_order(order, csr)
+        return self._client.finalize_order(
+            order, deadline=datetime.now() + timedelta(seconds=300)
+        )
 
     @staticmethod
     def _generate_csr(domain: str, key) -> bytes:
@@ -320,9 +351,10 @@ class AcmeClient:
                     dns.resolver.resolve,
                     record_name,
                     "TXT",
+                    lifetime=min(5.0, max(0.1, timeout - (time.monotonic() - start))),
                 )
                 for rdata in answers:
-                    txt_value = str(rdata).strip('"').strip()
+                    txt_value = b"".join(rdata.strings).decode("utf-8")
                     if txt_value == expected_value:
                         logger.info("DNS propagation confirmed for {}", record_name)
                         return
@@ -336,11 +368,9 @@ class AcmeClient:
 
             await asyncio.sleep(interval)
 
-        logger.warning(
-            "DNS propagation timeout for {} after {}s, proceeding anyway",
-            record_name,
-            timeout,
+        raise TimeoutError(
+            f"DNS propagation timed out for {record_name} after {timeout}s"
         )
 
 
-__all__ = ["AcmeClient"]
+__all__ = ["AcmeClient", "validate_acme_directory_url"]

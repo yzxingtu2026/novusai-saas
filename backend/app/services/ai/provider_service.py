@@ -6,10 +6,14 @@ Handles AI provider business logic.
 """
 
 from typing import Any
-from urllib.parse import urlparse
 
 from sqlalchemy.exc import IntegrityError
 
+from app.ai.provider_url_policy import (
+    ProviderUrlPolicyError,
+    provider_config_allows_private_network,
+    validate_provider_base_url,
+)
 from app.ai.text_semantics import slugify_ascii_identifier
 from app.core.base_service import BaseService
 from app.core.i18n import _
@@ -29,7 +33,6 @@ from app.schemas.ai.provider import (
 
 _logger = LogManager.get_logger("ai")
 
-_ALLOWED_PROVIDER_BASE_URL_SCHEMES = {"http", "https"}
 _FORBIDDEN_OPENAI_COMPATIBLE_BASE_URL_SUFFIXES = (
     "/responses",
     "/chat/completions",
@@ -99,13 +102,6 @@ class AIProviderService(BaseService[AIProvider, AIProviderRepository]):
             suffix += 1
         return code
 
-    @staticmethod
-    def _clean_base_url(base_url: str | None) -> str | None:
-        normalized = str(base_url or "").strip()
-        if not normalized:
-            return None
-        return normalized
-
     @classmethod
     def _has_forbidden_openai_endpoint_suffix(cls, base_url: str) -> bool:
         normalized_for_suffix_check = base_url.rstrip("/").lower()
@@ -120,24 +116,27 @@ class AIProviderService(BaseService[AIProvider, AIProviderRepository]):
         base_url: str | None,
         *,
         provider_type: str | None = None,
+        provider_config: dict[str, Any] | None = None,
     ) -> str | None:
-        cleaned_base_url = cls._clean_base_url(base_url)
-        if cleaned_base_url:
-            parsed = urlparse(cleaned_base_url)
-            if (
-                parsed.scheme.lower() not in _ALLOWED_PROVIDER_BASE_URL_SCHEMES
-                or not parsed.netloc
-            ):
-                raise ValidationException(
-                    message=_("ai.error.provider_base_url_invalid")
-                )
-            if (
-                provider_type == "openai_compatible"
-                and cls._has_forbidden_openai_endpoint_suffix(cleaned_base_url)
-            ):
-                raise ValidationException(
-                    message=_("ai.error.provider_base_url_endpoint_not_allowed")
-                )
+        try:
+            cleaned_base_url = validate_provider_base_url(
+                base_url,
+                allow_private_network=provider_config_allows_private_network(
+                    provider_config
+                ),
+            )
+        except ProviderUrlPolicyError as exc:
+            raise ValidationException(
+                message=_("ai.error.provider_base_url_invalid")
+            ) from exc
+        if (
+            cleaned_base_url
+            and provider_type == "openai_compatible"
+            and cls._has_forbidden_openai_endpoint_suffix(cleaned_base_url)
+        ):
+            raise ValidationException(
+                message=_("ai.error.provider_base_url_endpoint_not_allowed")
+            )
         return cleaned_base_url
 
     @classmethod
@@ -148,20 +147,25 @@ class AIProviderService(BaseService[AIProvider, AIProviderRepository]):
         existing_provider: AIProvider | None = None,
     ) -> dict[str, Any]:
         validated_payload = dict(payload)
-        if "base_url" in validated_payload:
-            provider_type = validated_payload.get("type") or getattr(
-                existing_provider, "type", None
-            )
-            validated_payload["base_url"] = cls._validate_base_url(
-                validated_payload.get("base_url"),
-                provider_type=provider_type,
-            )
-        if "config" in validated_payload:
+        if "config" in validated_payload or existing_provider is None:
             validated_payload["config"] = cls._normalize_provider_config(
                 validated_payload.get("config"),
             )
-        elif existing_provider is None:
-            validated_payload["config"] = cls._normalize_provider_config(None)
+        if {"base_url", "type", "config"}.intersection(validated_payload):
+            provider_type = validated_payload.get("type") or getattr(
+                existing_provider, "type", None
+            )
+            base_url = cls._validate_base_url(
+                validated_payload.get(
+                    "base_url", getattr(existing_provider, "base_url", None)
+                ),
+                provider_type=provider_type,
+                provider_config=validated_payload.get(
+                    "config", getattr(existing_provider, "config", None)
+                ),
+            )
+            if "base_url" in validated_payload:
+                validated_payload["base_url"] = base_url
         return validated_payload
 
     @classmethod

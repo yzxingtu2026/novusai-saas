@@ -5,15 +5,17 @@
  */
 import type { TreeProps as AntTreeProps } from 'ant-design-vue';
 
-import type { TenantPermissionNode } from '#/api/tenant/permission';
+import type { TenantPermissionNodeRaw } from '#/api/tenant/permission';
 import type { TenantUserRoleInfo } from '#/api/tenant/tenant-user-roles';
 
-import { computed, ref, watch } from 'vue';
+import { computed, ref, shallowRef, watch } from 'vue';
 
 import { IconifyIcon } from '@vben/icons';
 
 import {
+  Alert,
   Button,
+  Checkbox,
   Drawer,
   Empty,
   message,
@@ -23,10 +25,9 @@ import {
   Tree,
 } from 'ant-design-vue';
 
-import { getTenantPermissionTreeApi } from '#/api/tenant/permission';
 import {
   assignTenantUserRolePermissionsApi,
-  getTenantUserRoleDetailApi,
+  getTenantUserRoleAssignmentApi,
 } from '#/api/tenant/tenant-user-roles';
 import { $t } from '#/locales';
 
@@ -45,13 +46,25 @@ const emit = defineEmits<{
 // ============================================================
 
 const loading = ref(false);
+const loadFailed = ref(false);
 const saving = ref(false);
+const draft = shallowRef<null | { ineligibleGrants: string[]; roleId: number }>(
+  null,
+);
+const removeIneligibleGrants = ref(false);
 const permissionTree = ref<TreeNode[]>([]);
 const checkedKeys = ref<number[]>([]);
 const expandedKeys = ref<number[]>([]);
-const halfCheckedKeys = ref<number[]>([]);
 const parentKeyMap = ref<Map<number, null | number>>(new Map());
 const descendantKeyMap = ref<Map<number, number[]>>(new Map());
+const activeRoleId = computed(() => (props.open ? props.role?.id : undefined));
+const canSave = computed(
+  () =>
+    !saving.value &&
+    draft.value !== null &&
+    draft.value.roleId === activeRoleId.value &&
+    (draft.value.ineligibleGrants.length === 0 || removeIneligibleGrants.value),
+);
 
 // ============================================================
 // Tree node type / 树节点类型
@@ -79,15 +92,27 @@ const drawerTitle = computed(() => {
 // Load data / 加载数据
 // ============================================================
 
-function transformToTreeNodes(nodes: TenantPermissionNode[]): TreeNode[] {
-  return nodes.map((node) => ({
-    key: node.id,
-    title: node.name,
-    code: node.code,
-    type: node.type,
-    icon: node.icon ?? undefined,
-    children: node.children ? transformToTreeNodes(node.children) : undefined,
+function transformToTreeNodes(options: TenantPermissionNodeRaw[]): TreeNode[] {
+  const entries = options.map((option) => ({
+    node: {
+      children: [] as TreeNode[],
+      code: option.code,
+      icon: option.icon ?? undefined,
+      key: option.id,
+      title: option.name,
+      type: option.type,
+    },
+    parentId: option.parent_id,
   }));
+  const nodesById = new Map(entries.map(({ node }) => [node.key, node]));
+  const roots: TreeNode[] = [];
+  for (const { node, parentId } of entries) {
+    const parent = parentId === null ? undefined : nodesById.get(parentId);
+    // 中文: 父节点不可分配时，在顶层显示可分配的子权限。
+    // EN: Show eligible child permissions at the root when their parent is ineligible.
+    (parent?.children ?? roots).push(node);
+  }
+  return roots;
 }
 
 function getAllKeys(nodes: TreeNode[]): number[] {
@@ -126,83 +151,45 @@ function getBranchKeys(targetKey: number): number[] {
   return branch.toReversed();
 }
 
-async function loadData() {
-  if (!props.role) return;
-  loading.value = true;
-  try {
-    const [tree, detail] = await Promise.all([
-      getTenantPermissionTreeApi(),
-      getTenantUserRoleDetailApi(props.role.id),
-    ]);
-
-    permissionTree.value = transformToTreeNodes(tree);
-    expandedKeys.value = [];
-    parentKeyMap.value = new Map();
-    descendantKeyMap.value = new Map();
-    buildTreeRelations(permissionTree.value);
-
-    const permIds = detail.permissionIds || [];
-    checkedKeys.value = filterLeafKeys(permissionTree.value, new Set(permIds));
-  } catch {
-    permissionTree.value = [];
-    checkedKeys.value = [];
-  } finally {
-    loading.value = false;
-  }
-}
-
-/**
- * 只返回叶子节点 ID（Ant Tree 的 checkStrictly=false 模式需要）
- */
-function filterLeafKeys(nodes: TreeNode[], idSet: Set<number>): number[] {
-  const result: number[] = [];
-  for (const node of nodes) {
-    if (!node.children || node.children.length === 0) {
-      if (idSet.has(node.key)) {
-        result.push(node.key);
-      }
-    } else {
-      result.push(...filterLeafKeys(node.children, idSet));
-    }
-  }
-  return result;
-}
-
 // ============================================================
 // Actions / 操作
 // ============================================================
 
-function onCheck(
-  checked:
-    | (number | string)[]
-    | { checked: (number | string)[]; halfChecked: (number | string)[] },
-) {
-  if (Array.isArray(checked)) {
-    checkedKeys.value = checked.filter(
-      (k): k is number => typeof k === 'number',
-    );
-    halfCheckedKeys.value = [];
+const onCheck: NonNullable<AntTreeProps['onCheck']> = (
+  _displayedKeys,
+  { checked, node },
+) => {
+  const key = node.key;
+  if (typeof key !== 'number') return;
+  // 中文: 仅应用用户直接切换的权限，保留草稿中的其他授权。
+  // EN: Apply only the toggled permission and retain the rest of the draft.
+  const selection = new Set(checkedKeys.value);
+  if (checked) {
+    selection.add(key);
   } else {
-    checkedKeys.value = checked.checked.filter(
-      (k): k is number => typeof k === 'number',
-    );
-    halfCheckedKeys.value = checked.halfChecked.filter(
-      (k): k is number => typeof k === 'number',
-    );
+    selection.delete(key);
   }
-}
+  checkedKeys.value = [...selection];
+};
 
 async function onSave() {
-  if (!props.role) return;
+  const submittedDraft = draft.value;
+  if (!canSave.value || !submittedDraft) return;
   saving.value = true;
   try {
-    const allIds = [...checkedKeys.value, ...halfCheckedKeys.value];
-    await assignTenantUserRolePermissionsApi(props.role.id, {
-      permission_ids: allIds,
+    await assignTenantUserRolePermissionsApi(submittedDraft.roleId, {
+      permission_ids: [...checkedKeys.value],
     });
-    message.success($t('tenant.system.userRole.messages.permissionsSaved'));
+    // 中文: 已完成的写入始终通知角色列表刷新，即使抽屉已切换到其他角色。
+    // EN: Notify the role list of a committed save even after the drawer changes roles.
     emit('saved');
-    emit('update:open', false);
+    if (
+      draft.value === submittedDraft &&
+      activeRoleId.value === submittedDraft.roleId
+    ) {
+      message.success($t('tenant.system.userRole.messages.permissionsSaved'));
+      emit('update:open', false);
+    }
   } finally {
     saving.value = false;
   }
@@ -252,12 +239,48 @@ const onExpand: NonNullable<AntTreeProps['onExpand']> = (
 // ============================================================
 
 watch(
-  () => props.open,
-  (val) => {
-    if (val && props.role) {
-      loadData();
+  activeRoleId,
+  async (roleId, _, onCleanup) => {
+    draft.value = null;
+    removeIneligibleGrants.value = false;
+    permissionTree.value = [];
+    checkedKeys.value = [];
+    expandedKeys.value = [];
+    loadFailed.value = false;
+    loading.value = roleId !== undefined;
+    if (roleId === undefined) return;
+
+    let current = true;
+    onCleanup(() => {
+      current = false;
+    });
+    try {
+      const assignment = await getTenantUserRoleAssignmentApi(roleId);
+      if (!current) return;
+
+      const eligibleIds = new Set(
+        assignment.permissionOptions.map((option) => option.id),
+      );
+      const ineligibleGrants = assignment.permissionIds.flatMap((id, index) =>
+        eligibleIds.has(id)
+          ? []
+          : [assignment.permissionCodes[index] ?? String(id)],
+      );
+      permissionTree.value = transformToTreeNodes(assignment.permissionOptions);
+      parentKeyMap.value = new Map();
+      descendantKeyMap.value = new Map();
+      buildTreeRelations(permissionTree.value);
+      checkedKeys.value = assignment.permissionIds.filter((id) =>
+        eligibleIds.has(id),
+      );
+      draft.value = { ineligibleGrants, roleId };
+    } catch {
+      if (current) loadFailed.value = true;
+    } finally {
+      if (current) loading.value = false;
     }
   },
+  { immediate: true },
 );
 
 // ============================================================
@@ -330,6 +353,24 @@ function getTypeLabel(type: string): string {
       </Space>
     </template>
 
+    <Alert
+      v-if="draft && draft.ineligibleGrants.length > 0"
+      :description="draft.ineligibleGrants.join(', ')"
+      class="mb-3"
+      show-icon
+      type="warning"
+    >
+      <template #message>
+        <Checkbox v-model:checked="removeIneligibleGrants" :disabled="saving">
+          {{
+            $t('tenant.system.userRole.removeIneligibleGrants', {
+              count: draft.ineligibleGrants.length,
+            })
+          }}
+        </Checkbox>
+      </template>
+    </Alert>
+
     <!-- Loading -->
     <div v-if="loading" class="space-y-3 p-2">
       <Skeleton
@@ -341,6 +382,8 @@ function getTypeLabel(type: string): string {
         class="!mb-0"
       />
     </div>
+
+    <Empty v-else-if="loadFailed" :description="$t('common.loadFailed')" />
 
     <!-- Empty -->
     <Empty
@@ -354,7 +397,9 @@ function getTypeLabel(type: string): string {
       v-model:expanded-keys="expandedKeys"
       :checked-keys="checkedKeys"
       :tree-data="permissionTree"
+      check-strictly
       checkable
+      :disabled="saving"
       :selectable="false"
       block-node
       @check="onCheck"
@@ -386,7 +431,7 @@ function getTypeLabel(type: string): string {
         <Button
           type="primary"
           :loading="saving"
-          :disabled="loading"
+          :disabled="!canSave"
           @click="onSave"
         >
           {{ $t('shared.common.save') }}

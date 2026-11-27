@@ -11,7 +11,14 @@ import type { Socket } from 'socket.io-client';
 
 import type { Ref, ShallowRef } from 'vue';
 
-import { ref, shallowRef, toValue, watch } from 'vue';
+import {
+  getCurrentScope,
+  onScopeDispose,
+  ref,
+  shallowRef,
+  toValue,
+  watch,
+} from 'vue';
 
 import { io } from 'socket.io-client';
 
@@ -127,8 +134,7 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
   const status = ref<SocketIOStatus>('disconnected');
 
   let isManualDisconnect = false;
-  let authErrorCount = 0;
-  const MAX_AUTH_ERRORS = 3;
+  let socketCleanup: (() => void) | null = null;
 
   /** Get current token value (supports Ref, getter function, static string) / 获取当前 token 值 */
   function getToken(): string {
@@ -138,22 +144,33 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
     return toValue(token);
   }
 
-  /** Create Socket.IO connection / 创建 Socket.IO 连接 */
-  function createSocket(): Socket {
-    const url = serverUrl || window.location.origin;
-    const currentToken = getToken();
+  function createAuthPayload(currentToken: string): Record<string, string> {
     const traceId = getSocketTraceId();
-
     const authPayload: Record<string, string> = {
       token: currentToken ? `Bearer ${currentToken}` : '',
     };
     if (traceId) {
       authPayload.trace_id = traceId;
     }
+    return authPayload;
+  }
+
+  function isCurrentSocket(sock: Socket): boolean {
+    return socket.value === sock && !isManualDisconnect;
+  }
+
+  /** Create Socket.IO connection / 创建 Socket.IO 连接 */
+  function createSocket(): { cleanup: () => void; socket: Socket } {
+    const url = serverUrl || window.location.origin;
+    let lastHandshakeToken = getToken();
+    let lastRetriedToken = '';
 
     const sock = io(`${url}${namespace}`, {
       path,
-      auth: authPayload,
+      auth: (callback) => {
+        lastHandshakeToken = getToken();
+        callback(createAuthPayload(lastHandshakeToken));
+      },
       autoConnect: false,
       reconnection: true,
       reconnectionDelay: 1000,
@@ -164,60 +181,72 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
 
     // Connection status events / 连接状态事件
     sock.on('connect', () => {
+      if (!isCurrentSocket(sock)) return;
       status.value = 'connected';
-      authErrorCount = 0;
     });
 
-    sock.on('disconnect', (_reason) => {
-      if (!isManualDisconnect) {
+    sock.on('disconnect', () => {
+      if (isCurrentSocket(sock)) {
         status.value = 'disconnected';
       }
     });
 
-    sock.io.on('reconnect_attempt', () => {
-      status.value = 'reconnecting';
-    });
+    const onReconnectAttempt = () => {
+      if (isCurrentSocket(sock) && sock.active) {
+        status.value = 'reconnecting';
+      }
+    };
 
-    sock.io.on('reconnect', () => {
-      status.value = 'connected';
-    });
+    const onReconnect = () => {
+      if (isCurrentSocket(sock) && sock.active && !sock.connected) {
+        // 中文: Manager 只恢复底层传输；命名空间仍需完成认证握手。
+        // EN: The manager restored transport; the namespace still needs to authenticate.
+        status.value = 'connecting';
+      }
+    };
 
-    sock.io.on('reconnect_failed', () => {
-      status.value = 'disconnected';
-      console.error('[Socket.IO] Reconnection failed');
-    });
+    const onReconnectFailed = () => {
+      if (isCurrentSocket(sock) && sock.active) {
+        status.value = 'disconnected';
+        console.error('[Socket.IO] Reconnection failed');
+      }
+    };
+
+    sock.io.on('reconnect_attempt', onReconnectAttempt);
+    sock.io.on('reconnect', onReconnect);
+    sock.io.on('reconnect_failed', onReconnectFailed);
 
     // Token expired / auth failure handling / Token 过期认证失败处理
     sock.on(
       'connect_error',
       (err: Error & { data?: SocketConnectErrorData }) => {
+        if (!isCurrentSocket(sock)) return;
+
         const { debugMessage, reason, traceId } =
           getSocketConnectErrorInfo(err);
         const traceSuffix = traceId ? ` (trace_id=${traceId})` : '';
+        status.value = 'disconnected';
+
         if (reason === 'token_expired' || reason === 'authentication_failed') {
-          authErrorCount++;
           const latestToken = getToken();
 
-          if (latestToken && latestToken !== currentToken) {
-            // Token refreshed, reconnect with new token / Token 已刷新，用新 token 重连
-            const refreshedTraceId = getSocketTraceId();
-            sock.auth = refreshedTraceId
-              ? { token: `Bearer ${latestToken}`, trace_id: refreshedTraceId }
-              : { token: `Bearer ${latestToken}` };
-            authErrorCount = 0;
+          if (
+            latestToken &&
+            latestToken !== lastHandshakeToken &&
+            latestToken !== lastRetriedToken
+          ) {
+            // 中文: 仅在令牌确实更新时重试一次命名空间握手。
+            // EN: Retry the namespace handshake once only when the token changed.
+            lastRetriedToken = latestToken;
+            lastHandshakeToken = latestToken;
+            status.value = 'connecting';
+            sock.connect();
             console.warn(
               `[Socket.IO] Token refreshed, reconnecting with new token${traceSuffix}`,
             );
-          } else if (authErrorCount >= MAX_AUTH_ERRORS) {
-            // Multiple auth failures without token refresh, stop reconnecting / 多次认证失败停止重连
-            sock.disconnect();
-            status.value = 'disconnected';
-            console.warn(
-              `[Socket.IO] Auth failed after max retries, stopped reconnecting${traceSuffix}`,
-            );
           } else {
             console.warn(
-              `[Socket.IO] Auth error: ${reason} (attempt ${authErrorCount}/${MAX_AUTH_ERRORS})${traceSuffix}`,
+              `[Socket.IO] Auth error: ${reason}; waiting for a new token or explicit retry${traceSuffix}`,
             );
           }
         } else {
@@ -230,33 +259,40 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
       },
     );
 
-    return sock;
+    return {
+      socket: sock,
+      cleanup: () => {
+        sock.io.off('reconnect_attempt', onReconnectAttempt);
+        sock.io.off('reconnect', onReconnect);
+        sock.io.off('reconnect_failed', onReconnectFailed);
+        sock.removeAllListeners();
+      },
+    };
   }
 
   /** Connect / 连接 */
   function connect() {
     isManualDisconnect = false;
-    authErrorCount = 0;
 
     const currentToken = getToken();
     if (!currentToken) {
       return;
     }
 
-    // Ignore if already connected / 如果已有连接且 connected，忽略
-    if (socket.value?.connected) {
+    if (socket.value) {
+      if (socket.value.connected) {
+        return;
+      }
+
+      status.value = 'connecting';
+      socket.value.connect();
       return;
     }
 
-    // Destroy existing socket if not connected / 如果已有 socket 但未连接，先销毁
-    if (socket.value) {
-      socket.value.removeAllListeners();
-      socket.value.disconnect();
-    }
-
     status.value = 'connecting';
-    const sock = createSocket();
+    const { cleanup, socket: sock } = createSocket();
     socket.value = sock;
+    socketCleanup = cleanup;
     sock.connect();
   }
 
@@ -264,8 +300,10 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
   function disconnect() {
     isManualDisconnect = true;
     if (socket.value) {
-      socket.value.removeAllListeners();
-      socket.value.disconnect();
+      const sock = socket.value;
+      socketCleanup?.();
+      socketCleanup = null;
+      sock.disconnect();
       socket.value = null;
     }
     status.value = 'disconnected';
@@ -304,18 +342,13 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
       }
 
       if (socket.value) {
-        // Token updated → reconnect (update auth) / Token 更新 → 重连
-        const traceId = getSocketTraceId();
-        socket.value.auth = traceId
-          ? { token: `Bearer ${newToken}`, trace_id: traceId }
-          : { token: `Bearer ${newToken}` };
+        // 中文: 每次命名空间握手都通过 auth 回调读取最新令牌。
+        // EN: The auth callback reads the latest token for every namespace handshake.
         if (socket.value.connected) {
-          // Token changed while connected: disconnect and reconnect with new token / 已连接状态下断开重连
           socket.value.disconnect();
-          socket.value.connect();
-        } else {
-          socket.value.connect();
         }
+        status.value = 'connecting';
+        socket.value.connect();
       } else if (oldToken === '') {
         // First token received → connect / 首次获得 token → 连接
         connect();
@@ -326,6 +359,10 @@ export function useSocketIO(options: UseSocketIOOptions): UseSocketIOReturn {
   // Auto-connect / 自动连接
   if (autoConnect && getToken()) {
     connect();
+  }
+
+  if (getCurrentScope()) {
+    onScopeDispose(disconnect);
   }
 
   return {

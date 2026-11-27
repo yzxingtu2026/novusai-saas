@@ -33,9 +33,11 @@ import {
 } from 'ant-design-vue';
 
 import { adminApi as admin } from '#/api';
+import DomainManagedHttps from '#/components/business/domain-managed-https.vue';
 import { $t } from '#/locales';
 import { useAccess } from '#/utils';
 import { copyToClipboard } from '#/utils/common';
+import { getDomainSslPresentation } from '#/utils/domain-presentation';
 
 import DomainsAddDrawer from './DomainsAddDrawer.vue';
 import DomainsDetailDrawer from './DomainsDetailDrawer.vue';
@@ -70,7 +72,14 @@ const canDeleteDomain = hasAccessByCodes(['tenant_domain:delete']);
 const canSetPrimaryDomain = hasAccessByCodes(['tenant_domain:set_primary']);
 const canVerifyDomain = hasAccessByCodes(['tenant_domain:verify']);
 const canViewDomainDetail = hasAccessByCodes(['tenant_domain:detail']);
-const canViewDevHosts = hasAccessByCodes(['tenant_domain:hosts_status']);
+const canProbeDevHosts =
+  import.meta.env.DEV && hasAccessByCodes(['tenant_domain:hosts_status']);
+const canViewDevHosts = computed(
+  () =>
+    canProbeDevHosts &&
+    devHostsOverview.value?.runtime.debug === true &&
+    devHostsOverview.value.runtime.enabled === true,
+);
 const canSyncDevHosts = hasAccessByCodes(['tenant_domain:hosts_sync']);
 const canSyncAllDevHosts = hasAccessByCodes(['tenant_domain:hosts_sync_all']);
 const canRemoveDevHosts = hasAccessByCodes(['tenant_domain:hosts_remove']);
@@ -91,7 +100,7 @@ const [Modal, modalApi] = useVbenModal({
       if (data?.tenantId) {
         currentTenant.value = data;
         const loadingTasks = [loadDomains()];
-        if (canViewDevHosts) {
+        if (canProbeDevHosts) {
           loadingTasks.push(loadDevHosts());
         }
         await Promise.all(loadingTasks);
@@ -170,7 +179,7 @@ async function loadDomains() {
 }
 
 async function loadDevHosts() {
-  if (!currentTenant.value?.tenantId || !canViewDevHosts) return;
+  if (!currentTenant.value?.tenantId || !canProbeDevHosts) return;
 
   devHostsLoading.value = true;
   devHostsLoadError.value = false;
@@ -244,12 +253,13 @@ function onOpenDnsGuide(domain: TenantDomainInfo) {
 
 /** Open SSL management drawer / 打开 SSL 管理抽屉 */
 function onOpenSslDrawer(domain: TenantDomainInfo) {
-  if (!currentTenant.value) return;
+  if (!currentTenant.value || domain.verificationStatus !== 'verified') return;
   sslDrawerRef.value?.open({
     domainId: domain.id,
     tenantId: currentTenant.value.tenantId,
     domain: domain.domain,
     isDefault: domain.domainType === 'default',
+    managedHttps: domain.managedHttps,
   });
 }
 
@@ -297,10 +307,12 @@ async function onDeleteDomain(domain: TenantDomainInfo) {
 }
 
 function getDevHostsDomainStatus(domainId: number) {
+  if (!canViewDevHosts.value) return null;
   return devHostsDomainStatusMap.value.get(domainId) || null;
 }
 
 function getDevHostsDomainStatusView(domainId: number) {
+  if (!canViewDevHosts.value) return null;
   return devHostsDomainStatusViews.value.get(domainId) || null;
 }
 
@@ -348,7 +360,7 @@ function isRemovingDomain(domainId: number) {
 }
 
 function canSyncDevHost(domainStatus: DevHostDomainStatus | null) {
-  if (!domainStatus || !devHostsOverview.value?.runtime.enabled) return false;
+  if (!canViewDevHosts.value || !domainStatus) return false;
   return domainStatus.eligible && domainStatus.status !== 'unsupported';
 }
 
@@ -361,7 +373,7 @@ function getDevHostsReasonText(reason?: null | string): string {
 }
 
 function canRemoveDevHost(domainStatus: DevHostDomainStatus | null) {
-  if (!domainStatus) return false;
+  if (!canViewDevHosts.value || !domainStatus) return false;
   return domainStatus.managed;
 }
 
@@ -375,6 +387,7 @@ function getDevHostsCliCommand(domain?: string) {
 }
 
 async function onCopyDevHostsCommand(domain?: string) {
+  if (!canViewDevHosts.value) return;
   const command = getDevHostsCliCommand(domain);
   if (!command) return;
   const success = await copyToClipboard(command);
@@ -386,7 +399,12 @@ async function onCopyDevHostsCommand(domain?: string) {
 }
 
 async function onSyncAllDevHosts() {
-  if (!currentTenant.value?.tenantId) return;
+  if (
+    !currentTenant.value?.tenantId ||
+    !canViewDevHosts.value ||
+    !canSyncAllDevHosts
+  )
+    return;
 
   syncingAllDevHosts.value = true;
   try {
@@ -415,7 +433,13 @@ async function onSyncAllDevHosts() {
 }
 
 async function onSyncDevHost(domain: TenantDomainInfo) {
-  if (!currentTenant.value?.tenantId || isSyncingDomain(domain.id)) return;
+  if (
+    !currentTenant.value?.tenantId ||
+    !canSyncDevHosts ||
+    !canSyncDevHost(getDevHostsDomainStatus(domain.id)) ||
+    isSyncingDomain(domain.id)
+  )
+    return;
 
   syncingDomainIds.value = [...syncingDomainIds.value, domain.id];
   try {
@@ -449,7 +473,13 @@ async function onSyncDevHost(domain: TenantDomainInfo) {
 }
 
 async function onRemoveDevHost(domain: TenantDomainInfo) {
-  if (!currentTenant.value?.tenantId || isRemovingDomain(domain.id)) return;
+  if (
+    !currentTenant.value?.tenantId ||
+    !canRemoveDevHosts ||
+    !canRemoveDevHost(getDevHostsDomainStatus(domain.id)) ||
+    isRemovingDomain(domain.id)
+  )
+    return;
 
   removingDomainIds.value = [...removingDomainIds.value, domain.id];
   try {
@@ -504,37 +534,12 @@ function getVerificationTagConfig(status: string) {
 }
 
 /** Get SSL status tag config / 获取 SSL 状态标签配置 */
-function getSslTagConfig(status: string) {
-  switch (status) {
-    case 'active': {
-      return {
-        color: 'success',
-        icon: 'lucide:shield-check',
-        text: $t('admin.tenant.domain.ssl.status.active'),
-      };
-    }
-    case 'expired': {
-      return {
-        color: 'error',
-        icon: 'lucide:shield-off',
-        text: $t('admin.tenant.domain.ssl.status.expired'),
-      };
-    }
-    case 'pending': {
-      return {
-        color: 'processing',
-        icon: 'lucide:shield',
-        text: $t('admin.tenant.domain.ssl.status.pending'),
-      };
-    }
-    default: {
-      return {
-        color: 'default',
-        icon: 'lucide:shield-x',
-        text: $t('admin.tenant.domain.ssl.status.none'),
-      };
-    }
-  }
+function getSslTagConfig(status?: string) {
+  const presentation = getDomainSslPresentation(status);
+  return {
+    ...presentation,
+    text: $t(`admin.tenant.domain.ssl.status.${presentation.key}`),
+  };
 }
 
 /** Open modal / 打开弹窗 */
@@ -748,11 +753,12 @@ defineExpose({ open, openAddDomain });
                 </Tag>
               </div>
 
-              <!-- SSL 状态 (只显示自定义域名) -->
-              <div
-                v-if="domain.domainType === 'custom'"
-                class="flex items-center gap-1"
-              >
+              <DomainManagedHttps
+                v-if="domain.domainType === 'default'"
+                :info="domain.managedHttps"
+              />
+              <!-- Custom domain certificate status -->
+              <div v-else class="flex items-center gap-1">
                 <span class="text-sm text-muted-foreground">SSL:</span>
                 <Tag :color="getSslTagConfig(domain.sslStatus).color">
                   <IconifyIcon
@@ -826,11 +832,10 @@ defineExpose({ open, openAddDomain });
                 {{ $t('admin.tenant.domain.editDomain') }}
               </Button>
 
-              <!-- SSL 管理 (已验证的自定义域名才显示) -->
+              <!-- Verified domain HTTPS detail/setup -->
               <Button
                 v-if="
                   domain.verificationStatus === 'verified' &&
-                  domain.domainType === 'custom' &&
                   canViewDomainSslDetail
                 "
                 type="link"
@@ -838,7 +843,11 @@ defineExpose({ open, openAddDomain });
                 @click="onOpenSslDrawer(domain)"
               >
                 <IconifyIcon icon="lucide:shield" class="mr-1 size-4" />
-                {{ $t('admin.tenant.domain.ssl.manage') }}
+                {{
+                  domain.domainType === 'default'
+                    ? $t('shared.domain.managedHttps.details')
+                    : $t('admin.tenant.domain.ssl.manage')
+                }}
               </Button>
 
               <!-- DNS 配置引导 (待验证才显示) -->

@@ -797,7 +797,9 @@ _VALID_CAPABILITIES: frozenset[str] = frozenset(
         "http:outbound",  # Send outbound HTTP requests (with SSRF protection) / 发送外部 HTTP 请求
         "storage:read",  # Read storage files / 读取存储文件
         "storage:write",  # Write storage files / 写入存储文件
+        "storage:credential_use",  # Use storage credentials through host operations
         "ai:call",  # Call AI features (via SystemAgentAssignment) / 调用 AI 功能
+        "config:read",  # Read own plugin config / 读取插件自身配置
         "config:write",  # Modify plugin's own config / 修改插件自身配置
         "notifications:send",  # Send notifications / WebSocket push / 发送通知
     }

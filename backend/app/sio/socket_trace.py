@@ -7,6 +7,8 @@ This mixin keeps ordinary realtime namespaces able to propagate trace ids.
 from __future__ import annotations
 
 import contextlib
+import json
+import time
 from typing import Any
 
 import socketio
@@ -24,6 +26,125 @@ def _extract_trace_id(payload: dict[str, Any] | None = None) -> str | None:
     return extract_optional_trace_id(payload.get("trace_id"))
 
 
+def _tenant_socket_sessions_key(tenant_id: int) -> str:
+    return f"socketio:tenant-sessions:{tenant_id}"
+
+
+def _socket_entry(namespace: str, sid: str, epoch: int) -> str:
+    return json.dumps([namespace, sid, epoch], separators=(",", ":"))
+
+
+async def register_tenant_socket_session(
+    tenant_id: int, namespace: str, sid: str, epoch: int
+) -> None:
+    from app.core.redis import get_redis_client
+
+    await get_redis_client().sadd(
+        _tenant_socket_sessions_key(tenant_id), _socket_entry(namespace, sid, epoch)
+    )
+
+
+async def unregister_tenant_socket_session(
+    tenant_id: int, namespace: str, sid: str, epoch: int
+) -> None:
+    from app.core.redis import get_redis_client
+
+    await get_redis_client().srem(
+        _tenant_socket_sessions_key(tenant_id), _socket_entry(namespace, sid, epoch)
+    )
+
+
+async def disconnect_tenant_socket_sessions(tenant_id: int, current_epoch: int) -> bool:
+    from app.core.redis import get_redis_client
+    from app.core.socketio_server import get_sio
+
+    redis = get_redis_client()
+    key = _tenant_socket_sessions_key(tenant_id)
+    complete = True
+    async for entry in redis.sscan_iter(key):
+        try:
+            namespace, sid, epoch = json.loads(entry)
+            if (
+                not isinstance(namespace, str)
+                or not namespace.startswith("/")
+                or not isinstance(sid, str)
+                or not sid
+                or type(epoch) is not int
+            ):
+                raise ValueError("Invalid tenant socket entry")
+        except (TypeError, ValueError):
+            await redis.srem(key, entry)
+            continue
+        if epoch >= current_epoch:
+            continue
+        try:
+            await get_sio().disconnect(sid, namespace=namespace)
+        except Exception:
+            complete = False
+            continue
+        await redis.srem(key, entry)
+    return complete
+
+
+async def tenant_socket_session_is_current(session: dict[str, Any] | None) -> bool:
+    """复核当前租户会话 / Check the tenant session for the next inbound or outbound event."""
+    from sqlalchemy import select
+
+    from app.core.database import async_session_factory
+    from app.core.security import (
+        TENANT_SESSION_EPOCH_CLAIM,
+        TOKEN_SCOPE_TENANT_ADMIN,
+        TOKEN_SCOPE_TENANT_USER,
+        is_token_revoked,
+        normalize_positive_subject_id,
+        tenant_session_epoch_matches,
+    )
+    from app.models import Tenant, TenantAdmin, TenantUser
+
+    if not isinstance(session, dict):
+        return False
+    user_type = session.get("user_type")
+    identity = {
+        TOKEN_SCOPE_TENANT_ADMIN: TenantAdmin,
+        TOKEN_SCOPE_TENANT_USER: TenantUser,
+    }.get(user_type)
+    user_id = normalize_positive_subject_id(session.get("user_id"))
+    tenant_id = normalize_positive_subject_id(session.get("tenant_id"))
+    jti, expires = session.get("token_jti"), session.get("token_exp")
+    if (
+        identity is None
+        or user_id is None
+        or tenant_id is None
+        or not isinstance(jti, str)
+        or not jti
+        or type(expires) is not int
+        or expires <= time.time()
+    ):
+        return False
+    try:
+        if await is_token_revoked(jti):
+            return False
+        async with async_session_factory() as db:
+            epoch = await db.scalar(
+                select(Tenant.session_revocation_epoch)
+                .join(identity, Tenant.id == identity.tenant_id)
+                .where(
+                    identity.id == user_id,
+                    identity.tenant_id == tenant_id,
+                    identity.is_active.is_(True),
+                    identity.is_deleted.is_(False),
+                    Tenant.is_active.is_(True),
+                    Tenant.is_deleted.is_(False),
+                )
+            )
+            return tenant_session_epoch_matches(
+                {TENANT_SESSION_EPOCH_CLAIM: session.get(TENANT_SESSION_EPOCH_CLAIM)},
+                epoch,
+            )
+    except Exception:
+        return False
+
+
 class SocketTraceMixin:
     """Bind trace context for generic Socket.IO namespace events."""
 
@@ -39,7 +160,12 @@ class SocketTraceMixin:
         payload = args[1] if len(args) > 1 and isinstance(args[1], dict) else None
         try:
             if sid:
-                await self.bind_socket_trace(sid, payload)
+                session = await self.bind_socket_trace(sid, payload)
+                if self.namespace in {"/tenant", "/user"} and not (
+                    await tenant_socket_session_is_current(session)
+                ):
+                    await self.disconnect(sid)
+                    return None
             return await super().trigger_event(event, *args)
         finally:
             trace_id_var.set("")

@@ -140,7 +140,7 @@ defineExpose({
         'cursor-wait': loading,
       }"
       :loading="loading"
-      aria-label="login"
+      :aria-label="submitButtonText || $t('common.login')"
       class="w-full"
       @click="handleSubmit"
     >

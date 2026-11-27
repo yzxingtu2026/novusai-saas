@@ -11,9 +11,12 @@ from sqlalchemy import func, select
 
 from app.core.base_repository import TenantRepository
 from app.models.auth.tenant_user_role import TenantUserRole
+from app.repositories.tenant.role_unique_write_mixin import TenantRoleUniqueWriteMixin
 
 
-class TenantUserRoleRepository(TenantRepository[TenantUserRole]):
+class TenantUserRoleRepository(
+    TenantRoleUniqueWriteMixin, TenantRepository[TenantUserRole]
+):
     """
     企业用户权限角色仓储 / Tenant user permission role repository.
 
@@ -21,6 +24,10 @@ class TenantUserRoleRepository(TenantRepository[TenantUserRole]):
     """
 
     model = TenantUserRole
+    _role_unique_constraints = {
+        "uq_tenant_user_roles_live_name": "tenant_user_role.name_exists",
+        "uq_tenant_user_roles_live_code": "tenant_user_role.code_exists",
+    }
 
     async def get_by_code(self, code: str) -> TenantUserRole | None:
         """
@@ -57,8 +64,7 @@ class TenantUserRoleRepository(TenantRepository[TenantUserRole]):
         if exclude_id:
             query = query.where(self.model.id != exclude_id)
 
-        result = await self.db.execute(query)
-        return result.scalar_one_or_none() is not None
+        return bool(await self.db.scalar(select(query.exists())))
 
     async def name_exists(
         self,
@@ -83,8 +89,7 @@ class TenantUserRoleRepository(TenantRepository[TenantUserRole]):
         if exclude_id:
             query = query.where(self.model.id != exclude_id)
 
-        result = await self.db.execute(query)
-        return result.scalar_one_or_none() is not None
+        return bool(await self.db.scalar(select(query.exists())))
 
     async def count_users(self, role_id: int) -> int:
         """

@@ -164,6 +164,5 @@ async def cancel_batch(
 
     batch_svc = BatchRunService(db, tenant_admin.tenant_id)
     await batch_svc.cancel_batch_run(agent_id, run_id)
-    await db.commit()
 
     return success(message=_("agent.batch.cancelled"))

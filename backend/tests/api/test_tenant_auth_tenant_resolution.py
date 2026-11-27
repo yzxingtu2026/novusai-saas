@@ -13,6 +13,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import pytest
+from starlette.datastructures import Headers
 
 
 def _load_tenant_auth_module():
@@ -50,6 +51,8 @@ def _auth_service_factory(calls: list[dict]):
 
 
 class _Request:
+    headers = Headers()
+
     def __init__(
         self,
         tenant_code: str | None = None,
@@ -90,7 +93,9 @@ async def test_tenant_auth_route_uses_domain_tenant_code(monkeypatch):
     tenant_auth = _load_tenant_auth_module()
     calls: list[dict] = []
     monkeypatch.setattr(tenant_auth, "AuthService", _auth_service_factory(calls))
-    monkeypatch.setattr(tenant_auth, "check_login_rate_limit", lambda _request: None)
+    monkeypatch.setattr(
+        tenant_auth, "check_login_rate_limit", AsyncMock(return_value=None)
+    )
 
     db = SimpleNamespace(commit=AsyncMock())
 
@@ -122,7 +127,9 @@ async def test_tenant_auth_route_ignores_body_tenant_code(monkeypatch):
     tenant_auth = _load_tenant_auth_module()
     calls: list[dict] = []
     monkeypatch.setattr(tenant_auth, "AuthService", _auth_service_factory(calls))
-    monkeypatch.setattr(tenant_auth, "check_login_rate_limit", lambda _request: None)
+    monkeypatch.setattr(
+        tenant_auth, "check_login_rate_limit", AsyncMock(return_value=None)
+    )
 
     db = SimpleNamespace(commit=AsyncMock())
 

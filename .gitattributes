@@ -5,3 +5,5 @@ backend/**/*.pyi text eol=lf
 backend/**/*.toml text eol=lf
 backend/**/*.yml text eol=lf
 backend/**/*.yaml text eol=lf
+# Server-sent events terminate with a blank line. Keep the fixture's wire bytes.
+backend/tests/regressions/fixtures/bug_2026_11_24_stream_whitespace_order.sse -text whitespace=-blank-at-eof

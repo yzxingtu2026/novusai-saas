@@ -5,10 +5,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import pytest
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from fastapi.testclient import TestClient
 
 from app.core.deps import get_current_active_admin, get_db
+from app.exceptions import AppException
+from app.middleware.i18n import I18nMiddleware
 from app.schemas.common.query import FilterOp
 
 
@@ -35,6 +39,12 @@ def _build_test_app(mock_db, module) -> FastAPI:
     controller = module.AdminNotificationTemplateController
     app = FastAPI()
 
+    app.add_middleware(I18nMiddleware)
+
+    @app.exception_handler(AppException)
+    async def app_exception_handler(_request, exc: AppException):
+        return JSONResponse(status_code=exc.status_code, content=exc.to_dict())
+
     @app.middleware("http")
     async def inject_permissions(request, call_next):
         request.state.user_permissions = {
@@ -50,7 +60,9 @@ def _build_test_app(mock_db, module) -> FastAPI:
         yield mock_db
 
     async def override_admin():
-        return SimpleNamespace(id=1, is_active=True, is_super=True)
+        return SimpleNamespace(
+            id=1, is_active=True, is_super=True, nickname=None, username="fixture-admin"
+        )
 
     app.dependency_overrides[get_db] = override_db
     app.dependency_overrides[get_current_active_admin] = override_admin
@@ -237,3 +249,70 @@ def test_update_notification_template_rejects_enabled_alias(monkeypatch) -> None
     assert "enabled" in response.text
     repo.get_by_id.assert_not_awaited()
     mock_db.commit.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    ("method", "action"),
+    [("GET", "effective-preview"), ("POST", "restore-default")],
+)
+@pytest.mark.parametrize(
+    ("locale", "message"),
+    [("en", "Resource not found"), ("zh_CN", "资源不存在")],
+)
+def test_template_actions_return_localized_not_found(
+    monkeypatch, method, action, locale, message
+) -> None:
+    module = _load_notification_templates_module()
+    monkeypatch.setattr(module.AdminNotificationTemplateController, "_instance", None)
+    monkeypatch.setattr(module.AdminNotificationTemplateController, "_router", None)
+
+    repo = SimpleNamespace(get_by_id=AsyncMock(return_value=None))
+    monkeypatch.setattr(module, "NotificationTemplateRepository", _return(repo))
+    mock_db = SimpleNamespace(commit=AsyncMock())
+    app = _build_test_app(mock_db, module)
+
+    with TestClient(app, raise_server_exceptions=False) as client:
+        response = client.request(
+            method,
+            f"/notification-templates/9/{action}",
+            headers={"X-Language": locale},
+        )
+
+    assert response.status_code == 404, response.text
+    assert response.json()["code"] == 4040
+    assert response.json()["message"] == message
+    repo.get_by_id.assert_awaited_once_with(9)
+    mock_db.commit.assert_not_awaited()
+
+
+def test_test_route_reports_committed_delivery_acceptance(monkeypatch) -> None:
+    from app.services.common.notification_service import NotificationService
+
+    module = _load_notification_templates_module()
+    monkeypatch.setattr(module.AdminNotificationTemplateController, "_instance", None)
+    monkeypatch.setattr(module.AdminNotificationTemplateController, "_router", None)
+    repo = SimpleNamespace(get_by_id=AsyncMock(return_value=_make_template()))
+    monkeypatch.setattr(module, "NotificationTemplateRepository", _return(repo))
+    calls = []
+
+    async def plan(_service, *, template_code, admin_id, data):
+        calls.append(("plan", template_code, admin_id))
+        assert data["task_id"] == "test-001"
+        return 1
+
+    async def commit():
+        calls.append(("commit",))
+
+    monkeypatch.setattr(NotificationService, "send_test", plan)
+    app = _build_test_app(SimpleNamespace(commit=commit), module)
+
+    with TestClient(app) as client:
+        response = client.post("/notification-templates/9/test")
+
+    assert response.status_code == 200
+    assert response.json()["data"] == {
+        "accepted_count": 1,
+        "template_code": "task.failed",
+    }
+    assert calls == [("plan", "task.failed", 1), ("commit",)]
+    repo.get_by_id.assert_awaited_once_with(9)

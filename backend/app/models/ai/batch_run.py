@@ -8,7 +8,7 @@ Tracks agent batch execution task progress and results.
 from datetime import datetime
 from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String
+from sqlalchemy import JSON, DateTime, ForeignKey, Index, Integer, String, text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.base_model import TenantModel
@@ -123,6 +123,19 @@ class BatchRun(TenantModel):
         comment=_("enum.batch_run.celery_task_id"),
     )
 
+    # Internal dispatch recovery metadata. A null due time does not opt in.
+    dispatch_recovery_due_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+    dispatch_recovery_attempts: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
+    # 中文: 未设置租约的历史任务不参加运行中失联判定。
+    # EN: Runs without an execution lease are outside the expiration scan.
+    execution_lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime, nullable=True
+    )
+
     # ==================== 时间 ==================== / Timestamps
 
     started_at: Mapped[datetime | None] = mapped_column(
@@ -141,6 +154,24 @@ class BatchRun(TenantModel):
     __table_args__ = (
         Index("ix_batch_runs_tenant_agent", "tenant_id", "agent_id"),
         Index("ix_batch_runs_tenant_status", "tenant_id", "status"),
+        Index(
+            "ix_batch_runs_dispatch_recovery_due",
+            "status",
+            "dispatch_recovery_due_at",
+            "id",
+            postgresql_where=text(
+                "is_deleted IS FALSE AND dispatch_recovery_due_at IS NOT NULL"
+            ),
+        ),
+        Index(
+            "ix_batch_runs_execution_lease_due",
+            "execution_lease_expires_at",
+            "id",
+            postgresql_where=text(
+                "is_deleted IS FALSE AND status = 'running' "
+                "AND execution_lease_expires_at IS NOT NULL"
+            ),
+        ),
     )
 
     # ==================== 关系 ==================== / Relationships

@@ -172,4 +172,6 @@ async def build_attachment_delivery_response(
         expires=expires,
         preview=preview,
     )
-    return RedirectResponse(url=url)
+    return AttachmentDownloadService.apply_business_cache_policy(
+        attachment, RedirectResponse(url=url)
+    )

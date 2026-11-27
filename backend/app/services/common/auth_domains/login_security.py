@@ -2,14 +2,37 @@
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, TypeVar
 
-from sqlalchemy import or_, select
+from sqlalchemy import Select, and_, func, literal_column, or_, select
+from sqlalchemy.exc import MultipleResultsFound
 
 from app.models import Admin, TenantAdmin, TenantUser
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
+
+
+LoginAccount = TypeVar("LoginAccount", Admin, TenantAdmin, TenantUser)
+
+
+def password_login_query(
+    query: Select[tuple[LoginAccount]], model: type[LoginAccount], identifier: str
+) -> Select[tuple[LoginAccount]]:
+    """精确匹配优先，邮箱按大小写折叠回退 / Prefer exact matches before folded email."""
+    exact_matches = [model.username == identifier, model.email == identifier]
+    if model is TenantUser:
+        exact_matches.append(TenantUser.phone == identifier)
+    exact = or_(*exact_matches)
+    # 内外查询使用同一租户范围 / The subquery reuses the outer query's tenant scope.
+    exact_exists = (
+        query.with_only_columns(literal_column("1"), maintain_column_froms=True)
+        .where(exact)
+        .exists()
+        .correlate(None)
+    )
+    folded_email = func.lower(model.email) == identifier.strip().lower()
+    return query.where(or_(exact, and_(folded_email, ~exact_exists))).limit(2)
 
 
 class AuthLoginSecurityDomain:
@@ -28,7 +51,11 @@ class AuthLoginSecurityDomain:
         _ = client_ip
         from datetime import timedelta
 
-        if tenant_id and user_type in ("tenant_admin", "tenant_user"):
+        tenant_account = user_type in ("tenant_admin", "tenant_user")
+        if tenant_account and tenant_id is None:
+            return
+
+        if tenant_account:
             max_attempts = await self._service._config_service.get_tenant_config(
                 tenant_id, "tenant_login_max_attempts", default=5
             )
@@ -45,34 +72,42 @@ class AuthLoginSecurityDomain:
 
         now = self._service._utc_now_aware()
 
+        query: (
+            Select[tuple[Admin]]
+            | Select[tuple[TenantAdmin]]
+            | Select[tuple[TenantUser]]
+        )
         if user_type == "admin":
-            result = await self._service.db.execute(
-                select(Admin).where(
-                    or_(Admin.username == username, Admin.email == username),
-                    Admin.is_deleted.is_(False),
-                )
+            query = password_login_query(
+                select(Admin).where(Admin.is_deleted.is_(False)),
+                Admin,
+                username,
             )
-            user = result.scalar_one_or_none()
         elif user_type == "tenant_admin":
-            result = await self._service.db.execute(
+            query = password_login_query(
                 select(TenantAdmin).where(
-                    or_(
-                        TenantAdmin.username == username,
-                        TenantAdmin.email == username,
-                    ),
+                    TenantAdmin.tenant_id == tenant_id,
                     TenantAdmin.is_deleted.is_(False),
-                )
+                ),
+                TenantAdmin,
+                username,
             )
-            user = result.scalar_one_or_none()
         elif user_type == "tenant_user":
-            result = await self._service.db.execute(
+            query = password_login_query(
                 select(TenantUser).where(
-                    or_(TenantUser.username == username, TenantUser.email == username),
+                    TenantUser.tenant_id == tenant_id,
                     TenantUser.is_deleted.is_(False),
-                )
+                ),
+                TenantUser,
+                username,
             )
-            user = result.scalar_one_or_none()
         else:
+            return
+
+        result = await self._service.db.execute(query)
+        try:
+            user = result.scalar_one_or_none()
+        except MultipleResultsFound:
             return
 
         if user:

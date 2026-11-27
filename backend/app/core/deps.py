@@ -13,7 +13,7 @@ Provides FastAPI dependency injection functions.
 from collections.abc import AsyncGenerator
 from typing import Annotated
 
-from fastapi import Depends, HTTPException, status
+from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import OAuth2PasswordBearer
 from redis.asyncio import Redis as AioRedis
 from sqlalchemy import select
@@ -30,9 +30,13 @@ from app.core.security import (
     TOKEN_SCOPE_TENANT_USER,
     TOKEN_TYPE_ACCESS,
     TokenExpiredError,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
+    tenant_session_epoch_matches,
     verify_token_with_scope,
 )
 from app.exceptions.base import TokenExpiredException
+from app.middleware.tenant import request_matches_authenticated_tenant
 from app.models import Admin, Tenant, TenantAdmin, TenantUser
 
 # ========================================
@@ -151,6 +155,7 @@ async def get_current_super_admin(
 
 
 async def get_current_tenant_admin(
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     token: Annotated[str | None, Depends(oauth2_tenant_admin_scheme)],
 ) -> TenantAdmin:
@@ -167,27 +172,32 @@ async def get_current_tenant_admin(
         raise credentials_exception
 
     try:
-        user_id, scope = await verify_token_with_scope(
+        payload = await get_token_payload_with_scope(
             token, TOKEN_SCOPE_TENANT_ADMIN, TOKEN_TYPE_ACCESS, raise_on_expired=True
         )
     except TokenExpiredError as exc:
         raise TokenExpiredException() from exc
 
+    user_id = normalize_positive_subject_id((payload or {}).get("sub"))
     if user_id is None:
         raise credentials_exception
 
     result = await db.execute(
-        select(TenantAdmin).where(
-            TenantAdmin.id == int(user_id),
+        select(TenantAdmin, Tenant.session_revocation_epoch)
+        .join(Tenant, Tenant.id == TenantAdmin.tenant_id)
+        .where(
+            TenantAdmin.id == user_id,
             TenantAdmin.is_deleted.is_(False),
+            Tenant.is_deleted.is_(False),
         )
     )
-    tenant_admin = result.scalar_one_or_none()
-
-    if tenant_admin is None:
+    identity = result.one_or_none()
+    if identity is None or not tenant_session_epoch_matches(payload, identity[1]):
+        raise credentials_exception
+    if not request_matches_authenticated_tenant(request, identity[0].tenant_id):
         raise credentials_exception
 
-    return tenant_admin
+    return identity[0]
 
 
 async def get_current_active_tenant_admin(
@@ -239,6 +249,7 @@ async def get_current_tenant_owner(
 
 
 async def get_current_tenant_user(
+    request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
     token: Annotated[str | None, Depends(oauth2_tenant_user_scheme)],
 ) -> TenantUser:
@@ -255,27 +266,32 @@ async def get_current_tenant_user(
         raise credentials_exception
 
     try:
-        user_id, scope = await verify_token_with_scope(
+        payload = await get_token_payload_with_scope(
             token, TOKEN_SCOPE_TENANT_USER, TOKEN_TYPE_ACCESS, raise_on_expired=True
         )
     except TokenExpiredError as exc:
         raise TokenExpiredException() from exc
 
+    user_id = normalize_positive_subject_id((payload or {}).get("sub"))
     if user_id is None:
         raise credentials_exception
 
     result = await db.execute(
-        select(TenantUser).where(
-            TenantUser.id == int(user_id),
+        select(TenantUser, Tenant.session_revocation_epoch)
+        .join(Tenant, Tenant.id == TenantUser.tenant_id)
+        .where(
+            TenantUser.id == user_id,
             TenantUser.is_deleted.is_(False),
+            Tenant.is_deleted.is_(False),
         )
     )
-    user = result.scalar_one_or_none()
-
-    if user is None:
+    identity = result.one_or_none()
+    if identity is None or not tenant_session_epoch_matches(payload, identity[1]):
+        raise credentials_exception
+    if not request_matches_authenticated_tenant(request, identity[0].tenant_id):
         raise credentials_exception
 
-    return user
+    return identity[0]
 
 
 async def get_current_active_tenant_user(

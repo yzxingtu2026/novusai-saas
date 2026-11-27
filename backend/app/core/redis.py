@@ -89,6 +89,10 @@ def get_redis_client() -> Redis:
 async def cache_get(key: str) -> Any | None:
     client = get_redis_client()
     value = await client.get(key)
+    return _deserialize_cache_value(value)
+
+
+def _deserialize_cache_value(value: Any | None) -> Any | None:
     if value is None:
         return None
     try:
@@ -105,9 +109,54 @@ async def cache_set(key: str, value: Any, ttl: int | None = None) -> bool:
     return await client.set(key, serialized)
 
 
+async def cache_set_if_absent(key: str, value: Any, ttl: int | None = None) -> bool:
+    """仅在缓存键不存在时写入 / Set a cache value only when its key is absent."""
+    client = get_redis_client()
+    serialized = json.dumps(value, ensure_ascii=False, default=str)
+    return bool(await client.set(key, serialized, ex=ttl, nx=True))
+
+
+async def cache_getdel_if_matches(key: str, *, code: str, user_id: int) -> Any | None:
+    """原子消费匹配验证码与身份的记录 / Atomically consume a matching code record."""
+    client = get_redis_client()
+    script = """
+    local value = redis.call('GET', KEYS[1])
+    if not value then
+        return nil
+    end
+    local ok, decoded = pcall(cjson.decode, value)
+    if not ok or type(decoded) ~= 'table' then
+        return nil
+    end
+    if decoded['code'] ~= ARGV[1] or tostring(decoded['user_id']) ~= ARGV[2] then
+        return nil
+    end
+    redis.call('DEL', KEYS[1])
+    return value
+    """
+    value = await client.eval(script, 1, key, code, str(user_id))
+    return _deserialize_cache_value(value)
+
+
 async def cache_delete(key: str) -> int:
     client = get_redis_client()
     return await client.delete(key)
+
+
+async def cache_increment(key: str, ttl: int | None = None) -> int:
+    """原子递增并可在首次写入时设置 TTL / Increment and optionally set initial TTL."""
+    client = get_redis_client()
+    if ttl is None:
+        return int(await client.incr(key))
+
+    script = """
+    local count = redis.call('INCR', KEYS[1])
+    if count == 1 then
+        redis.call('EXPIRE', KEYS[1], ARGV[1])
+    end
+    return count
+    """
+    return int(await client.eval(script, 1, key, ttl))
 
 
 async def cache_exists(key: str) -> bool:

@@ -11,8 +11,12 @@ import time
 from typing import Any
 
 from starlette.datastructures import Headers
+from starlette.requests import Request
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+from app.core.logging import get_logger
+from app.core.rate_limit import resolve_client_ip
 from app.core.security import (
     TOKEN_SCOPE_ADMIN,
     TOKEN_SCOPE_TENANT_ADMIN,
@@ -41,18 +45,69 @@ EXCLUDED_PATTERNS = [
 
 # Sensitive fields (need masking) / 敏感字段（需要脱敏）
 SENSITIVE_FIELDS = {
+    "authorization",
+    "aes_key",
+    "app_key",
+    "captcha",
+    "challenge_material",
+    "challenge_response",
+    "challenge_submission",
+    "cookie",
+    "cookies",
+    "credential",
+    "credentials",
+    "mfa",
+    "one_time_code",
+    "otp",
     "password",
     "password_hash",
     "old_password",
     "new_password",
     "confirm_password",
+    "session",
+    "sms_code",
+    "storage_state",
     "token",
     "access_token",
     "refresh_token",
+    "sign",
+    "signature",
+    "exp",
+    "jwt",
+    "preview_jwt",
+    "preview_token",
+    "short_token",
     "secret",
+    "secret_ref",
+    "secrets",
+    "secret_refs",
+    "secret_refs_json",
     "api_key",
     "secret_key",
+    "private_key",
+    "signing_key",
+    "verification_code",
+    "progress_token",
+    "verification_url",
+    "webhook_url",
+    "passwd",
+    "dsn",
+    "apikey",
+    "proxy_authorization",
+    "set_cookie",
+    "otp_code",
+    "one_time_password",
+    "secret_updates",
 }
+
+SENSITIVE_FIELD_SUFFIXES = (
+    "_key",
+    "_token",
+    "_jwt",
+    "_secret",
+    "_signature",
+    "_webhook_url",
+)
 
 # HTTP method to action type mapping (fallback only) / HTTP 方法到操作类型的映射
 METHOD_ACTION_MAP = {
@@ -110,19 +165,63 @@ def sanitize_body(body: dict | list | Any) -> dict | list | Any:
     Returns:
         Sanitized request body / 脱敏后的请求体
     """
-    if isinstance(body, dict):
+    return sanitize_mapping(body)
+
+
+def normalize_audit_field_name(key: object) -> str:
+    """中文: 统一审计字段名归一化。
+
+    EN: Normalize field names so audit redaction matches API naming styles.
+    """
+    value = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1_\2", str(key).strip())
+    value = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", value)
+    return value.lower().replace("-", "_")
+
+
+def is_sensitive_field(key: str) -> bool:
+    """中文: 统一判断写入审计日志前必须脱敏的字段。
+
+    EN: Centralize field checks that must be redacted before audit writes.
+    """
+    normalized = normalize_audit_field_name(key)
+    if normalized in SENSITIVE_FIELDS:
+        return True
+    return any(normalized.endswith(suffix) for suffix in SENSITIVE_FIELD_SUFFIXES)
+
+
+def sanitize_mapping(
+    data: dict | list | Any, *, _headers: bool = False
+) -> dict | list | Any:
+    """中文: 对结构化审计载荷递归脱敏。
+
+    EN: Recursively redact sensitive fields in structured audit payloads.
+    """
+    if isinstance(data, dict):
         result = {}
-        for key, value in body.items():
-            if key.lower() in SENSITIVE_FIELDS:
+        for key, value in data.items():
+            if is_sensitive_field(str(key)):
                 result[key] = "***"
             elif isinstance(value, (dict, list)):
-                result[key] = sanitize_body(value)
+                result[key] = sanitize_mapping(
+                    value,
+                    _headers=normalize_audit_field_name(key)
+                    in {"headers", "request_headers", "response_headers"},
+                )
             else:
                 result[key] = value
         return result
-    elif isinstance(body, list):
-        return [sanitize_body(item) for item in body]
-    return body
+    if isinstance(data, list):
+        return [
+            [item[0], "***"]
+            if _headers
+            and isinstance(item, list)
+            and len(item) == 2
+            and isinstance(item[0], str)
+            and is_sensitive_field(item[0])
+            else sanitize_mapping(item)
+            for item in data
+        ]
+    return data
 
 
 def extract_permission_from_route(
@@ -190,30 +289,43 @@ def get_special_action(path: str) -> str | None:
 
 
 def get_client_ip(scope: Scope) -> str | None:
-    """
-    Get client real IP / 获取客户端真实 IP
-
-    Supports proxy X-Forwarded-For header / 支持代理服务器的 X-Forwarded-For 头
-    """
-    headers = Headers(scope=scope)
-
-    # Prefer X-Forwarded-For / 优先从 X-Forwarded-For 获取
-    x_forwarded_for = headers.get("x-forwarded-for")
-    if x_forwarded_for:
-        # First IP is client real IP / 取第一个 IP（客户端真实 IP）
-        return x_forwarded_for.split(",")[0].strip()
-
-    # From X-Real-IP / 从 X-Real-IP 获取
-    x_real_ip = headers.get("x-real-ip")
-    if x_real_ip:
-        return x_real_ip
-
-    # From ASGI scope / 从 ASGI scope 获取
     client = scope.get("client")
-    if client:
-        return client[0]
+    if not client:
+        return None
+    headers = Headers(scope=scope)
+    return resolve_client_ip(
+        client[0],
+        headers.get("x-forwarded-for"),
+        headers.get("x-real-ip"),
+    )
 
-    return None
+
+_DEFERRED_SERVER_ERROR_AUDIT = "novusai.audit.server_error"
+
+
+def _capture_response_envelope(body: bytes, response_info: dict[str, Any]) -> None:
+    try:
+        envelope = json.loads(body)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return
+    if isinstance(envelope, dict):
+        response_info["response_code"] = envelope.get("code")
+        response_info["response_message"] = envelope.get("message")
+
+
+async def complete_server_error_audit(
+    scope: Scope, response: JSONResponse | None
+) -> None:
+    """中文: 用外层错误响应完成一条审计记录。
+
+    EN: Complete one audit from the outer server-error response.
+    """
+    complete = scope.pop(_DEFERRED_SERVER_ERROR_AUDIT, None)
+    if complete is not None:
+        try:
+            await complete(response)
+        except Exception:
+            get_logger(__name__).warning("Could not complete operation audit")
 
 
 class AuditLogMiddleware:
@@ -229,19 +341,16 @@ class AuditLogMiddleware:
     5. 异步写入数据库（不阻塞请求） / Async write to DB (non-blocking)
     """
 
-    def __init__(self, app: ASGIApp) -> None:
+    def __init__(self, app: ASGIApp, *, defer_server_errors: bool = False) -> None:
         self.app = app
+        self.defer_server_errors = defer_server_errors
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] != "http":
             await self.app(scope, receive, send)
             return
 
-        # Ensure scope has state (for subsequent middleware) / 确保 scope 中有 state
-        if "state" not in scope:
-            from starlette.datastructures import State
-
-            scope["state"] = State()
+        scope.setdefault("state", {})
 
         # Get request info / 获取请求信息
         path = scope.get("path", "")
@@ -324,28 +433,35 @@ class AuditLogMiddleware:
                 if body:
                     response_body_parts.append(body)
                 if not message.get("more_body", False) and response_body_parts:
-                    try:
-                        response_data = json.loads(b"".join(response_body_parts))
-                        response_info["response_code"] = response_data.get("code")
-                        response_info["response_message"] = response_data.get("message")
-                    except (json.JSONDecodeError, UnicodeDecodeError):
-                        pass
+                    _capture_response_envelope(
+                        b"".join(response_body_parts), response_info
+                    )
             await send(message)
 
-        # Execute request / 执行请求
-        try:
-            await self.app(scope, wrapped_receive, wrapped_send)
-        finally:
-            # Calculate duration / 计算耗时
-            duration_ms = int((time.time() - start_time) * 1000)
-
-            # Record log asynchronously / 异步记录日志
+        async def write_log(error_response: JSONResponse | None = None) -> None:
+            if error_response is not None:
+                response_info["status_code"] = error_response.status_code
+                _capture_response_envelope(error_response.body, response_info)
             await self._write_log(
                 scope=scope,
                 request_info=request_info,
                 response_info=response_info,
-                duration_ms=duration_ms,
+                duration_ms=int((time.time() - start_time) * 1000),
             )
+
+        deferred = False
+        try:
+            await self.app(scope, wrapped_receive, wrapped_send)
+        except Exception:
+            # 中文: 响应开始前的 500 由外层 Starlette 异常处理器发送。
+            # EN: The outer Starlette handler sends a 500 before response start.
+            if self.defer_server_errors and response_info["status_code"] is None:
+                scope[_DEFERRED_SERVER_ERROR_AUDIT] = write_log
+                deferred = True
+            raise
+        finally:
+            if not deferred:
+                await write_log()
 
     async def _collect_request_info(
         self, scope: Scope, receive: Receive
@@ -377,7 +493,7 @@ class AuditLogMiddleware:
         if info["query_string"]:
             from urllib.parse import parse_qs
 
-            info["query_params"] = parse_qs(info["query_string"])
+            info["query_params"] = sanitize_mapping(parse_qs(info["query_string"]))
         else:
             info["query_params"] = None
 
@@ -520,14 +636,11 @@ class AuditLogMiddleware:
 
         # Get trace_id from scope state (injected by TraceIdMiddleware)
         # 从 scope state 获取 trace_id（由 TraceIdMiddleware 注入）
-        trace_id = ""
-        if "state" in scope:
-            state = scope["state"]
-            trace_id = getattr(state, "trace_id", "") or ""
+        state = Request(scope).state
+        trace_id = getattr(state, "trace_id", "") or ""
 
         # If user_id exists, prefer from scope state (injected by PermissionMiddleware) / 优先从 scope state 获取
-        if user_info.get("user_id") and "state" in scope:
-            state = scope["state"]
+        if user_info.get("user_id"):
             user = getattr(state, "user", None)
             state_user_id = getattr(user, "id", None) if user else None
             state_tenant_id = getattr(user, "tenant_id", None) if user else None
@@ -595,4 +708,4 @@ class AuditLogMiddleware:
         )
 
 
-__all__ = ["AuditLogMiddleware"]
+__all__ = ["AuditLogMiddleware", "complete_server_error_audit"]

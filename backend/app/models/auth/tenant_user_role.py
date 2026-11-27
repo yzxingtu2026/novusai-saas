@@ -9,7 +9,17 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from sqlalchemy import Boolean, Column, ForeignKey, Integer, String, Table, Text
+from sqlalchemy import (
+    Boolean,
+    Column,
+    ForeignKey,
+    Index,
+    Integer,
+    String,
+    Table,
+    Text,
+    text,
+)
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.base_model import Base, TenantModel
@@ -46,6 +56,23 @@ class TenantUserRole(TenantModel):
     """
 
     __tablename__ = "tenant_user_roles"
+
+    __table_args__ = (
+        Index(
+            "uq_tenant_user_roles_live_name",
+            "tenant_id",
+            "name",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+        Index(
+            "uq_tenant_user_roles_live_code",
+            "tenant_id",
+            "code",
+            unique=True,
+            postgresql_where=text("is_deleted = false"),
+        ),
+    )
 
     __delete_deps__ = [
         DeletionDep(

@@ -125,6 +125,7 @@
     "isSystem": "系统内置",
     "createdAt": "创建时间",
     "noPermissions": "未配置权限",
+    "removeIneligibleGrants": "确认保存时移除 {count} 项已失效的角色授权",
     "assignPermissions": "分配权限",
     "stats": {
       "total": "角色总数",

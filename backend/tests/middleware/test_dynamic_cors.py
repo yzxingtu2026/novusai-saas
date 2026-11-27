@@ -70,8 +70,13 @@ class TestDynamicCORSMiddleware:
         assert resp.status_code == 200
         assert resp.headers["Access-Control-Allow-Origin"] == origin
 
-    def test_allows_tenant_subdomain_origin(self):
+    def test_allows_active_tenant_subdomain_origin(self, monkeypatch):
         origin = f"https://demo{settings.TENANT_DOMAIN_SUFFIX}"
+        database = AsyncMock()
+        database.execute.return_value = make_scalar_result(11)
+        monkeypatch.setattr(
+            cors_module, "async_session_factory", lambda: _SessionManager(database)
+        )
 
         with TestClient(_build_app()) as client:
             resp = client.get("/ok", headers={"Origin": origin})
@@ -89,8 +94,15 @@ class TestDynamicCORSMiddleware:
         assert "Access-Control-Allow-Origin" not in resp.headers
 
     @pytest.mark.asyncio
-    async def test_error_header_helper_allows_tenant_subdomain_origin(self):
+    async def test_error_header_helper_allows_active_tenant_subdomain_origin(
+        self, monkeypatch
+    ):
         origin = f"https://demo{settings.TENANT_DOMAIN_SUFFIX}"
+        database = AsyncMock()
+        database.execute.return_value = make_scalar_result(11)
+        monkeypatch.setattr(
+            cors_module, "async_session_factory", lambda: _SessionManager(database)
+        )
         headers = await get_cors_headers_for_origin(origin)
         assert headers["Access-Control-Allow-Origin"] == origin
 

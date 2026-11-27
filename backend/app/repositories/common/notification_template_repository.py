@@ -78,6 +78,8 @@ class NotificationTemplateRepository(BaseRepository[NotificationTemplate]):
         self,
         code: str,
         tenant_id: int | None = None,
+        *,
+        fallback_code: str | None = None,
     ) -> NotificationTemplate | None:
         """中文: 按租户覆盖、插件/source、平台默认顺序解析生效模板。
 
@@ -105,6 +107,8 @@ class NotificationTemplateRepository(BaseRepository[NotificationTemplate]):
         )
         templates = list(result.scalars().all())
         if not templates:
+            if fallback_code and fallback_code != code:
+                return await self.resolve_effective_template(fallback_code, tenant_id)
             return None
         templates.sort(
             key=lambda template: self._template_rank(template, normalized_tenant_id)

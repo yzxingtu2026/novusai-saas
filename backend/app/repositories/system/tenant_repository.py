@@ -20,6 +20,18 @@ class TenantRepository(BaseRepository[Tenant]):
 
     model = Tenant
 
+    async def get_for_lifecycle_update(
+        self, tenant_id: int, *, include_deleted: bool = False
+    ) -> Tenant | None:
+        """锁定并刷新租户 / Lock and refresh a tenant before lifecycle changes."""
+        query = select(Tenant).where(Tenant.id == tenant_id)
+        if not include_deleted:
+            query = query.where(Tenant.is_deleted.is_(False))
+        result = await self.db.execute(
+            query.with_for_update().execution_options(populate_existing=True)
+        )
+        return result.scalar_one_or_none()
+
     # 不同 scope 下允许筛选的字段
     _scope_fields: dict[str, set[str]] = {
         "admin": {

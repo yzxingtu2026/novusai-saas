@@ -208,6 +208,11 @@ asyncio_mode = "auto"
 testpaths = ["tests"]
 python_files = ["test_*.py", "*_test.py"]
 python_functions = ["test_*"]
+markers = [
+    "structural: import, registration, serialization, and contract checks",
+    "behavioral: observable application behavior through real decision paths",
+    "smoke: end-to-end application acceptance with real or approved replay inputs",
+]
 addopts = [
     "-v",
     "--strict-markers",

@@ -11,6 +11,13 @@ interface HttpResponse<T = unknown> {
   message: string;
 }
 
+class PublicConfigApiError extends Error {
+  constructor(message: string, public readonly code: number) {
+    super(message);
+    this.name = 'PublicConfigApiError';
+  }
+}
+
 /**
  * Extract business data from baseRequestClient response / 从 baseRequestClient 响应中提取业务数据
  * baseRequestClient TS type returns T, but runtime returns AxiosResponse with .data as HttpResponse
@@ -532,7 +539,10 @@ export async function getTenantPublicConfigApi(): Promise<TenantPublicConfig> {
   const responseData = extractResponseData<TenantPublicConfigRaw>(response);
 
   if (responseData.code !== 0) {
-    throw new Error(responseData.message || 'Failed to get tenant config');
+    throw new PublicConfigApiError(
+      responseData.message || 'Failed to get tenant config',
+      responseData.code,
+    );
   }
 
   return transformTenantConfig(responseData.data);

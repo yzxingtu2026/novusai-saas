@@ -1,5 +1,8 @@
 """
 批量运行 Service / Batch Run Service
+
+管理企业端批量 AI 运行的生命周期：查询、取消和状态跟踪。
+Manages tenant batch AI run lifecycle: query, cancellation, and status tracking.
 """
 
 from app.core.base_service import TenantService
@@ -55,7 +58,7 @@ class BatchRunService(TenantService[BatchRun, BatchRunRepository]):
         from app.enums.agent import BatchRunStatusEnum
         from app.exceptions import BusinessException, NotFoundException
 
-        batch_run = await self.get_agent_batch_run(agent_id, run_id)
+        batch_run = await self.repo.lock_for_cancellation(agent_id, run_id)
         if not batch_run:
             raise NotFoundException(
                 message=_("agent.error.batch_run_not_found"),
@@ -70,25 +73,28 @@ class BatchRunService(TenantService[BatchRun, BatchRunRepository]):
             )
 
         batch_run.status = BatchRunStatusEnum.CANCELLED.value
+        task_id = batch_run.celery_task_id
+        await self.db.commit()
 
-        # 尝试撤销 Celery 任务
-        if batch_run.celery_task_id:
+        # 中文: 先让取消状态生效并释放数据库锁，再通知 Celery。
+        # EN: Make cancellation durable and release the database lock before notifying Celery.
+        if task_id:
             try:
                 from app.celery_app import celery_app
 
                 celery_app.control.revoke(
-                    batch_run.celery_task_id,
+                    task_id,
                     terminate=False,
                 )
                 logger.info(
                     "Celery task {} revoked for batch_run {}",
-                    batch_run.celery_task_id,
+                    task_id,
                     run_id,
                 )
             except Exception as e:
                 logger.warning(
                     "Failed to revoke celery task {}: {}",
-                    batch_run.celery_task_id,
+                    task_id,
                     str(e),
                 )
 

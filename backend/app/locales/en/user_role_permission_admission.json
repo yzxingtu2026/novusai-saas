@@ -1,0 +1,5 @@
+{
+  "user_role_permission_admission": {
+    "invalid_selection": "Some selected permissions are unavailable or do not belong to the user app. Refresh the permission list and select again."
+  }
+}

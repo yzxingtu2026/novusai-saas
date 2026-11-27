@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
 import pytest
+from starlette.requests import Request
 
 from app.core.security import TokenExpiredError
 from app.exceptions.base import TokenExpiredException
@@ -75,12 +76,16 @@ async def test_get_current_tenant_admin_raises_token_expired(_fake_db):
     from app.core.deps import get_current_tenant_admin
 
     with patch(
-        "app.core.deps.verify_token_with_scope",
+        "app.core.deps.get_token_payload_with_scope",
         new_callable=AsyncMock,
         side_effect=TokenExpiredError(),
     ):
         with pytest.raises(TokenExpiredException) as exc_info:
-            await get_current_tenant_admin(db=_fake_db, token="expired-jwt")
+            await get_current_tenant_admin(
+                Request({"type": "http", "headers": []}),
+                db=_fake_db,
+                token="expired-jwt",
+            )
         assert exc_info.value.code == 4011
 
 
@@ -90,10 +95,14 @@ async def test_get_current_tenant_user_raises_token_expired(_fake_db):
     from app.core.deps import get_current_tenant_user
 
     with patch(
-        "app.core.deps.verify_token_with_scope",
+        "app.core.deps.get_token_payload_with_scope",
         new_callable=AsyncMock,
         side_effect=TokenExpiredError(),
     ):
         with pytest.raises(TokenExpiredException) as exc_info:
-            await get_current_tenant_user(db=_fake_db, token="expired-jwt")
+            await get_current_tenant_user(
+                Request({"type": "http", "headers": []}),
+                db=_fake_db,
+                token="expired-jwt",
+            )
         assert exc_info.value.code == 4011

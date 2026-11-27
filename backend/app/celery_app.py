@@ -93,6 +93,7 @@ celery_app.conf.task_routes = {
 celery_app.conf.include = [
     "app.tasks.scheduled",
     "app.tasks.task_scheduling",
+    "app.tasks.task_run_monitor",
     "app.tasks.recycle_bin",
     "app.tasks.upload_cleanup",
     "app.tasks.ai_health_check",

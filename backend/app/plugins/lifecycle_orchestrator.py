@@ -863,6 +863,7 @@ class LifecycleOrchestrator(LifecycleOrchestratorMaintenanceMixin):
         force: bool = False,
         operator_id: int | None = None,
         skip_lifecycle_guards: bool = False,
+        preserve_plan_grants: bool = False,
     ) -> None:
         """Disable plugin runtime after lock acquisition."""
         from sqlalchemy import select
@@ -965,14 +966,15 @@ class LifecycleOrchestrator(LifecycleOrchestratorMaintenanceMixin):
         )
         await lifecycle.permissions.set_enabled(plugin_name, False)
 
-        try:
-            await lifecycle.permissions.revoke_plan_menus(plugin_name)
-        except Exception as exc:
-            logger.warning(
-                "Plugin {}: failed to revoke permissions from plans: {}",
-                plugin_name,
-                exc,
-            )
+        if not preserve_plan_grants:
+            try:
+                await lifecycle.permissions.revoke_plan_menus(plugin_name)
+            except Exception as exc:
+                logger.warning(
+                    "Plugin {}: failed to revoke permissions from plans: {}",
+                    plugin_name,
+                    exc,
+                )
 
         await emitter.emit_step("permissions", "success", "Plugin permissions disabled")
 

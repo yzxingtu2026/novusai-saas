@@ -158,7 +158,7 @@ async def test_trace_middleware_replaces_invalid_utf8_header() -> None:
 
     async def app(scope, receive, send):
         _ = receive
-        captured["trace_id"] = scope["state"].trace_id
+        captured["trace_id"] = scope["state"]["trace_id"]
         await send({"type": "http.response.start", "status": 200, "headers": []})
         await send({"type": "http.response.body", "body": b"ok"})
 

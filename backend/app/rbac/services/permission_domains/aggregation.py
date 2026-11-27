@@ -297,48 +297,42 @@ class PermissionAggregationDomain:
             ).get_visible_org_node_ids()
         )
 
-    async def get_tenant_user_permissions(self, tenant_user: TenantUser) -> set[str]:
+    async def _get_tenant_user_grants(
+        self, tenant_user: TenantUser
+    ) -> list[Permission]:
         if tenant_user.role_id is None:
-            return set()
+            return []
 
         result = await self._db.execute(
             select(TenantUserRole)
-            .where(TenantUserRole.id == tenant_user.role_id)
+            .where(
+                TenantUserRole.id == tenant_user.role_id,
+                TenantUserRole.tenant_id == tenant_user.tenant_id,
+                TenantUserRole.is_deleted.is_(False),
+            )
             .options(selectinload(TenantUserRole.permissions))
         )
         role = result.scalar_one_or_none()
 
         if role is None or not role.is_active:
-            return set()
+            return []
 
-        return {
-            permission.code
+        return [
+            permission
             for permission in role.permissions
-            if permission.is_enabled and not permission.is_deleted
-        }
+            if permission.is_enabled
+            and not permission.is_deleted
+            and permission.scope == PermissionScope.USER.value
+        ]
+
+    async def get_tenant_user_permissions(self, tenant_user: TenantUser) -> set[str]:
+        return {grant.code for grant in await self._get_tenant_user_grants(tenant_user)}
 
     async def get_tenant_user_effective_permission_ids(
         self,
         tenant_user: TenantUser,
     ) -> set[int]:
-        if tenant_user.role_id is None:
-            return set()
-
-        result = await self._db.execute(
-            select(TenantUserRole)
-            .where(TenantUserRole.id == tenant_user.role_id)
-            .options(selectinload(TenantUserRole.permissions))
-        )
-        role = result.scalar_one_or_none()
-
-        if role is None or not role.is_active:
-            return set()
-
-        return {
-            permission.id
-            for permission in role.permissions
-            if permission.is_enabled and not permission.is_deleted
-        }
+        return {grant.id for grant in await self._get_tenant_user_grants(tenant_user)}
 
     async def get_enabled_permissions_by_scope(self, scope: str) -> list[Permission]:
         if scope == PermissionScope.USER.value:

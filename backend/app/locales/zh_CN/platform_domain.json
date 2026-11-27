@@ -1,0 +1,29 @@
+{
+  "config": {
+    "platform": {
+      "tenant_domain_suffix": {
+        "name": "企业默认域名后缀",
+        "desc": "企业访问域名后缀（由部署配置管理；同步 DNS、HTTPS 和代理配置后重新部署才能变更）"
+      }
+    }
+  },
+  "domain": {
+    "binding_verification_required": "请登录企业后台绑定域名，并使用该域名返回的随机 TXT 验证记录确认所有权；公开解析指引不生成验证令牌。",
+    "instructions_header": "自定义域名解析说明",
+    "cname_record_required": "将域名解析到企业入口",
+    "host_record": "主机记录",
+    "record_type": "记录类型",
+    "record_value": "记录值",
+    "dns_propagation_note": "DNS 解析生效需要时间，请在域名管理中按实际记录完成归属验证。",
+    "invalid_format": "请填写域名，不要包含协议、路径或端口。",
+    "custom_only_routing": "请使用部署运维人员提供的自定义域名 DNS 解析目标。"
+  },
+  "error": {
+    "config": {
+      "domain_suffix_deployment_managed": "企业域名后缀由部署配置 TENANT_DOMAIN_SUFFIX 管理；更改需同步 DNS、HTTPS 与代理配置后重新部署。"
+    }
+  },
+  "tenant_domain": {
+    "default_domain_remark": "平台统一管理的企业默认域名"
+  }
+}

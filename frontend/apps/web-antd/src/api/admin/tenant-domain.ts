@@ -3,68 +3,28 @@
  * Backend: /admin/tenants/{tenant_id}/domains/*
  */
 import type {
-  DomainType,
   SslCertificateInfo,
   SslCertificateInfoRaw,
-  SslStatus,
-  VerificationInfo,
-  VerificationStatus,
+  TenantDomainInfo,
+  TenantDomainInfoRaw,
 } from '#/types/domain';
 import type { ApiRequestOptions } from '#/utils/request';
 
-import { transformSslCertInfo } from '#/types/domain';
+import { transformDomainInfo, transformSslCertInfo } from '#/types/domain';
 import { requestClient } from '#/utils/request';
 
 export type {
   DomainType,
   SslCertificateInfo,
   SslStatus,
+  TenantDomainInfo,
+  TenantDomainInfoRaw,
   VerificationStatus,
 } from '#/types/domain';
 
 // ============================================================
 // Type definitions / 类型定义
 // ============================================================
-
-/** Domain info (backend raw snake_case) / 域名信息（后端原始格式） */
-export interface TenantDomainInfoRaw {
-  id: number;
-  tenant_id: number;
-  domain: string;
-  domain_type: DomainType;
-  is_verified: boolean;
-  is_primary: boolean;
-  ssl_status: SslStatus;
-  cname_target?: string;
-  txt_record?: string;
-  verification_token?: null | string;
-  verification_info?: null | VerificationInfo;
-  verified_at?: null | string;
-  ssl_expires_at?: string;
-  remark?: string;
-  created_at: string;
-  updated_at: string;
-}
-
-/** Domain info (frontend camelCase) / 域名信息（前端格式） */
-export interface TenantDomainInfo {
-  id: number;
-  tenantId: number;
-  domain: string;
-  domainType: DomainType;
-  isPrimary: boolean;
-  verificationStatus: VerificationStatus;
-  sslStatus: SslStatus;
-  cnameTarget?: string;
-  txtRecord?: string;
-  verificationToken?: null | string;
-  verificationInfo?: null | VerificationInfo;
-  verifiedAt?: string;
-  sslExpiresAt?: string;
-  remark?: string;
-  createdAt: string;
-  updatedAt: string;
-}
 
 /** Create domain request / 创建域名请求 */
 export interface TenantDomainCreateRequest {
@@ -180,28 +140,6 @@ export interface DevHostsSyncAllResponse extends DevHostsStatusResponse {
 // ============================================================
 // Transform functions / 转换函数
 // ============================================================
-
-/** Convert backend snake_case to frontend camelCase / 将后端转换为前端格式 */
-function transformDomainInfo(raw: TenantDomainInfoRaw): TenantDomainInfo {
-  return {
-    id: raw.id,
-    tenantId: raw.tenant_id,
-    domain: raw.domain,
-    domainType: raw.domain_type || 'custom',
-    isPrimary: raw.is_primary,
-    verificationStatus: raw.is_verified ? 'verified' : 'pending',
-    sslStatus: raw.ssl_status,
-    cnameTarget: raw.cname_target,
-    txtRecord: raw.txt_record,
-    verificationToken: raw.verification_token,
-    verificationInfo: raw.verification_info,
-    verifiedAt: raw.verified_at || undefined,
-    sslExpiresAt: raw.ssl_expires_at,
-    remark: raw.remark,
-    createdAt: raw.created_at,
-    updatedAt: raw.updated_at,
-  };
-}
 
 /** Convert Dev Hosts runtime info / 转换 Dev Hosts 运行时信息 */
 function transformDevHostsRuntimeInfo(

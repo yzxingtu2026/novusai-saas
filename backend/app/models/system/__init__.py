@@ -17,6 +17,7 @@ from app.models.system.config import (
 from app.models.system.email_log import EmailLog
 from app.models.system.operation_log import OperationLog
 from app.models.system.plugin import Plugin
+from app.models.system.plugin_image_operation import PluginImageOperation
 from app.models.system.plugin_license import PluginLicense
 from app.models.system.plugin_version import PluginVersion
 from app.models.system.resource_tenant_assignment import ResourceTenantAssignment
@@ -38,6 +39,7 @@ __all__ = [
     "SystemAgentAssignment",
     "EmailLog",
     "Plugin",
+    "PluginImageOperation",
     "PluginVersion",
     "PluginLicense",
     "ResourceTenantAssignment",

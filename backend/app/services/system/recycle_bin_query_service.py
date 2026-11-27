@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from sqlalchemy import select
 
-from app.enums.recycle import RecycleStageEnum
+from app.enums.common import RecycleStageEnum
 from app.models.tenant.tenant import Tenant
 
 

@@ -53,7 +53,8 @@ class StorageBillingBindingService:
     / 租户账单绑定 CRUD 与校验服务。
     """
 
-    def __init__(self, ctx, *, host_read=None) -> None:
+    def __init__(self, ctx, *, host_read=None, prerequisites_reader=None) -> None:
+        self._prerequisites_reader = prerequisites_reader
         self._ctx = ctx
         self._db = _get_plugin_db(ctx)
         self._host_read = (
@@ -66,7 +67,12 @@ class StorageBillingBindingService:
 
     @classmethod
     def from_context(cls, ctx) -> StorageBillingBindingService:
-        return cls(ctx, host_read=getattr(ctx, "host", None))
+        host_read = getattr(ctx, "host", None)
+        return cls(
+            ctx,
+            host_read=host_read,
+            prerequisites_reader=getattr(host_read, "read_storage_billing_prerequisites", None),
+        )
 
     async def list_bindings(self, request) -> dict[str, Any]:
         page = max(1, int(request.query_params.get("page[number]", "1")))
@@ -258,6 +264,8 @@ class StorageBillingBindingService:
         return self._build_mutation_result(instance, validation)
 
     async def get_tenant_prerequisites(self, tenant_id: int) -> dict[str, Any]:
+        if self._prerequisites_reader is not None:
+            return await self._prerequisites_reader(tenant_id)
         tenant_snapshot = await self._get_tenant_snapshot(tenant_id)
         storage_context = await self._get_tenant_storage_context(tenant_id)
         platform_storage_context = await self._get_platform_storage_context()

@@ -21,6 +21,11 @@ import {
 import { overridesPreferences } from '#/preferences';
 import { ensureCaptchaPluginReady } from '#/utils/captcha-plugin';
 import { mergeBrandConfig } from '#/utils/public-branding';
+import {
+  isUnknownTenantDomainError,
+  normalizeDomainHostname,
+  shouldRequestTenantPublicConfig,
+} from '#/utils/public-config-domain';
 
 /**
  * Update page head info (Favicon, Meta Description)
@@ -428,7 +433,12 @@ export const usePublicConfigStore = defineStore('publicConfig', {
 
         // Platform-domain tenant/admin routes should keep using platform public config.
         // / 平台域企业端管理页面应继续使用平台公开配置，避免误打 tenant public config。
-        if (this.isDomainDetected && this.isDomainTenantDomain === false) {
+        if (
+          !shouldRequestTenantPublicConfig(
+            this.isDomainDetected,
+            this.isDomainTenantDomain,
+          )
+        ) {
           return null;
         }
       }
@@ -501,7 +511,10 @@ export const usePublicConfigStore = defineStore('publicConfig', {
     async _doDetectDomainType(): Promise<void> {
       if (this.isDomainDetected) return;
 
-      const hostname = globalThis.location?.hostname ?? '';
+      const hostname = normalizeDomainHostname(
+        globalThis.location?.hostname ?? '',
+      );
+      this.error = null;
       const e2eDomainTypeOverride = readE2EDomainTypeOverride();
 
       if (e2eDomainTypeOverride) {
@@ -510,46 +523,41 @@ export const usePublicConfigStore = defineStore('publicConfig', {
         return;
       }
 
-      // ── Layer 1: Env var fast match / 环境变量快速匹配 ──────────────
-      const envDomains = (import.meta.env.VITE_PLATFORM_DOMAINS ?? '')
+      const runtimeDomains =
+        import.meta.env.PROD && typeof window !== 'undefined'
+          ? window._VBEN_ADMIN_PRO_APP_CONF_?.VITE_PLATFORM_DOMAINS
+          : undefined;
+      const envDomains = (
+        runtimeDomains ??
+        import.meta.env.VITE_PLATFORM_DOMAINS ??
+        ''
+      )
         .split(',')
-        .map((d: string) => d.trim().toLowerCase())
+        .map(normalizeDomainHostname)
         .filter(Boolean);
 
-      if (envDomains.includes(hostname.toLowerCase())) {
+      if (hostname && envDomains.includes(hostname)) {
         this.isDomainTenantDomain = false;
         this.isDomainDetected = true;
         return;
       }
 
-      // ── Layer 2: Platform public config API / 平台公开配置 API ───────────
       const platformConfig = await this.loadPlatformConfig({
         applyBrand: false,
       });
-      if (platformConfig) {
-        // 2a: Check platformDomains list / 检查 platformDomains 列表
-        const apiDomains = platformConfig.platformDomains.map((d) =>
-          d.toLowerCase(),
-        );
-        if (apiDomains.includes(hostname.toLowerCase())) {
-          this.isDomainTenantDomain = false;
-          this.isDomainDetected = true;
-          applyBrandConfig(platformConfig.brand);
-          return;
-        }
-
-        // 2b: Check tenant subdomain suffix match (*.suffix) / 检查企业子域名后缀
-        const suffix = platformConfig.domain.suffix?.toLowerCase();
-        if (suffix && hostname.toLowerCase().endsWith(suffix)) {
-          this.isDomainTenantDomain = true;
-          this.isDomainDetected = true;
-          // Preload tenant config / 预加载企业配置
-          await this.loadTenantConfig({ skipDomainCheck: true });
-          return;
-        }
+      if (
+        platformConfig &&
+        hostname &&
+        platformConfig.platformDomains
+          .map(normalizeDomainHostname)
+          .includes(hostname)
+      ) {
+        this.isDomainTenantDomain = false;
+        this.isDomainDetected = true;
+        applyBrandConfig(platformConfig.brand);
+        return;
       }
 
-      // ── Layer 3: Tenant config API fallback (custom domain) / 企业配置回退 ────
       try {
         const tenantConfig = await prepareTenantCaptchaPlugin(
           await getTenantPublicConfigApi(),
@@ -564,30 +572,24 @@ export const usePublicConfigStore = defineStore('publicConfig', {
           applyBrandConfig(this.tenantConfig.brand);
         }
         this.isDomainDetected = true;
-      } catch (error) {
-        const err = error as {
-          response?: { data?: { code?: number }; status?: number };
-        };
-        const httpStatus = err?.response?.status;
-        const businessCode = err?.response?.data?.code;
-
-        if (httpStatus === 404 || businessCode === 4040) {
-          // Tenant not found → platform domain / 企业不存在
-          this.isDomainTenantDomain = false;
-          this.isDomainDetected = true;
-          if (platformConfig) {
-            applyBrandConfig(platformConfig.brand);
-          }
-        } else if (httpStatus && httpStatus >= 400 && httpStatus < 500) {
-          // Other client errors (e.g. 403) also mark as non-tenant domain / 其他客户端错误
-          this.isDomainTenantDomain = false;
-          this.isDomainDetected = true;
-          if (platformConfig) {
-            applyBrandConfig(platformConfig.brand);
-          }
-        }
-        // Network/500 errors: isDomainDetected stays false, retry on next nav / 网络错误不标记
+        this.error = null;
+      } catch (error: unknown) {
+        this.isDomainTenantDomain = null;
+        this.isDomainDetected = Boolean(
+          platformConfig && isUnknownTenantDomainError(error),
+        );
+        this.error =
+          error instanceof Error ? error.message : 'Failed to detect domain';
       }
+    },
+
+    async retryDomainDetection(): Promise<void> {
+      if (_detectDomainPromise) return _detectDomainPromise;
+      this.isDomainDetected = false;
+      this.isDomainTenantDomain = null;
+      this.platformConfig = null;
+      this.platformConfigLoaded = false;
+      await this.detectDomainType();
     },
 
     /**

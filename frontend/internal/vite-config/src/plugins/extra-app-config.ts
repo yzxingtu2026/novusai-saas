@@ -7,6 +7,7 @@ import {
 } from '@vben/node-utils';
 
 import { loadEnv } from '../utils/env';
+import { resolvePublicAppConfig } from '../utils/public-app-config';
 
 interface PluginOptions {
   isBuild: boolean;
@@ -71,7 +72,10 @@ async function viteExtraAppConfigPlugin({
 }
 
 async function getConfigSource() {
-  const config = await loadEnv();
+  const config = resolvePublicAppConfig(
+    await loadEnv('VITE_GLOB_|VITE_PLATFORM_DOMAINS$'),
+    process.env,
+  );
   const windowVariable = `window.${VBEN_ADMIN_PRO_APP_CONF}`;
   // 确保变量不会被修改 / freeze injected window config
   let source = `${windowVariable}=${JSON.stringify(config)};`;

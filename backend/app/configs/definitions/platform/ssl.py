@@ -5,7 +5,7 @@ Includes ACME/Let's Encrypt connection config, auto-renewal policy, etc.
 """
 
 from app.configs.definitions.groups import PLATFORM_SSL_GROUP
-from app.configs.meta import ConfigMeta, ConfigOption, DisplayRule
+from app.configs.meta import ConfigMeta, ConfigOption, DisplayRule, max_value, min_value
 from app.core.config import settings
 from app.enums.config import ConfigScope, ConfigValueType
 
@@ -83,6 +83,7 @@ SSL_AUTO_RENEW_DAYS = ConfigMeta(
     scope=ConfigScope.ADMIN_ONLY,
     value_type=ConfigValueType.NUMBER,
     default_value=30,
+    validation_rules=[min_value(1), max_value(60)],
     sort_order=60,
 )
 
@@ -107,6 +108,7 @@ _DNS_PROVIDER_OPTIONS = [
     ConfigOption(
         value="cloudflare", label_key="config.platform.dns_provider.cloudflare"
     ),
+    ConfigOption(value="aliyun", label_key="config.platform.dns_provider.aliyun"),
 ]
 
 if settings.DEBUG:
@@ -156,6 +158,42 @@ DNS_CLOUDFLARE_ZONE_ID = ConfigMeta(
 )
 
 
+# Generic ConfigService currently exposes encryption metadata only. Prefer
+# private worker env rather than storing AccessKeys in platform config rows.
+DNS_ALIYUN_ACCESS_KEY_ID = ConfigMeta(
+    key="dns_aliyun_access_key_id",
+    name_key="config.platform.dns_aliyun_access_key_id.name",
+    description_key="config.platform.dns_aliyun_access_key_id.desc",
+    scope=ConfigScope.ADMIN_ONLY,
+    value_type=ConfigValueType.PASSWORD,
+    default_value="",
+    is_encrypted=True,
+    display_rules=[DisplayRule(field="dns_provider", value="aliyun")],
+    sort_order=83,
+)
+DNS_ALIYUN_ACCESS_KEY_SECRET = ConfigMeta(
+    key="dns_aliyun_access_key_secret",
+    name_key="config.platform.dns_aliyun_access_key_secret.name",
+    description_key="config.platform.dns_aliyun_access_key_secret.desc",
+    scope=ConfigScope.ADMIN_ONLY,
+    value_type=ConfigValueType.PASSWORD,
+    default_value="",
+    is_encrypted=True,
+    display_rules=[DisplayRule(field="dns_provider", value="aliyun")],
+    sort_order=84,
+)
+DNS_ALIYUN_ZONE = ConfigMeta(
+    key="dns_aliyun_zone",
+    name_key="config.platform.dns_aliyun_zone.name",
+    description_key="config.platform.dns_aliyun_zone.desc",
+    scope=ConfigScope.ADMIN_ONLY,
+    value_type=ConfigValueType.STRING,
+    default_value="",
+    display_rules=[DisplayRule(field="dns_provider", value="aliyun")],
+    sort_order=85,
+)
+
+
 # ==========================================
 # Register configs to group / 注册配置项到分组
 # ==========================================
@@ -171,4 +209,7 @@ PLATFORM_SSL_GROUP.configs = [
     DNS_PROVIDER,
     DNS_CLOUDFLARE_API_TOKEN,
     DNS_CLOUDFLARE_ZONE_ID,
+    DNS_ALIYUN_ACCESS_KEY_ID,
+    DNS_ALIYUN_ACCESS_KEY_SECRET,
+    DNS_ALIYUN_ZONE,
 ]

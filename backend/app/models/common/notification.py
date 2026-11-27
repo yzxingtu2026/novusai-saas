@@ -7,7 +7,7 @@ Stores all persistent notifications (inbox), supports read/unread, category filt
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text
+from sqlalchemy import Boolean, DateTime, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSONB
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -38,6 +38,29 @@ class Notification(BaseModel):
             "idx_notifications_recipient", "recipient_type", "recipient_id", "is_read"
         ),
         Index("idx_notifications_tenant", "tenant_id", "created_at"),
+        Index(
+            "uq_notifications_tenant_dedupe",
+            "tenant_id",
+            "recipient_type",
+            "recipient_id",
+            "template_code",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND tenant_id IS NOT NULL AND dedupe_key IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_notifications_platform_dedupe",
+            "recipient_type",
+            "recipient_id",
+            "template_code",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND tenant_id IS NULL AND dedupe_key IS NOT NULL"
+            ),
+        ),
     )
 
     tenant_id: Mapped[int | None] = mapped_column(
@@ -60,6 +83,11 @@ class Notification(BaseModel):
         String(100),
         nullable=False,
         comment="通知模板编码",
+    )
+    dedupe_key: Mapped[str | None] = mapped_column(
+        String(160),
+        nullable=True,
+        comment="业务去重键 / Business dedupe key",
     )
     category: Mapped[str] = mapped_column(
         String(50),

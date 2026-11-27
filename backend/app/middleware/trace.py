@@ -12,7 +12,6 @@ import asyncio
 import uuid
 from contextvars import ContextVar
 
-from starlette.datastructures import State
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 # ContextVar for async context propagation / 用于异步上下文传播的 ContextVar
@@ -82,14 +81,8 @@ class TraceIdMiddleware:
         tid = normalize_trace_id(raw_tid)
         trace_id_var.set(tid)
 
-        # Ensure scope has state (for AuditLogMiddleware etc.) / 确保 scope 有 state
-        # TestClient uses dict, TenantMiddleware uses dict; wrap in State for attribute-style access
-        raw = scope.get("state")
-        if raw is None:
-            raw = {}
-        if not isinstance(raw, State):
-            scope["state"] = State(raw)
-        scope["state"].trace_id = tid
+        # 保留 ASGI 状态字典 / Keep the ASGI state dictionary for Starlette Request.state.
+        scope.setdefault("state", {})["trace_id"] = tid
 
         # Wrap send to add X-Trace-ID to response headers / 包装 send 以添加 X-Trace-ID
         async def wrapped_send(message: Message) -> None:

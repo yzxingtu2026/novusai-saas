@@ -6,6 +6,8 @@ Keeps marketplace/upload install-preview orchestration out of admin API modules.
 
 from __future__ import annotations
 
+import hashlib
+import hmac
 import re
 import shutil
 import tempfile
@@ -66,11 +68,21 @@ def assert_marketplace_package_identity(
         )
 
 
+def _package_file_sha256(path: Path) -> str:
+    """Hash the downloaded archive without loading its bytes into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as package_file:
+        for chunk in iter(lambda: package_file.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def create_install_preview_token(
     *,
     source: str,
     plugin_name: str,
     version: str,
+    package_sha256: str,
     admin_id: int | None,
     marketplace_slug: str | None = None,
 ) -> str:
@@ -81,6 +93,7 @@ def create_install_preview_token(
         "source": source,
         "plugin_name": plugin_name,
         "version": version,
+        "package_sha256": package_sha256,
         "iat": issued_at,
         "exp": issued_at + timedelta(seconds=15 * 60),
     }
@@ -123,6 +136,7 @@ def assert_install_preview_token(
     source: str,
     plugin_name: str | None = None,
     version: str | None = None,
+    package_sha256: str | None = None,
     marketplace_slug: str | None = None,
     admin_id: int | None = None,
 ) -> None:
@@ -135,12 +149,23 @@ def assert_install_preview_token(
         and payload.get("marketplace_slug") != marketplace_slug
     ):
         raise ValidationException(message=_("plugin.error.install_preview_invalid"))
-    if admin_id is not None and payload.get("admin_id") not in {None, int(admin_id)}:
+    issuer_id = payload.get("admin_id")
+    if admin_id is not None and (
+        type(issuer_id) is not int or issuer_id != int(admin_id)
+    ):
         raise ValidationException(message=_("plugin.error.install_preview_invalid"))
     if plugin_name is not None and payload.get("plugin_name") != plugin_name:
         raise ValidationException(message=_("plugin.error.install_preview_stale"))
     if version is not None and payload.get("version") != version:
         raise ValidationException(message=_("plugin.error.install_preview_stale"))
+    if package_sha256 is not None:
+        preview_digest = payload.get("package_sha256")
+        if (
+            not isinstance(preview_digest, str)
+            or not preview_digest.isascii()
+            or not hmac.compare_digest(preview_digest, package_sha256)
+        ):
+            raise ValidationException(message=_("plugin.error.install_preview_stale"))
 
 
 async def test_registry_connection(
@@ -334,6 +359,7 @@ class PluginInstallPreviewService:
                 source="marketplace",
                 plugin_name=manifest.name,
                 version=manifest.version,
+                package_sha256=_package_file_sha256(zip_path),
                 admin_id=admin_id,
                 marketplace_slug=slug,
             )
@@ -382,6 +408,13 @@ class PluginInstallPreviewService:
         zip_path = await client.download_plugin(slug, version)
 
         try:
+            assert_install_preview_token(
+                preview_payload,
+                source="marketplace",
+                package_sha256=_package_file_sha256(zip_path),
+                admin_id=admin_id,
+                marketplace_slug=slug,
+            )
             extract_dir = zip_path.parent / "extracted"
             plugin_dir = extract_plugin_zip_safely(zip_path, extract_dir)
             loader = PluginLoader()
@@ -444,6 +477,7 @@ class PluginInstallPreviewService:
                 source="upload",
                 plugin_name=manifest.name,
                 version=manifest.version,
+                package_sha256=hashlib.sha256(content).hexdigest(),
                 admin_id=admin_id,
             )
             return preview.model_dump()
@@ -466,6 +500,7 @@ class PluginInstallPreviewService:
         assert_install_preview_token(
             preview_payload,
             source="upload",
+            package_sha256=hashlib.sha256(content).hexdigest(),
             admin_id=admin_id,
         )
 

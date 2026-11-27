@@ -9,6 +9,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.logging import LogManager
@@ -55,11 +56,37 @@ class InboxChannel(NotificationChannel):
             from app.models.common.notification import Notification
 
             delivery_record = kwargs.get("delivery_record")
+            created_notifications = kwargs.get("created_notifications")
+            dedupe_key = kwargs.get("dedupe_key")
+            if dedupe_key:
+                conditions = [
+                    Notification.recipient_type == user_type,
+                    Notification.recipient_id == user_id,
+                    Notification.template_code == template_code,
+                    Notification.dedupe_key == dedupe_key,
+                    Notification.is_deleted.is_(False),
+                ]
+                if tenant_id is None:
+                    conditions.append(Notification.tenant_id.is_(None))
+                else:
+                    conditions.append(Notification.tenant_id == tenant_id)
+                result = await db.execute(select(Notification).where(*conditions))
+                existing = result.scalar_one_or_none()
+                if existing is not None:
+                    if isinstance(created_notifications, list):
+                        created_notifications.append(existing)
+                    if delivery_record is not None:
+                        delivery_record.notification_id = existing.id
+                        delivery_record.status = "sent"
+                        delivery_record.attempt = (delivery_record.attempt or 0) + 1
+                        delivery_record.last_error = None
+                    return True
             notification = Notification(
                 tenant_id=tenant_id,
                 recipient_type=user_type,
                 recipient_id=user_id,
                 template_code=template_code,
+                dedupe_key=dedupe_key,
                 category=template_code.split(".")[0]
                 if "." in template_code
                 else "system",
@@ -70,7 +97,6 @@ class InboxChannel(NotificationChannel):
                 priority=priority,
             )
             db.add(notification)
-            created_notifications = kwargs.get("created_notifications")
             if isinstance(created_notifications, list):
                 created_notifications.append(notification)
             if delivery_record is not None:

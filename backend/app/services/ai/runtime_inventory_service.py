@@ -125,7 +125,6 @@ class RuntimeInventoryService:
             request=request,
             skill_result=skill_result,
             state=state,
-            intent_plan=None,
         )
         manifest = AIRuntimeInventoryService.build_manifest(
             agent=agent,

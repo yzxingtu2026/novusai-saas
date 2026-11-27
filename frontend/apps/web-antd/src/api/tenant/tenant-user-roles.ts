@@ -1,3 +1,5 @@
+import type { TenantPermissionNodeRaw } from './permission';
+
 /**
  * Tenant user role management API / 企业用户角色管理 API
  * Backend: /tenant/user-roles/* / 对接后端 /tenant/user-roles/* 接口
@@ -74,6 +76,10 @@ export interface TenantUserRoleInfo {
   updatedAt?: null | string;
 }
 
+interface TenantUserRoleAssignmentRaw extends TenantUserRoleInfoRaw {
+  permission_options?: TenantPermissionNodeRaw[];
+}
+
 /** Paginated list response / 分页列表响应 */
 export interface TenantUserRoleListResponse {
   items: TenantUserRoleInfo[];
@@ -148,6 +154,27 @@ export async function getTenantUserRoleDetailApi(
     options,
   );
   return transformUserRoleInfo(raw);
+}
+
+/** 读取当前角色的完整授权草稿 / Read the complete assignment draft for the current role. */
+export async function getTenantUserRoleAssignmentApi(roleId: number) {
+  const raw = await requestClient.get<TenantUserRoleAssignmentRaw>(
+    `${API_PREFIX}/${roleId}`,
+    { params: { include_permission_options: true } },
+  );
+  if (
+    raw.id !== roleId ||
+    !Array.isArray(raw.permission_ids) ||
+    !Array.isArray(raw.permission_codes) ||
+    !Array.isArray(raw.permission_options)
+  ) {
+    throw new Error('Incomplete role permission assignment data');
+  }
+  return {
+    permissionCodes: raw.permission_codes,
+    permissionIds: raw.permission_ids,
+    permissionOptions: raw.permission_options,
+  };
 }
 
 /**

@@ -1,0 +1,14 @@
+{
+  "ssl_certificate": {
+    "cert_not_yet_valid": "此证书尚未生效，请上传当前有效的证书。",
+    "cert_not_current": "仅当前有效或已过期的平台签发证书可续期。",
+    "managed_wildcard": "此域名使用部署环境的共享泛域名证书。",
+    "replace_required": "已有当前证书，请使用续期或明确的替换操作。"
+  },
+  "tenant_domain": {
+    "cannot_delete_default": "不能删除默认域名。",
+    "cannot_delete_primary": "不能删除主域名。",
+    "primary_switch_busy": "其他操作正在更新此企业的域名，请稍后重试。",
+    "primary_switch_transaction_unsupported": "当前无法安全执行域名操作，请重试或联系管理员。"
+  }
+}

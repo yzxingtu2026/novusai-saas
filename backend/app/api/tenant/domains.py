@@ -316,6 +316,7 @@ class TenantDomainController(TenantController):
             )
             if auto_provisioned:
                 await db.commit()
+                await service.dispatch_ssl_provision(domain_id)
                 domain = auto_provisioned
 
             return success(
@@ -398,10 +399,15 @@ class TenantDomainController(TenantController):
                     detail=_("ssl_certificate.domain_not_verified"),
                 )
 
-            await service.start_ssl_provision(domain_id)
-            await db.commit()
-
-            return success(message=_("ssl_certificate.provision_started"))
+            outcome = await service.trigger_ssl_provision(domain_id)
+            return success(
+                data=outcome,
+                message=_(
+                    "ssl_certificate.managed_wildcard"
+                    if outcome["status"] == "managed_wildcard"
+                    else "ssl_certificate.provision_started"
+                ),
+            )
 
         @router.post("/{domain_id}/ssl/renew", summary="手动续期 SSL 证书")
         @permission_action("ssl_renew", "action.tenant_domain.ssl_renew")
@@ -420,36 +426,7 @@ class TenantDomainController(TenantController):
                     detail=_("tenant_domain.not_found"),
                 )
 
-            ssl_service = SslCertificateService(db)
-            cert = await ssl_service.get_cert_detail(domain_id)
-            if not cert:
-                raise HTTPException(
-                    status_code=status.HTTP_404_NOT_FOUND,
-                    detail=_("ssl_certificate.not_found"),
-                )
-
-            from app.enums.domain import SslCertType
-
-            if cert.cert_type != SslCertType.PLATFORM.value:
-                raise HTTPException(
-                    status_code=status.HTTP_400_BAD_REQUEST,
-                    detail=_("ssl_certificate.custom_cert_no_renew"),
-                )
-            await service.ensure_custom_domain_entitled(
-                current_admin.tenant_id,
-                domain,
-            )
-
-            from app.services.system.dns_provider import ensure_dns_provider_ready
-
-            await ensure_dns_provider_ready(db)
-            from app.celery_app import celery_app
-
-            celery_app.send_task(
-                "app.tasks.ssl_tasks.task_renew_ssl",
-                kwargs={"cert_id": cert.id},
-                queue="default",
-            )
+            await service.trigger_ssl_renew(domain_id)
 
             return success(message=_("ssl_certificate.renew_started"))
 
