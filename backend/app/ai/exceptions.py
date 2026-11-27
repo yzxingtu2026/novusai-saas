@@ -30,6 +30,7 @@ class AIGatewayError(Exception):
         model_code: str | None = None,
         error_code: str | None = None,
         status_code: int | None = None,
+        upstream_status_code: int | None = None,
         retry_after: int | None = None,
         original_error: Exception | None = None,
     ):
@@ -42,7 +43,8 @@ class AIGatewayError(Exception):
             provider_code: Provider code (e.g. openai_compatible) / 供应商代码
             model_code: Model code (e.g. gpt-4) / 模型代码
             error_code: Provider original error code / 供应商原始错误码
-            status_code: Effective upstream HTTP status / 实际上游 HTTP 状态码
+            status_code: Effective failure status / 错误分类对应的状态码
+            upstream_status_code: Observed wire status when distinguished / 单独记录的实际传输状态码
             retry_after: Suggested retry wait seconds / 建议重试等待秒数
             original_error: Original exception object / 原始异常对象
         """
@@ -51,6 +53,7 @@ class AIGatewayError(Exception):
         self.model_code = model_code
         self.error_code = error_code or self.__class__.error_code
         self.status_code = int(status_code or self.__class__.status_code)
+        self.upstream_status_code = upstream_status_code
         self.retry_after = retry_after
         self.original_error = original_error
         super().__init__(self.message)

@@ -20,31 +20,29 @@ class FailureClassifier:
     def classify_exception(
         exc: BaseException,
     ) -> tuple[ProviderFailureKind, dict[str, Any]]:
-        if isinstance(exc, ProviderTimeoutError):
-            return "provider_timeout", {"kind": "provider_timeout", "error": str(exc)}
-        if isinstance(exc, ProviderRateLimitError):
-            return "provider_rate_limit", {
-                "kind": "provider_rate_limit",
-                "error": str(exc),
-            }
-        if isinstance(exc, ProviderConnectionError):
-            return "provider_unavailable", {
-                "kind": "provider_unavailable",
-                "error": str(exc),
-            }
         if isinstance(exc, AIGatewayError):
-            status_code = int(getattr(exc, "status_code", 0) or 0)
-            if 500 <= status_code < 600:
-                return "provider_http_5xx", {
-                    "kind": "provider_http_5xx",
-                    "error": str(exc),
-                    "status_code": status_code,
-                }
-            return "provider_bad_response", {
-                "kind": "provider_bad_response",
-                "error": str(exc),
-                "status_code": status_code,
-            }
+            status_code = exc.upstream_status_code or exc.status_code
+            details: dict[str, Any] = {"error": str(exc)}
+            if exc.upstream_status_code is not None:
+                details["status_code"] = status_code
+                if status_code != exc.status_code:
+                    details["effective_status_code"] = exc.status_code
+
+            kind: ProviderFailureKind
+            if isinstance(exc, ProviderTimeoutError):
+                kind = "provider_timeout"
+            elif isinstance(exc, ProviderRateLimitError):
+                kind = "provider_rate_limit"
+            elif isinstance(exc, ProviderConnectionError):
+                kind = "provider_unavailable"
+            else:
+                kind = (
+                    "provider_http_5xx"
+                    if 500 <= status_code < 600
+                    else "provider_bad_response"
+                )
+                details["status_code"] = status_code
+            return kind, {"kind": kind, **details}
         if exc.__class__.__name__ in {"CancelledError", "GeneratorExit"}:
             return "server_interrupt", {"kind": "server_interrupt", "error": str(exc)}
         return "none", {}

@@ -54,6 +54,14 @@ class _FakeChatCompletions:
         self.last_kwargs = kwargs
         return self.response
 
+    @property
+    def with_raw_response(self):
+        return SimpleNamespace(create=self._create_raw)
+
+    async def _create_raw(self, **kwargs):
+        response = await self.create(**kwargs)
+        return SimpleNamespace(status_code=200, parse=lambda: response)
+
 
 class _FakeResponses:
     def __init__(self, response):

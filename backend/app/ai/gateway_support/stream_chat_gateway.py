@@ -96,6 +96,8 @@ async def execute_stream_chat(
     async def generate_chunks() -> AsyncIterator[ChatChunk]:
         nonlocal api_key, provider, ai_model, model
         current_key = api_key
+        stream_started = False
+        can_restart = True
 
         try:
             for attempt in range(MAX_RETRIES + 1):
@@ -130,6 +132,7 @@ async def execute_stream_chat(
                         tool_choice=tool_choice,
                         extra_kwargs=kwargs,
                     ):
+                        stream_started = True
                         yield chunk
 
                     if attempt > 0:
@@ -144,6 +147,16 @@ async def execute_stream_chat(
                     return
 
                 except AIGatewayError as exc:
+                    upstream_status = exc.upstream_status_code
+                    if (
+                        stream_started
+                        and upstream_status is not None
+                        and 200 <= upstream_status < 300
+                    ):
+                        # The client already received part of this successful-HTTP stream.
+                        can_restart = False
+                        raise
+
                     if not is_retryable(exc):
                         logger.error(
                             "Non-retryable error: provider={} model={} error_code={} error={}",
@@ -200,14 +213,16 @@ async def execute_stream_chat(
                 model_id=ai_model.id,
                 error=original_error,
             )
-            fallback_model = await gateway.failover.get_fallback_model(
-                ai_model.id,
-                **build_gateway_fallback_requirements(
-                    messages=messages,
-                    tools=tools,
-                    estimated_input=estimated_input,
-                ),
-            )
+            fallback_model = None
+            if can_restart:
+                fallback_model = await gateway.failover.get_fallback_model(
+                    ai_model.id,
+                    **build_gateway_fallback_requirements(
+                        messages=messages,
+                        tools=tools,
+                        estimated_input=estimated_input,
+                    ),
+                )
             if not fallback_model:
                 await gateway.usage_recorder.log_call_failure(
                     error=original_error,

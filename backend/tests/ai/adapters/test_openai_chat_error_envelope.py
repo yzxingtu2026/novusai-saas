@@ -1,76 +1,116 @@
-"""Behavioral protocol test with a synthetic HTTP response and the real SDK."""
+"""Test type: structural.
+
+Scope: SDK chat error-envelope mapping, safe diagnostics and unchanged empty
+response contract. Payloads are synthetic contract cases, not recorded model
+answers or evidence of successful real dialogue. No provider or database calls.
+"""
 
 from __future__ import annotations
 
-import httpx
-import pytest
+from types import SimpleNamespace
+from typing import Any
 
-from app.ai.adapters.openai_adapter import OpenAIAdapter
+import pytest
+from openai.types.chat import ChatCompletion
+
+from app.ai.adapters.openai_compatible.support.protocol_chat_completions_helpers import (
+    convert_chat_response,
+)
+from app.ai.engine.failure_classifier import FailureClassifier
 from app.ai.exceptions import ProviderError, is_retryable
 from app.core.i18n import _
 
-pytestmark = pytest.mark.behavioral
+
+class _UnusedUsageExtractor:
+    def _extract_usage_tokens(self, _usage: Any) -> tuple[None, None, None]:
+        raise AssertionError("Error envelopes and empty responses have no usage")
 
 
 @pytest.mark.parametrize(
-    "envelope", [False, True], ids=("empty-result", "provider-error")
+    "shape",
+    ["sdk_none_choices", "sdk_empty_choices", "object_without_choices", "dict"],
 )
-async def test_chat_completions_distinguishes_http_200_error_from_empty_result(
-    envelope: bool,
+def test_error_envelope_keeps_http_200_and_omits_raw_payload(shape: str) -> None:
+    secret = "synthetic-api-key-and-private-provider-message"
+    raw_error = {
+        "type": "custom_unclassified_type",
+        "code": "custom_unclassified_code",
+        "message": secret,
+        "body": {"token": secret},
+    }
+    if shape == "dict":
+        payload = {"error": raw_error}
+    elif shape == "object_without_choices":
+        payload = SimpleNamespace(error=raw_error)
+    else:
+        payload = ChatCompletion.model_construct(
+            choices=None if shape == "sdk_none_choices" else [],
+            error=raw_error,
+        )
+
+    with pytest.raises(ProviderError) as raised:
+        convert_chat_response(
+            adapter=_UnusedUsageExtractor(), response=payload, model="fixture-model"
+        )
+
+    error = raised.value
+    assert type(error) is ProviderError
+    assert error.status_code == 200
+    assert error.upstream_status_code == 200
+    assert error.error_code == "provider_error_envelope"
+    assert error.provider_code == "openai"
+    assert error.model_code == "fixture-model"
+    assert error.message == _("ai.request_failed")
+    assert error.original_error is None
+    assert error.__cause__ is None
+    assert is_retryable(error) is False
+    kind, details = FailureClassifier.classify_exception(error)
+    assert kind == "provider_bad_response"
+    assert details == {
+        "kind": "provider_bad_response",
+        "error": _("ai.request_failed"),
+        "status_code": 200,
+    }
+    projected = repr((str(error), error.to_dict(), details, error.__dict__))
+    assert secret not in projected
+    assert "custom_unclassified_code" not in projected
+    assert "custom_unclassified_type" not in projected
+
+
+def test_error_envelope_is_checked_before_any_choice_content() -> None:
+    payload = ChatCompletion.model_construct(
+        choices=[object()], error={"message": "synthetic-private-message"}
+    )
+
+    with pytest.raises(ProviderError) as raised:
+        convert_chat_response(
+            adapter=_UnusedUsageExtractor(), response=payload, model="fixture-model"
+        )
+
+    assert raised.value.error_code == "provider_error_envelope"
+    assert raised.value.status_code == 200
+
+
+@pytest.mark.parametrize("choices", [None, []])
+@pytest.mark.parametrize("include_null_error", [False, True])
+def test_legitimate_empty_response_contract_is_unchanged(
+    choices: list | None, include_null_error: bool
 ) -> None:
-    payload = {"object": "chat.completion", "choices": []}
-    if envelope:
-        payload["error"] = {"message": "synthetic provider diagnostic"}
-    requests = []
+    fields: dict[str, Any] = {"choices": choices}
+    if include_null_error:
+        fields["error"] = None
+    payload = ChatCompletion.model_construct(**fields)
 
-    def receive(request):
-        requests.append(request)
-        return httpx.Response(200, json=payload)
-
-    adapter = OpenAIAdapter(
-        api_key="fixture-key", base_url="https://provider.fixture.invalid/v1/"
+    response = convert_chat_response(
+        adapter=_UnusedUsageExtractor(), response=payload, model="fixture-model"
     )
-    original = adapter.client
-    try:
-        async with httpx.AsyncClient(
-            transport=httpx.MockTransport(receive),
-            trust_env=False,
-            follow_redirects=False,
-        ) as client:
-            adapter.client = original.with_options(http_client=client)
-            request_kwargs = {
-                "wire_api": "chat_completions",
-                "messages": [],
-                "model": "fixture-model",
-            }
-            if envelope:
-                with pytest.raises(ProviderError) as raised:
-                    await adapter.execute_protocol_chat(**request_kwargs)
-                error = raised.value
-                assert (error.status_code, error.error_code) == (
-                    200,
-                    "provider_error_envelope",
-                )
-                assert (error.provider_code, error.model_code) == (
-                    "openai",
-                    "fixture-model",
-                )
-                assert error.message == _("ai.request_failed")
-                assert error.original_error is None
-                assert not is_retryable(error)
-                assert "synthetic provider diagnostic" not in repr(error.to_dict())
-            else:
-                response = await adapter.execute_protocol_chat(**request_kwargs)
-                assert (response.message.content, response.finish_reason) == (
-                    "",
-                    "stop",
-                )
-                assert response.metadata["protocol_path"] == "chat_completions"
-    finally:
-        await original.close()
 
-    (request,) = requests
-    assert request.method == "POST"
-    assert request.url == httpx.URL(
-        "https://provider.fixture.invalid/v1/chat/completions"
-    )
+    assert response.message.role == "assistant"
+    assert response.message.content == ""
+    assert response.model == "fixture-model"
+    assert response.finish_reason == "stop"
+    assert response.metadata == {"protocol_path": "chat_completions"}
+    assert response.raw_response is None
+    assert response.input_tokens is None
+    assert response.output_tokens is None
+    assert response.total_tokens is None
