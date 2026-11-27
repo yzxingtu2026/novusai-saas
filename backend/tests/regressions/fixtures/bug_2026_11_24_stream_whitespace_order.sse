@@ -1,0 +1,84 @@
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":"Seeds"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" need"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" sun,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" water,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" and patience."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":"\n"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":"In"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" spring,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" we"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" prepare"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" the"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" beds"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" and"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" label"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" each"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" row."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" New"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" volunteers"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" can"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" bring"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" gloves"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" and"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" share"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" a"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" watering"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" can."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" By"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" summer,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" everyone"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" can"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" pick"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" herbs,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" trade"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" tips,"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" and"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" take"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" a"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" small"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" bouquet"},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{"role":"assistant","content":" home."},"finish_reason":null}]}
+
+data: {"id":"chatcmpl-fixture-whitespace","object":"chat.completion.chunk","created":1,"model":"fixture-stream-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":16,"completion_tokens":40,"total_tokens":56}}
+
+data: [DONE]
+
