@@ -15,6 +15,7 @@ from typing import Any
 
 from app.core.config import settings
 from app.core.security import (
+    TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_ADMIN,
     TOKEN_SCOPE_TENANT_ADMIN,
     TOKEN_SCOPE_TENANT_USER,
@@ -39,6 +40,7 @@ def issue_ai_proxy_token(
     tenant_id: int | None,
     agent_id: int | None,
     conversation_id: int | None,
+    tenant_session_epoch: int | None = None,
 ) -> str:
     """
     Issue a short-lived AI proxy access token / 签发短时效 AI 代理访问 token
@@ -66,7 +68,22 @@ def issue_ai_proxy_token(
         },
     }
     if scope in (TOKEN_SCOPE_TENANT_ADMIN, TOKEN_SCOPE_TENANT_USER):
+        if (
+            isinstance(tenant_id, bool)
+            or not isinstance(tenant_id, int)
+            or tenant_id < 1
+        ):
+            raise ValueError(
+                "tenant_id must be a positive integer for tenant proxy tokens"
+            )
+        if (
+            isinstance(tenant_session_epoch, bool)
+            or not isinstance(tenant_session_epoch, int)
+            or tenant_session_epoch < 0
+        ):
+            raise ValueError("tenant_session_epoch is required for tenant proxy tokens")
         extra_claims["tenant_id"] = tenant_id
+        extra_claims[TENANT_SESSION_EPOCH_CLAIM] = tenant_session_epoch
 
     token, _jti = create_access_token(
         subject=int(user_id),

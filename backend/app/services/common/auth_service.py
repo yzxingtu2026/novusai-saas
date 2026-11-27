@@ -10,7 +10,6 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.service import ConfigService
@@ -34,7 +33,8 @@ from app.core.security import (
     verify_token_with_scope,
 )
 from app.exceptions import AuthenticationException
-from app.models import Admin, Tenant, TenantAdmin, TenantUser
+from app.models import Admin, TenantAdmin, TenantUser
+from app.repositories.system.tenant_repository import TenantRepository
 from app.services.common.auth_domains import (
     AdminAuthFacade,
     AuthAdminDomain,
@@ -88,14 +88,9 @@ class AuthService(AuthCaptchaVerificationMixin):
 
     async def _tenant_session_epoch(self, tenant_id: int) -> int:
         """读取有效租户的当前代际 / Read the active tenant's session epoch."""
-        result = await self.db.execute(
-            select(Tenant.session_revocation_epoch).where(
-                Tenant.id == tenant_id,
-                Tenant.is_active.is_(True),
-                Tenant.is_deleted.is_(False),
-            )
+        epoch = normalize_nonnegative_integer(
+            await TenantRepository(self.db).get_active_session_epoch(tenant_id)
         )
-        epoch = normalize_nonnegative_integer(result.scalar_one_or_none())
         if epoch is None:
             raise AuthenticationException(message=_("auth.token_invalid"))
         return epoch
