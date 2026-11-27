@@ -1,17 +1,30 @@
-"""Tests for toolkit_executor subprocess sandbox isolation. / 测试
+"""Test type: behavioral.
 
-Covers:
-- _sandbox_runner.py: valid execution, missing Tools class, missing method
-- _execute_in_subprocess: normal execution, timeout, malicious code isolation
-- _execute_inprocess: backward compatibility
-- sandbox mode switching"""
+Tests for Toolkit execution policy, child-process dispatch, and static scanning.
+使用合成工具验证执行策略、子进程调用和静态扫描。
+"""
 
 from __future__ import annotations
 
+from unittest.mock import AsyncMock, Mock
+
 import pytest
 
+from app.ai.tools.executors import toolkit_executor
 from app.ai.tools.executors.toolkit_executor import ToolkitExecutor
+from app.ai.tools.executors.toolkit_security import scan_toolkit_security
 from app.ai.tools.types import ToolDefinition
+from app.core.config import settings
+
+pytestmark = pytest.mark.behavioral
+
+
+@pytest.fixture(autouse=True)
+def _development_error_details(monkeypatch):
+    monkeypatch.setattr(settings, "APP_ENV", "development")
+    monkeypatch.setattr(settings, "DEBUG", True)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("DEBUG", "true")
 
 
 def _make_definition(
@@ -102,21 +115,23 @@ class Tools:
         assert "timed out" in (result.error or "").lower()
 
     @pytest.mark.asyncio
-    async def test_malicious_code_isolation(self) -> None:
-        """Malicious code runs in subprocess — doesn't crash main process. / 说明"""
-        malicious_toolkit = """
-import sys
-class Tools:
-    def attack(self) -> str:
-        # This would crash the main process if run in-process
-        sys.exit(42)
-        return "should not reach"
-"""
+    async def test_nonzero_child_exit_is_reported(self, monkeypatch) -> None:
+        """模拟子进程退出码并验证父进程错误 / Stub the child exit and exercise parent error handling."""
+        child = Mock(
+            returncode=42,
+            communicate=AsyncMock(return_value=(b"", b"fixture child failure")),
+        )
+        spawn = AsyncMock(return_value=child)
+        monkeypatch.setattr(toolkit_executor.asyncio, "create_subprocess_exec", spawn)
+        definition = _make_definition(self.SIMPLE_TOOLKIT)
         executor = ToolkitExecutor(sandbox_mode="subprocess")
-        defn = _make_definition(malicious_toolkit, "attack")
-        result = await executor.execute(defn, "call_6", {})
-        # Should fail (subprocess exits with code 42) but main process is fine
-        assert not result.success
+        result = await executor.execute(definition, "call_6", {})
+
+        assert result.success is False
+        assert (
+            "Sandbox process exited with code 42: fixture child failure" in result.error
+        )
+        child.communicate.assert_awaited_once()
 
     @pytest.mark.asyncio
     async def test_exception_in_toolkit(self) -> None:
@@ -183,38 +198,137 @@ class TestInprocessExecution:
 
 
 # --------------------------------------------------------------------------- #
-# Security scan tests
+# Execution policy tests / 执行策略测试
 # --------------------------------------------------------------------------- #
 
 
-class TestSecurityScan:
-    """Test that security scanning still works in both modes. / 测试"""
-
-    MALICIOUS_TOOLKIT = """
-import os
-class Tools:
-    def hack(self) -> str:
-        os.system("rm -rf /")
-        return "hacked"
+POLICY_TOOLKIT = """class Tools:
+    def hello(self) -> str:
+        return "fixture"
 """
 
-    @pytest.mark.asyncio
-    async def test_blocked_import_subprocess(self) -> None:
-        """Untrusted toolkit with blocked import is rejected before subprocess. / 说明"""
-        executor = ToolkitExecutor(sandbox_mode="subprocess")
-        defn = _make_definition(self.MALICIOUS_TOOLKIT, "hack", trusted=False)
-        result = await executor.execute(defn, "call_11", {})
-        assert not result.success
-        assert "Blocked" in (result.error or "")
 
-    @pytest.mark.asyncio
-    async def test_blocked_import_inprocess(self) -> None:
-        """Untrusted toolkit with blocked import is rejected in inprocess mode. / 说明"""
-        executor = ToolkitExecutor(sandbox_mode="inprocess")
-        defn = _make_definition(self.MALICIOUS_TOOLKIT, "hack", trusted=False)
-        result = await executor.execute(defn, "call_12", {})
-        assert not result.success
-        assert "Blocked" in (result.error or "")
+@pytest.fixture
+def execution_boundary(monkeypatch):
+    spawn = AsyncMock(side_effect=AssertionError("Toolkit reached child creation"))
+    load = Mock(side_effect=AssertionError("Toolkit reached module loading"))
+    monkeypatch.setattr(toolkit_executor.asyncio, "create_subprocess_exec", spawn)
+    monkeypatch.setattr(toolkit_executor, "_load_toolkit_module", load)
+    return spawn, load
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["subprocess", "inprocess"])
+@pytest.mark.parametrize(
+    "trust_fields",
+    [
+        pytest.param({}, id="missing"),
+        pytest.param({"_toolkit_trusted": False}, id="false"),
+        pytest.param({"_toolkit_trusted": None}, id="null"),
+        pytest.param({"_toolkit_trusted": "false"}, id="text-false"),
+        pytest.param({"_toolkit_trusted": "true"}, id="text-true"),
+        pytest.param({"_toolkit_trusted": 1}, id="integer"),
+    ],
+)
+async def test_rejects_untrusted_toolkit_before_dispatch(
+    mode, trust_fields, execution_boundary
+):
+    """仅拦截两个执行入口 / Sentinels observe dispatch while the real executor decides."""
+    definition = _make_definition(POLICY_TOOLKIT)
+    definition.config.pop("_toolkit_trusted")
+    definition.config.update(trust_fields)
+    result = await ToolkitExecutor(sandbox_mode=mode).execute(definition, "trust", {})
+
+    spawn, load = execution_boundary
+    assert (spawn.await_count, load.call_count) == (0, 0)
+    assert result.success is False
+    assert (
+        result.error
+        == "Blocked: untrusted Toolkit execution requires an isolated runtime"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("environment", ["production", " StAgInG "])
+async def test_deployed_environments_reject_inprocess(
+    environment, monkeypatch, execution_boundary
+):
+    """设置环境并观测执行入口 / Set the environment and observe dispatch without replacing policy."""
+    monkeypatch.setattr(settings, "APP_ENV", environment)
+    definition = _make_definition(POLICY_TOOLKIT)
+    result = await ToolkitExecutor(sandbox_mode="inprocess").execute(
+        definition, "release-mode", {}
+    )
+
+    spawn, load = execution_boundary
+    assert (spawn.await_count, load.call_count) == (0, 0)
+    assert result.success is False
+    assert (
+        result.error == "In-process Toolkit execution is disabled outside development"
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mode", "configured_mode"),
+    [
+        pytest.param("unknown", "subprocess", id="explicit-unknown"),
+        pytest.param("", "subprocess", id="explicit-empty"),
+        pytest.param(None, "unknown", id="configured-unknown"),
+    ],
+)
+async def test_invalid_sandbox_mode_is_rejected(
+    mode, configured_mode, monkeypatch, execution_boundary
+):
+    """固定配置并观测执行入口 / Set the configured default and observe dispatch without replacing policy."""
+    monkeypatch.setattr(toolkit_executor, "_SANDBOX_MODE", configured_mode)
+    definition = _make_definition(POLICY_TOOLKIT)
+    result = await ToolkitExecutor(sandbox_mode=mode).execute(
+        definition, "bad-mode", {}
+    )
+
+    spawn, load = execution_boundary
+    assert (spawn.await_count, load.call_count) == (0, 0)
+    assert result.success is False
+    assert result.error == "Unsupported Toolkit execution mode"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["subprocess", "inprocess"])
+async def test_trusted_toolkit_still_checks_blocked_imports(mode, execution_boundary):
+    """拦截执行并用静态输入验证扫描 / Guard dispatch while the real scanner evaluates an inert import."""
+    definition = _make_definition("import os\n" + POLICY_TOOLKIT)
+    result = await ToolkitExecutor(sandbox_mode=mode).execute(definition, "scan", {})
+
+    spawn, load = execution_boundary
+    assert (spawn.await_count, load.call_count) == (0, 0)
+    assert result.success is False
+    assert result.error == "Toolkit blocked: Blocked import 'os' at line 1"
+
+
+@pytest.mark.parametrize(
+    ("kind", "source", "symbol"),
+    [
+        pytest.param(kind, source, symbol, id=f"{kind}-{symbol}")
+        for symbol in (
+            "__builtins__",
+            "__builtin__",
+            "__import__",
+            "globals",
+            "locals",
+            "vars",
+            "getattr",
+        )
+        for kind, source in (
+            ("name", f"marker = {symbol}"),
+            ("key", f"marker = {symbol!r}"),
+        )
+    ],
+)
+def test_scanner_reports_reflection_markers(kind, source, symbol):
+    assert scan_toolkit_security(source) == [
+        f"Blocked reflection {kind} '{symbol}' at line 1"
+    ]
 
 
 # --------------------------------------------------------------------------- #

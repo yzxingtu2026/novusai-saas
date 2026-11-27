@@ -1,0 +1,9 @@
+{
+  "plugin": {
+    "error": {
+      "version_mutation_unavailable": "Plugin version changes are unavailable because the required runtime files or dependency environment cannot be written or verified. The current plugin remains unchanged.",
+      "version_archive_failed": "The current plugin files could not be backed up. The plugin remains in its current state.",
+      "image_upgrade_unavailable": "The plugin image upgrade is incomplete. Review the release request and confirm its current phase before continuing."
+    }
+  }
+}

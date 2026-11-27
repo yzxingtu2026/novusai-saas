@@ -14,6 +14,7 @@ tags: ["weather", "widget", "example"]
 
 capabilities:
   - http:outbound
+  - config:read
 
 extensions:
   permissions:

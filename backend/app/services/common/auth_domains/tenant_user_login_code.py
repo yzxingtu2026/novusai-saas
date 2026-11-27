@@ -6,10 +6,11 @@ import secrets
 import string
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import and_, select
+from sqlalchemy import func, select
 
 from app.core.i18n import _
 from app.core.logging import LogManager
+from app.core.security import normalize_positive_subject_id
 from app.exceptions import (
     AuthenticationException,
     BusinessException,
@@ -166,6 +167,9 @@ class TenantUserLoginCodeDomain:
                 raise ValidationException(message=_("auth.login_code_phone_required"))
             raise BusinessException(message=_("auth.login_code_sms_not_enabled"))
 
+        if channel != "email":
+            raise BusinessException(message=_("auth.login_code_channel_invalid"))
+
         await self.maybe_verify_code_login_captcha(
             tenant_id=tenant_id,
             identifier=identifier or "",
@@ -180,39 +184,33 @@ class TenantUserLoginCodeDomain:
             identifier=identifier or "",
             tenant_id=tenant_id,
         )
-        if await self._service._cache_get(rate_key):
+        if not await self._service._cache_set_if_absent(
+            rate_key, True, ttl=self._service.LOGIN_CODE_RATE_LIMIT_TTL
+        ):
             raise BusinessException(message=_("auth.reset_rate_limited"))
 
-        if channel != "email":
-            raise BusinessException(message=_("auth.login_code_channel_invalid"))
-
         result = await self._service.db.execute(
-            select(TenantUser).where(
-                and_(
-                    TenantUser.tenant_id == tenant_id,
-                    TenantUser.email == identifier,
-                    TenantUser.is_deleted.is_(False),
-                )
+            select(TenantUser)
+            .where(
+                TenantUser.tenant_id == tenant_id,
+                func.lower(TenantUser.email) == identifier,
+                TenantUser.is_deleted.is_(False),
             )
+            .limit(2)
         )
-        user = result.scalar_one_or_none()
-
-        await self._service._cache_set(
-            rate_key,
-            True,
-            ttl=self._service.LOGIN_CODE_RATE_LIMIT_TTL,
-        )
-        if user is None:
+        users = result.scalars().all()
+        if len(users) != 1:
             self._service._log_auth_warning(
                 "tenant_user.login_code.send.skipped",
                 identifier=self._service._mask_identifier(identifier),
                 tenant_id=tenant_id,
                 tenant_code=tenant_code,
                 client_ip=client_ip,
-                reason="user_not_found",
+                reason="ambiguous_email" if users else "user_not_found",
             )
             return {"message": _("auth.login_code_sent")}
 
+        user = users[0]
         code = "".join(secrets.choice(string.digits) for _ in range(6))
         code_key = self.build_login_code_key(
             channel=channel,
@@ -304,17 +302,16 @@ class TenantUserLoginCodeDomain:
         if stored.get("code") != code:
             raise AuthenticationException(message=_("auth.login_code_invalid"))
 
-        user_id = stored.get("user_id")
-        if not user_id:
+        user_id = normalize_positive_subject_id(stored.get("user_id"))
+        if user_id is None:
             raise AuthenticationException(message=_("auth.login_code_invalid"))
 
         result = await self._service.db.execute(
             select(TenantUser).where(
-                and_(
-                    TenantUser.id == int(user_id),
-                    TenantUser.tenant_id == tenant_id,
-                    TenantUser.is_deleted.is_(False),
-                )
+                TenantUser.id == user_id,
+                TenantUser.tenant_id == tenant_id,
+                func.lower(TenantUser.email) == identifier,
+                TenantUser.is_deleted.is_(False),
             )
         )
         user = result.scalar_one_or_none()
@@ -326,8 +323,11 @@ class TenantUserLoginCodeDomain:
         if not user.is_active:
             raise AuthenticationException(message=_("auth.account_disabled"))
 
+        if not await self._service._cache_getdel_if_matches(
+            code_key, code=code, user_id=user_id
+        ):
+            raise AuthenticationException(message=_("auth.login_code_invalid"))
         await self._service._reset_login_failures(user.id, "tenant_user")
-        await self._service._cache_delete(code_key)
         return await self._service._issue_tenant_user_tokens(
             user,
             client_ip=client_ip,

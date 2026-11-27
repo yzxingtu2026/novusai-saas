@@ -14,9 +14,9 @@ def _tool(name: str) -> ToolDefinition:
     return ToolDefinition(name=name, description=name)
 
 
-def test_build_model_request_overrides_fast_text_turn_uses_low_reasoning() -> None:
+def test_build_model_request_overrides_fast_text_turn_defaults_to_low() -> None:
     assert build_model_request_overrides(execution_path="fast", tools=None) == {
-        "_runtime_reasoning_effort_override": "low",
+        "_runtime_reasoning_effort_default": "low",
     }
 
 

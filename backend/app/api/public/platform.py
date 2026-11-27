@@ -57,7 +57,7 @@ async def get_platform_public_config(db: DbSession):
             site_favicon=configs.get("site_favicon"),
             site_copyright=configs.get("site_copyright"),
             site_icp=configs.get("site_icp"),
-            tenant_domain_suffix=configs.get("tenant_domain_suffix"),
+            tenant_domain_suffix=settings.TENANT_DOMAIN_SUFFIX,
             domain_verification_prefix=configs.get("domain_verification_prefix"),
             maintenance_mode=configs.get("maintenance_mode"),
             maintenance_message=configs.get("maintenance_message"),

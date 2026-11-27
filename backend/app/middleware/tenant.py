@@ -6,20 +6,25 @@ Resolves tenant info from request Host header, supports / 根据 Host 头解析�
 2. Custom domain mode / 自定义域名模式: custom.domain.com -> tenant_domains table
 """
 
-from urllib.parse import urlparse
-
-from sqlalchemy import select
+from sqlalchemy import func, select
+from sqlalchemy.exc import MultipleResultsFound
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
+from starlette.datastructures import Headers, State
 from starlette.requests import Request
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from app.core.config import settings
 from app.core.database import async_session_factory
-from app.core.logging import get_logger
+from app.core.domains import (
+    normalize_configured_host,
+    normalize_host_header,
+    normalize_tenant_suffix,
+    parse_http_origin,
+)
+from app.core.i18n import _
+from app.core.response import error
 from app.models import Tenant, TenantDomain
-
-logger = get_logger(__name__)
 
 
 class TenantContext:
@@ -36,11 +41,13 @@ class TenantContext:
         tenant_code: str | None = None,
         tenant: Tenant | None = None,
         domain_type: str = "unknown",  # subdomain, custom, unknown / 域名类型：子域名、自定义、未知
+        origin_host: str | None = None,
     ):
         self.tenant_id = tenant_id
         self.tenant_code = tenant_code
         self.tenant = tenant
         self.domain_type = domain_type
+        self.origin_host = origin_host
 
     @property
     def is_resolved(self) -> bool:
@@ -49,6 +56,20 @@ class TenantContext:
 
     def __repr__(self) -> str:
         return f"<TenantContext(tenant_id={self.tenant_id}, code={self.tenant_code}, type={self.domain_type})>"
+
+
+def is_development_loopback(host: str) -> bool:
+    return settings.APP_ENV.strip().lower() == "development" and host in {
+        "localhost",
+        "127.0.0.1",
+        "::1",
+    }
+
+
+def is_platform_host(host: str) -> bool:
+    return bool(host) and host in {
+        normalize_configured_host(item) for item in settings.platform_domains_list
+    }
 
 
 def parse_tenant_from_host(host: str) -> tuple[str | None, str]:
@@ -64,29 +85,32 @@ def parse_tenant_from_host(host: str) -> tuple[str | None, str]:
         - Custom domain / 自定义域名: (None, "custom")
         - Unresolvable / 无法解析: (None, "unknown")
     """
-    if not host:
+    host = normalize_host_header(host)
+    if not host or is_platform_host(host) or is_development_loopback(host):
         return None, "unknown"
 
-    # Remove port number / 移除端口号
-    host = host.split(":")[0].lower()
-
     # Check if subdomain mode / 检查是否是子域名模式
-    suffix = settings.TENANT_DOMAIN_SUFFIX.lower()
-    if host.endswith(suffix):
+    configured_suffix = settings.TENANT_DOMAIN_SUFFIX.strip()
+    suffix = normalize_tenant_suffix(configured_suffix) if configured_suffix else ""
+    if suffix and host.endswith(suffix):
         # Extract subdomain part / 提取子域名部分
         subdomain = host[: -len(suffix)]
         if subdomain and "." not in subdomain:
             # Valid tenant subdomain (no dots) / 合法的企业子域名
             return subdomain, "subdomain"
 
+    # Development mode: support {tenant_code}.localhost pattern / 开发模式：支持 {tenant_code}.localhost 格式
+    if (
+        host.endswith(".localhost")
+        and settings.APP_ENV.strip().lower() == "development"
+    ):
+        subdomain = host[: -len(".localhost")]
+        if subdomain and "." not in subdomain:
+            return subdomain, "subdomain"
+
     # Possibly custom domain / 可能是自定义域名
     # Exclude platform main domain / 排除平台主域名
     if host == suffix.lstrip("."):
-        return None, "unknown"
-
-    # Exclude configured platform admin domains to avoid unnecessary DB queries / 排除管理端域名
-    platform_domains = [d.lower() for d in settings.platform_domains_list]
-    if host in platform_domains:
         return None, "unknown"
 
     return None, "custom"
@@ -110,8 +134,10 @@ class TenantMiddleware:
         "/api/user/",
         "/api/public/tenant",
         "/api/public/captcha",
+        "/api/public/plugins/",
         "/plugin-public-assets/tenant/",
         "/plugin-public-assets/user/",
+        "/plugin-assets/",
     )
 
     @staticmethod
@@ -124,96 +150,78 @@ class TenantMiddleware:
             await self.app(scope, receive, send)
             return
 
-        # Get request path / 获取请求路径
-        path = scope.get("path", "")
-
-        # Non-tenant paths skip domain resolution, set empty context to avoid downstream errors / 非企业路径跳过解析
-        if not self._needs_tenant_resolution(path):
-            if "state" not in scope:
-                scope["state"] = {}
-            scope["state"]["tenant_ctx"] = TenantContext()
-            await self.app(scope, receive, send)
-            return
-
-        # Get Host header / 获取 Host 头
-        headers = dict(scope.get("headers", []))
-        host = headers.get(b"host", b"").decode("utf-8", errors="ignore")
-
-        # Parse tenant from Host (primary) / 优先用 Host 头解析企业
-        tenant_code, domain_type = parse_tenant_from_host(host)
-
-        # 预解析 Origin（用于跨域兜底） / Pre-parse Origin for cross-origin fallback
-        # 跨域场景：租户前端（如 https://t3tetj7r5.nvuai.online）调用集中式 API
-        # 域名（如 https://apidemo.nvuai.cc），此时 Host 头无法识别租户身份，
-        # 必须从 Origin 头还原真实租户。
-        # Cross-origin scenario: tenant frontend on https://t3tetj7r5.nvuai.online
-        # calls a centralised API domain like https://apidemo.nvuai.cc, in which
-        # case the Host header cannot identify the tenant and we must recover the
-        # real tenant from the Origin header.
-        origin_host: str | None = None
-        origin_code: str | None = None
-        origin_type: str = "unknown"
-        origin_raw = headers.get(b"origin", b"").decode("utf-8", errors="ignore")
-        if origin_raw:
-            try:
-                parsed = urlparse(origin_raw)
-                origin_host = (parsed.hostname or "").lower() or None
-            except ValueError:
-                origin_host = None
-            if origin_host and origin_host != host.split(":")[0].lower():
-                origin_code, origin_type = parse_tenant_from_host(origin_host)
-            else:
-                # Origin 与 Host 同域则无回退价值 / Same-origin: no fallback value
-                origin_host = None
-
-        # 创建企业上下文（占位） / Create tenant context placeholder
-        tenant_ctx = TenantContext(
-            tenant_code=tenant_code,
-            domain_type=domain_type,
-        )
-
-        # 两阶段查询：Host 优先 → Origin 兜底重试。
-        # Two-stage lookup: Host first, fallback to Origin when Host fails.
-        # 这样能同时覆盖：
-        # 1. 正常 subdomain / custom 域名（一阶段命中）
-        # 2. 集中式 API 跨域调用（Host 是 API 代理域名、不在 DB 中），
-        #    无论 Host 被解析为 subdomain / custom / unknown 都能由 Origin 兜底
-        async with async_session_factory() as db:
-            tenant = None
-            # Stage 1: Host
-            if tenant_code or domain_type == "custom":
-                tenant = await self._resolve_tenant(
-                    db, tenant_code, host, domain_type
+        tenant_ctx = TenantContext()
+        if self._needs_tenant_resolution(scope.get("path", "")):
+            headers = Headers(scope=scope)
+            host_header = headers.get("host", "")
+            host = normalize_host_header(host_header)
+            origin_header = headers.get("origin")
+            origin = parse_http_origin(origin_header) if origin_header else None
+            if not host or (origin_header and origin is None):
+                if scope["type"] == "websocket":
+                    await send({"type": "websocket.close", "code": 1008})
+                    return
+                response = error(
+                    message=_("common.bad_request"), code=4000, status_code=400
                 )
-            # Stage 2: Origin fallback when Host lookup failed
-            # 当 Host 查不到租户、且 Origin 能解析出候选租户时重试。
-            if (
-                tenant is None
-                and origin_host
-                and (origin_code or origin_type == "custom")
-            ):
-                tenant = await self._resolve_tenant(
-                    db, origin_code, origin_host, origin_type
-                )
-                if tenant is not None:
-                    tenant_code, domain_type = origin_code, origin_type
+                response.headers["cache-control"] = "no-store"
+                await response(scope, receive, send)
+                return
+            tenant_ctx = await self.resolve_request_context(
+                host, host_header, origin.host if origin else None
+            )
 
-            if tenant is not None:
-                tenant_ctx.tenant = tenant
-                tenant_ctx.tenant_id = tenant.id
-                tenant_ctx.tenant_code = tenant.code
-                tenant_ctx.domain_type = domain_type
-
-        # Store tenant context in scope state / 将企业上下文存储到 scope state
-        # FastAPI maps this to request.state / FastAPI 会将其映射到 request.state
-        if "state" not in scope:
-            scope["state"] = {}
-        scope["state"]["tenant_ctx"] = tenant_ctx
-
+        state = scope.setdefault("state", {})
+        if isinstance(state, State):
+            state.tenant_ctx = tenant_ctx
+        else:
+            state["tenant_ctx"] = tenant_ctx
         await self.app(scope, receive, send)
 
+    @classmethod
+    async def resolve_request_context(
+        cls, host: str, host_header: str, origin_host: str | None
+    ) -> TenantContext:
+        tenant_code, domain_type = parse_tenant_from_host(host_header)
+        context = TenantContext(tenant_code=tenant_code, domain_type=domain_type)
+        remote_origin = (
+            origin_host
+            if origin_host
+            and origin_host != host
+            and not is_platform_host(origin_host)
+            and not is_development_loopback(origin_host)
+            else None
+        )
+        central_host = is_platform_host(host) or is_development_loopback(host)
+        if domain_type == "unknown" and not (central_host and remote_origin):
+            return context
+        async with async_session_factory() as db:
+            tenant = await cls._resolve_tenant(db, tenant_code, host, domain_type)
+            if remote_origin and (tenant is not None or central_host):
+                authority = (
+                    f"[{remote_origin}]" if ":" in remote_origin else remote_origin
+                )
+                origin_code, origin_type = parse_tenant_from_host(authority)
+                origin_tenant = await cls._resolve_tenant(
+                    db,
+                    origin_code,
+                    remote_origin,
+                    origin_type,
+                )
+                if not origin_tenant or (tenant and tenant.id != origin_tenant.id):
+                    return context
+                if tenant is None:
+                    tenant = origin_tenant
+                    context.domain_type = origin_type
+            if tenant is not None:
+                context.tenant = tenant
+                context.tenant_id = tenant.id
+                context.tenant_code = tenant.code
+                context.origin_host = origin_host
+        return context
+
+    @staticmethod
     async def _resolve_tenant(
-        self,
         db: AsyncSession,
         tenant_code: str | None,
         host: str,
@@ -244,19 +252,20 @@ class TenantMiddleware:
 
         elif domain_type == "custom":
             # Custom domain mode: query tenant_domains table / 自定义域名模式
-            # Remove port number / 移除端口号
-            domain = host.split(":")[0].lower()
 
             result = await db.execute(
                 select(TenantDomain)
                 .options(selectinload(TenantDomain.tenant))
                 .where(
-                    TenantDomain.domain == domain,
+                    func.lower(func.rtrim(TenantDomain.domain, ".")) == host,
                     TenantDomain.is_verified.is_(True),
                     TenantDomain.is_deleted.is_(False),
                 )
             )
-            tenant_domain = result.scalar_one_or_none()
+            try:
+                tenant_domain = result.scalar_one_or_none()
+            except MultipleResultsFound:
+                return None
 
             if (
                 tenant_domain
@@ -296,6 +305,49 @@ def get_current_tenant(request: Request) -> Tenant | None:
     if ctx and ctx.is_resolved:
         return ctx.tenant
     return None
+
+
+def request_matches_authenticated_tenant(request: Request, tenant_id: int) -> bool:
+    """绑定已解析域名与认证租户 / Bind the resolved domain to the authenticated tenant."""
+    origin_header = request.headers.get("origin")
+    origin = parse_http_origin(origin_header) if origin_header else None
+    if origin_header and origin is None:
+        return False
+    host = normalize_host_header(request.headers.get("host", ""))
+    return tenant_context_matches(
+        get_tenant_context(request), tenant_id, host, origin.host if origin else None
+    )
+
+
+def tenant_context_matches(
+    context: TenantContext | None, tenant_id: int, host: str, origin_host: str | None
+) -> bool:
+    """HTTP 与套接字共用租户边界 / Share the tenant boundary across HTTP and sockets."""
+    if (
+        not host
+        or isinstance(tenant_id, bool)
+        or not isinstance(tenant_id, int)
+        or tenant_id < 1
+    ):
+        return False
+    if context and context.is_resolved:
+        return context.tenant_id == tenant_id and context.origin_host == origin_host
+    # 中心 API 保留桌面端和服务端调用 / Preserve native and server clients on central API hosts.
+    return (is_platform_host(host) or is_development_loopback(host)) and (
+        origin_host is None
+        or is_platform_host(origin_host)
+        or is_development_loopback(origin_host)
+    )
+
+
+__all__ = [
+    "TenantMiddleware",
+    "TenantContext",
+    "get_tenant_context",
+    "get_current_tenant",
+    "parse_tenant_from_host",
+    "request_matches_authenticated_tenant",
+]
 
 
 __all__ = [

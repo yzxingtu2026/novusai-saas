@@ -5,12 +5,16 @@
 Defines domain management request and response data structures.
 """
 
+import ipaddress
 from datetime import datetime
+from typing import Literal, Self
 
-from pydantic import Field, field_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.core.base_schema import BaseSchema
+from app.core.domains import normalize_hostname, normalize_tenant_suffix
 from app.core.i18n import _
+from app.core.managed_https import get_managed_https
 
 
 class TenantDomainSimpleResponse(BaseSchema):
@@ -32,6 +36,16 @@ class TenantDomainVerificationInfo(BaseSchema):
     dns_value: str = Field(..., description="DNS 记录值")
 
 
+class ManagedHttpsResponse(BaseSchema):
+    """Configured shared public certificate, distinct from per-domain issuance."""
+
+    configured: bool = False
+    covered: bool = False
+    status: Literal["active", "expiring", "expired", "unconfigured"] = "unconfigured"
+    expires_at: datetime | None = None
+    auto_renew: bool = False
+
+
 class TenantDomainResponse(BaseSchema):
     """企业域名响应 / Tenant domain response"""
 
@@ -44,6 +58,7 @@ class TenantDomainResponse(BaseSchema):
     is_primary: bool = Field(..., description="是否主域名")
     ssl_status: str = Field(..., description="SSL 状态")
     ssl_expires_at: datetime | None = Field(None, description="SSL 到期时间")
+    managed_https: ManagedHttpsResponse | None = None
     verification_token: str | None = Field(None, description="验证 Token")
     verification_info: TenantDomainVerificationInfo | None = Field(
         None, description="DNS 验证记录信息"
@@ -52,6 +67,16 @@ class TenantDomainResponse(BaseSchema):
     cname_target: str | None = Field(None, description="CNAME 解析目标")
     created_at: datetime = Field(..., description="创建时间")
     updated_at: datetime = Field(..., description="更新时间")
+
+    @model_validator(mode="after")
+    def enrich_deployment_metadata(self) -> Self:
+        if self.domain_type == "default":
+            self.managed_https = ManagedHttpsResponse(**get_managed_https(self.domain))
+        else:
+            self.managed_https = None
+        if self.remark == "tenant_domain.default_domain_remark":
+            self.remark = _("tenant_domain.default_domain_remark")
+        return self
 
 
 class DevHostsRuntimeInfo(BaseSchema):
@@ -124,22 +149,28 @@ class TenantDomainCreateRequest(BaseSchema):
     @classmethod
     def validate_domain(cls, v: str) -> str:
         """验证域名格式 / Validate domain format"""
-        import re
-
-        v = v.lower().strip()
-
-        # 基本域名格式验证 / Basic domain format
-        pattern = r"^([a-z0-9]([a-z0-9-]*[a-z0-9])?\.)+[a-z]{2,}$"
-        if not re.match(pattern, v):
+        try:
+            v = normalize_hostname(v.strip())
+        except ValueError as exc:
+            raise ValueError(_("tenant_domain.invalid_format")) from exc
+        try:
+            ipaddress.ip_address(v)
+        except ValueError:
+            if "." not in v:
+                raise ValueError(_("tenant_domain.invalid_format"))
+        else:
             raise ValueError(_("tenant_domain.invalid_format"))
 
         # 禁止使用平台域名 / Forbid platform-reserved suffix
         from app.core.config import settings
 
-        suffix = settings.TENANT_DOMAIN_SUFFIX.lstrip(".")
-        if v.endswith(suffix):
+        suffix = settings.TENANT_DOMAIN_SUFFIX
+        suffix = normalize_tenant_suffix(suffix) if suffix else ""
+        if v in settings.platform_domains_list:
+            raise ValueError(_("tenant_domain.platform_suffix_forbidden", suffix=v))
+        if suffix and (v == suffix[1:] or v.endswith(suffix)):
             raise ValueError(
-                _("tenant_domain.platform_suffix_forbidden", suffix=suffix)
+                _("tenant_domain.platform_suffix_forbidden", suffix=suffix[1:])
             )
 
         return v

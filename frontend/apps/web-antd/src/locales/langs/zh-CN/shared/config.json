@@ -1,5 +1,6 @@
 {
   "page": {
+    "runtime_readonly": "当前生效的部署配置值。需修改部署配置并重启服务后生效。",
     "title": "系统配置",
     "unsaved_title": "存在未保存的修改",
     "unsaved_content": "当前配置尚未保存，确定要离开吗？",

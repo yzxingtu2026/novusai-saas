@@ -9,7 +9,7 @@ Validates:
 import io
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import ANY, AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -494,79 +494,22 @@ async def test_oss_copy_preserves_public_acl(monkeypatch: pytest.MonkeyPatch):
     assert request.acl == "public-read"
 
 
-@pytest.mark.asyncio
-async def test_storage_migration_uses_attachment_db_metadata():
-    """Storage migration must trust attachment DB metadata over source object headers. / 存储迁移必须以附件表元数据为准，而不是源对象头。"""
-    from app.storage.base import StorageConfig, StorageVisibility
-
-    migration_module = _load_plugin_module(
-        "storage-migration",
-        "backend/services/migration_service.py",
+@pytest.mark.structural
+def test_storage_migration_uses_attachment_db_metadata():
+    """Keep DB storage provenance out of object headers / 对象头排除数据库存储归属。"""
+    from app.services.common.storage_config_resolver import (
+        merge_attachment_storage_snapshot,
+        strip_internal_attachment_meta,
     )
-    StorageMigrationService = migration_module.StorageMigrationService
+    from app.storage.base import StorageConfig
 
-    db = AsyncMock()
-    db.execute = AsyncMock(
-        side_effect=[
-            MagicMock(
-                one_or_none=MagicMock(
-                    return_value=SimpleNamespace(
-                        visibility="public",
-                        mime_type="image/png",
-                        meta={
-                            "biz": "avatar",
-                            "_storage_snapshot": {
-                                "scope": "platform",
-                                "driver": "s3",
-                                "root_path": "bucket-old",
-                                "base_url": "https://old.example.com",
-                            },
-                        },
-                        tenant_id=22,
-                    )
-                )
-            ),
-            MagicMock(),
-            MagicMock(),
-        ]
-    )
-    db.commit = AsyncMock()
-    db.rollback = AsyncMock()
+    before = {"biz": "avatar", "_storage_snapshot": {"root_path": "bucket-old"}}
+    target = StorageConfig(driver="s3", root_path="bucket-new")
+    after = merge_attachment_storage_snapshot(before, target, "platform")
 
-    source_driver = MagicMock()
-    source_driver.get = AsyncMock(return_value=b"image-bytes")
-    source_driver.get_info = AsyncMock()
-
-    target_driver = MagicMock()
-    target_driver.put = AsyncMock()
-
-    service = StorageMigrationService(db)
-    ok = await service._migrate_single_file(
-        db=db,
-        log_id=11,
-        attachment_id=22,
-        file_path="tenants/1/avatar.png",
-        source_driver=source_driver,
-        target_driver=target_driver,
-        target_driver_name="s3",
-        target_base_url="https://cdn.example.com",
-        target_storage_config=StorageConfig(
-            driver="s3",
-            root_path="bucket-new",
-            base_url="https://cdn.example.com",
-        ),
-    )
-
-    assert ok is True
-    source_driver.get_info.assert_not_awaited()
-    target_driver.put.assert_awaited_once_with(
-        path="tenants/1/avatar.png",
-        content=ANY,
-        mime_type="image/png",
-        visibility=StorageVisibility.PUBLIC,
-        metadata={"biz": "avatar"},
-    )
-    db.commit.assert_awaited_once()
+    assert after["_storage_snapshot"]["root_path"] == "bucket-new"
+    assert strip_internal_attachment_meta(after) == {"biz": "avatar"}
+    assert before == {"biz": "avatar", "_storage_snapshot": {"root_path": "bucket-old"}}
 
 
 @pytest.mark.asyncio

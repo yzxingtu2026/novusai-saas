@@ -7,7 +7,10 @@ orchestrates concurrency control, quota checks, and hook triggers.
 """
 
 import time
+from datetime import timedelta
+from uuid import uuid4
 
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.ai.agent_quota_config import AgentQuotaConfig
@@ -18,11 +21,16 @@ from app.ai.agent_quota_exceptions import (
 from app.ai.agent_quota_manager import AgentQuotaManager
 from app.ai.tools.sandbox import SandboxConfig
 from app.configs.service import PLATFORM_TENANT_ID
+from app.core.base_model import utc_now
 from app.core.i18n import _
 from app.core.logging import LogManager
 from app.core.response import build_public_error_text
 from app.enums.agent import AgentStatusEnum
-from app.exceptions import BusinessException, NotFoundException
+from app.exceptions import (
+    BusinessException,
+    NotFoundException,
+    ServiceUnavailableException,
+)
 from app.models.ai.agent import Agent
 from app.repositories.ai.agent_repository import AgentRepository
 
@@ -314,14 +322,20 @@ class ExecutionDispatcher:
 
         # 3. Create BatchRun record via Repository / 通过 Repository 创建 BatchRun 记录
         batch_repo = BatchRunRepository(self.db, request.tenant_id)
+        celery_task_id = str(uuid4())
+        agent_id = agent.id
+        from app.tasks.agent_batch import publish_batch_run
+
         input_snapshot = [
             {"item_id": item.item_id, "input_variables": item.input_variables}
             for item in items
         ]
         batch_run = await batch_repo.create(
             {
-                "agent_id": agent.id,
+                "agent_id": agent_id,
                 "status": BatchRunStatusEnum.PENDING.value,
+                "celery_task_id": celery_task_id,
+                "dispatch_recovery_due_at": utc_now() + timedelta(minutes=2),
                 "total_items": len(items),
                 "completed_items": 0,
                 "failed_items": 0,
@@ -332,33 +346,59 @@ class ExecutionDispatcher:
         )
 
         # 4. Submit Celery async task / 提交 Celery 异步任务
-        from app.tasks.agent_batch import execute_batch_run
-
-        celery_result = execute_batch_run.delay(
-            batch_run_id=batch_run.id,
-            tenant_id=request.tenant_id,
-        )
-
-        # Save celery_task_id via Repository / 通过 Repository 保存 celery_task_id
-        await batch_repo.update(
-            batch_run.id,
-            {
-                "celery_task_id": celery_result.id,
-            },
-        )
+        batch_run_id = batch_run.id
         await self.db.commit()
+        try:
+            publish_batch_run(batch_run_id, request.tenant_id, celery_task_id)
+        except Exception as exc:
+            logger.warning(
+                "Batch publication could not be confirmed: batch_run_id={} celery_task={} error_type={}",
+                batch_run_id,
+                celery_task_id,
+                type(exc).__name__,
+            )
+            # A broker reply can be lost after enqueue. Serialize with the worker's
+            # pending-only claim so a late delivery cannot start a rejected batch.
+            await self.db.refresh(
+                batch_run, ["status", "celery_task_id"], with_for_update=True
+            )
+            same_task = batch_run.celery_task_id == celery_task_id
+            pending = batch_run.status == BatchRunStatusEnum.PENDING.value
+            if same_task and pending:
+                batch_run.status = BatchRunStatusEnum.FAILED.value
+                batch_run.completed_at = utc_now()
+                batch_run.dispatch_recovery_due_at = None
+            await self.db.commit()
+            if not same_task or pending:
+                raise ServiceUnavailableException(
+                    data={"batch_run_id": batch_run_id}
+                ) from exc
+        else:
+            try:
+                await batch_repo.confirm_dispatch(batch_run_id, celery_task_id)
+                await self.db.commit()
+            except SQLAlchemyError as exc:
+                # Redis has already confirmed the publish. The due row can be
+                # recovered if this follow-up transaction could not be saved.
+                await self.db.rollback()
+                logger.warning(
+                    "Batch dispatch confirmation could not be saved: "
+                    "batch_run_id={} error_type={}",
+                    batch_run_id,
+                    type(exc).__name__,
+                )
 
         logger.info(
             "Batch submitted: batch_run_id={} agent={} items={} celery_task={}",
-            batch_run.id,
-            agent.id,
+            batch_run_id,
+            agent_id,
             len(items),
-            celery_result.id,
+            celery_task_id,
         )
 
         # 5. Return immediately (non-blocking) / 立即返回（非阻塞）
         return BatchResult(
-            batch_run_id=batch_run.id,
+            batch_run_id=batch_run_id,
             items=items,
             total=len(items),
             succeeded=0,

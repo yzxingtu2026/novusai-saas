@@ -30,7 +30,9 @@ class TenantDomain(BaseModel):
         DeletionDep(
             "DomainSslCertificate",
             "domain_id",
-            DeletionStrategy.CASCADE_DELETE,
+            # Soft deletion retains revoked certificate history. Hard deletion
+            # still uses the database's ON DELETE CASCADE constraint.
+            DeletionStrategy.CASCADE_SOFT,
             label_field="id",
             i18n_key="domain_ssl_certificate",
         ),
@@ -109,7 +111,7 @@ class TenantDomain(BaseModel):
     # SSL 证书状态 / SSL status
     ssl_status: Mapped[str] = mapped_column(
         String(20),
-        default=DomainSslStatus.PENDING,
+        default=DomainSslStatus.PENDING.value,
         comment="SSL 状态: none/pending/provisioning/active/failed/expired / SSL state",
     )
 
@@ -164,9 +166,15 @@ class TenantDomain(BaseModel):
     def domain_type(self) -> str:
         """域名类型：default（平台默认）或 custom（自定义） / Domain type: default or custom."""
         from app.core.config import settings
+        from app.core.domains import normalize_hostname, normalize_tenant_suffix
 
-        suffix = settings.TENANT_DOMAIN_SUFFIX.lstrip(".")
-        if self.domain and self.domain.endswith(suffix):
+        suffix = settings.TENANT_DOMAIN_SUFFIX
+        if not suffix or not self.domain:
+            return DomainType.CUSTOM
+        suffix = normalize_tenant_suffix(suffix)
+        host = normalize_hostname(self.domain)
+        label = host.removesuffix(suffix)
+        if host.endswith(suffix) and label and "." not in label:
             return DomainType.DEFAULT
         return DomainType.CUSTOM
 
@@ -182,9 +190,9 @@ class TenantDomain(BaseModel):
 
         需要从关联的企业获取子域名。
         """
-        if self.tenant:
-            from app.core.config import settings
+        from app.core.config import settings
 
+        if self.tenant and settings.TENANT_DOMAIN_SUFFIX:
             return f"{self.tenant.code}{settings.TENANT_DOMAIN_SUFFIX}"
         return None
 

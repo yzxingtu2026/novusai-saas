@@ -77,7 +77,7 @@ async def access_attachment(
             status_code=404,
         )
 
-    return RedirectResponse(url=url)
+    return service.apply_business_cache_policy(attachment, RedirectResponse(url=url))
 
 
 @router.get("/{attachment_id}/image", summary="图片处理")
@@ -161,7 +161,9 @@ async def get_processed_image(
         url = await download_service.get_redirect_url(
             attachment, expires=3600, preview=True
         )
-        return RedirectResponse(url=url)
+        return download_service.apply_business_cache_policy(
+            attachment, RedirectResponse(url=url)
+        )
 
     params = await image_service.parse_params(
         width=w,
@@ -177,18 +179,22 @@ async def get_processed_image(
         url = await download_service.get_redirect_url(
             attachment, expires=3600, preview=True
         )
-        return RedirectResponse(url=url)
+        return download_service.apply_business_cache_policy(
+            attachment, RedirectResponse(url=url)
+        )
 
     # 通过服务层获取处理后的图片 / Get processed image via service layer
     result = await image_service.get_processed_image_response(attachment, params)
 
     # 如果返回 URL，重定向（云存储原生处理） / If URL returned, redirect (cloud storage native processing)
     if isinstance(result, str):
-        return RedirectResponse(url=result)
+        return download_service.apply_business_cache_policy(
+            attachment, RedirectResponse(url=result)
+        )
 
     # 返回处理后的图片数据（本地处理） / Return processed image data (local processing)
     data, mime_type = result
-    return Response(
+    response = Response(
         content=data,
         media_type=mime_type,
         headers={
@@ -196,6 +202,7 @@ async def get_processed_image(
             "Content-Disposition": "inline",
         },
     )
+    return download_service.apply_business_cache_policy(attachment, response)
 
 
 __all__ = ["router"]

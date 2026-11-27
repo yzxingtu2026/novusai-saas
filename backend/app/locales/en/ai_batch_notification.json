@@ -1,0 +1,17 @@
+{
+  "ai": {
+    "batch_notification": {
+      "partial_failed": {
+        "title": "Batch partially failed",
+        "body": "Processed {completed} items: {succeeded} succeeded, {failed} failed. First error: {error}"
+      }
+    }
+  },
+  "enum": {
+    "agent": {
+      "batch_run_status": {
+        "unknown": "Outcome pending confirmation"
+      }
+    }
+  }
+}

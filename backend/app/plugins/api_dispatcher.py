@@ -22,6 +22,7 @@ import re
 from collections.abc import Callable
 from functools import lru_cache
 from typing import TYPE_CHECKING, Any
+from urllib.parse import unquote
 
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse
@@ -38,11 +39,14 @@ from app.core.response import (
     resolve_public_error_message,
     success,
 )
+from app.core.scope import ScopeChecker
 from app.core.security import (
     TOKEN_SCOPE_ADMIN,
     TOKEN_SCOPE_TENANT_ADMIN,
+    normalize_positive_subject_id,
 )
 from app.exceptions.base import AppException
+from app.middleware.tenant import get_tenant_context
 from app.middleware.trace import normalize_trace_id, trace_id_var
 from app.plugins.module_loader import load_plugin_handler
 from app.plugins.runtime_gate import evaluate_plugin_runtime_gate
@@ -92,10 +96,16 @@ def _default_plugin_status_code(code: int) -> int:
 
 
 def _normalize_plugin_error_code(code: Any, status_code: int) -> int:
-    try:
-        return int(code)
-    except (TypeError, ValueError):
-        return _default_plugin_error_code(status_code)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    if isinstance(code, str):
+        value = code.strip()
+        if value.isascii() and value.isdecimal():
+            try:
+                return int(value)
+            except ValueError:
+                pass
+    return _default_plugin_error_code(status_code)
 
 
 def _resolve_plugin_error_message(
@@ -166,6 +176,14 @@ async def _dispatch_plugin_api(
     allow_public_only: bool = False,
 ) -> JSONResponse:
     """Core plugin API dispatch logic (shared by admin/tenant) / 插件 API 核心分发逻辑（admin/tenant 共用）"""
+    if allow_public_only:
+        tenant_context = get_tenant_context(request)
+        tenant_id = (
+            tenant_context.tenant_id
+            if tenant_context is not None and tenant_context.is_resolved
+            else None
+        )
+
     gate = await evaluate_plugin_runtime_gate(
         db,
         plugin_name,
@@ -179,6 +197,13 @@ async def _dispatch_plugin_api(
             code=4040,
             status_code=404,
         )
+
+    if allow_public_only and tenant_id is None:
+        profile = gate.compatibility_profile or {}
+        if profile.get("tenant_runtime_scope") or not ScopeChecker.is_visible_to_admin(
+            gate.plugin_scope or ""
+        ):
+            return error(message="Tenant context required", code=4040, status_code=404)
 
     manifest_data = gate.manifest or {}
     granted_capabilities = gate.granted_capabilities or []
@@ -200,8 +225,8 @@ async def _dispatch_plugin_api(
 
     # Find matching route / 查找匹配的路由
     # Security rules / 安全规则：
-    # 1) When allow_public_only=True, only public_routes allowed, and route.auth must be none
-    #    / allow_public_only=True 时仅允许 public_routes，并且 route.auth 必须为 none
+    # 1) Anonymous routes need a public declaration without auth or RBAC
+    #    / 匿名路由须在 public_routes 中显式免鉴权且无 RBAC 要求
     # 2) Tenant side only matches tenant_routes + public_routes, no fallback to admin_routes
     #    / tenant 端只匹配 tenant_routes + public_routes，不回退到 admin_routes
     # 3) Admin side matches admin_routes + public_routes only, no implicit tenant fallback
@@ -213,15 +238,16 @@ async def _dispatch_plugin_api(
     if allow_public_only:
         candidate_routes = public_routes
     else:
-        request_path = str(request.url.path)
-        is_tenant_side = request_path.startswith("/tenant")
-        side = "tenant" if is_tenant_side else "admin"
+        side = "tenant" if user_role == TOKEN_SCOPE_TENANT_ADMIN else "admin"
         primary_routes = api_config.get(f"{side}_routes", [])
         candidate_routes = [*primary_routes, *public_routes]
 
     path_params: dict[str, str] = {}
     for route in candidate_routes:
-        if allow_public_only and route.get("auth", "required") != "none":
+        if allow_public_only and (
+            route.get("auth", "required") != "none"
+            or str(route.get("permission") or "").strip()
+        ):
             continue
         route_path = route.get("path", "").strip("/")
         route_method = route.get("method", "GET").upper()
@@ -512,10 +538,25 @@ def _match_route_path(
         # No parameters — exact match / 无参数时精确匹配
         return (route_pattern == actual_path, {})
 
-    m = _compile_route_regex(route_pattern).match(actual_path)
-    if m:
-        return (True, m.groupdict())
-    return (False, {})
+    match = _compile_route_regex(route_pattern).fullmatch(actual_path)
+    if match is None:
+        return (False, {})
+
+    params: dict[str, str] = {}
+    for name, value in match.groupdict().items():
+        try:
+            segment = unquote(value, errors="strict")
+        except UnicodeDecodeError:
+            return (False, {})
+        if (
+            segment in {"", ".", ".."}
+            or "/" in segment
+            or "\\" in segment
+            or any(ord(char) < 0x20 or ord(char) == 0x7F for char in segment)
+        ):
+            return (False, {})
+        params[name] = segment
+    return (True, params)
 
 
 def _get_plugin_loader():
@@ -570,19 +611,19 @@ async def _check_plugin_permission(
     Returns:
         True = allow / 允许, False = deny / 拒绝
     """
-    if not route_permission or not user_id:
+    user_id = normalize_positive_subject_id(user_id)
+    if not route_permission or user_id is None:
         return False
 
     # Parse permission_code:action / 解析 permission_code:action
-    parts = route_permission.split(":")
-    if len(parts) != 2:
+    perm_code, separator, action = route_permission.rpartition(":")
+    if not (perm_code and separator and action):
         logger.warning(
             "Invalid plugin permission format '{}' (expected 'code:action')",
             route_permission,
         )
         return False
 
-    perm_code, action = parts
     full_perm_code = f"plugin.{plugin_name}.{perm_code}"
 
     # Query plugin registered permission metadata, verify action is in declared list
@@ -617,6 +658,7 @@ async def _check_plugin_permission(
             result = await db.execute(
                 select(Admin).where(
                     Admin.id == user_id,
+                    Admin.is_active.is_(True),
                     Admin.is_deleted.is_(False),
                 )
             )
@@ -639,13 +681,18 @@ async def _check_plugin_permission(
 
             perm_service = PermissionService(db)
 
-            from app.models import TenantAdmin
+            from app.models import Tenant, TenantAdmin
 
             result = await db.execute(
-                select(TenantAdmin).where(
+                select(TenantAdmin)
+                .join(Tenant, Tenant.id == TenantAdmin.tenant_id)
+                .where(
                     TenantAdmin.id == user_id,
                     TenantAdmin.tenant_id == tenant_id,
+                    TenantAdmin.is_active.is_(True),
                     TenantAdmin.is_deleted.is_(False),
+                    Tenant.is_active.is_(True),
+                    Tenant.is_deleted.is_(False),
                 )
             )
             ta = result.scalar_one_or_none()

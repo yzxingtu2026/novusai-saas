@@ -13,6 +13,7 @@ import contextlib
 import re
 import smtplib
 import ssl as ssl_module
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from email.mime.application import MIMEApplication
 from email.mime.multipart import MIMEMultipart
@@ -59,6 +60,8 @@ class EmailResult:
     message: str
     recipients: list[str] = field(default_factory=list)
     error: str | None = None
+    submission_state: str = "not_submitted"
+    retryable: bool = False
 
 
 @dataclass
@@ -274,6 +277,7 @@ class EmailService:
         config: SmtpConfig,
         mime_msg: MIMEMultipart,
         recipients: list[str],
+        before_submit: Callable[[], None] | None = None,
     ) -> None:
         """通过 SMTP 发送邮件（同步阻塞） / Send email via SMTP (sync blocking)."""
         timeout = 30
@@ -294,13 +298,86 @@ class EmailService:
             if config.username and config.password:
                 server.login(config.username, config.password)
 
+            if before_submit is not None:
+                before_submit()
             server.sendmail(
                 config.from_address,
                 recipients,
                 mime_msg.as_string(),
             )
         finally:
-            server.quit()
+            # 中文: QUIT 清理失败不能推翻已受理的邮件，也不能覆盖原始发送异常。
+            # EN: QUIT cleanup must not overturn acceptance or mask a send error.
+            try:
+                server.quit()
+            except Exception:
+                with contextlib.suppress(Exception):
+                    server.close()
+
+
+def send_prepared_email(config, mime_msg, recipients, before_submit) -> EmailResult:
+    """中文: 对持久投递区分明确拒绝和未知受理。 EN: Distinguish definite rejection from unknown acceptance."""
+    started = False
+
+    def gate():
+        nonlocal started
+        before_submit()
+        started = True
+
+    try:
+        EmailService._smtp_send(config, mime_msg, recipients, before_submit=gate)
+        return EmailResult(True, "sent", recipients, submission_state="accepted")
+    except (smtplib.SMTPSenderRefused, smtplib.SMTPDataError) as error:
+        retryable = 400 <= error.smtp_code < 500
+        return EmailResult(
+            False,
+            "smtp_rejected",
+            recipients,
+            submission_state="rejected",
+            retryable=retryable,
+        )
+    except smtplib.SMTPRecipientsRefused as error:
+        retryable = bool(error.recipients) and all(
+            400 <= code < 500 for code, _message in error.recipients.values()
+        )
+        return EmailResult(
+            False,
+            "smtp_recipients_rejected",
+            recipients,
+            submission_state="rejected",
+            retryable=retryable,
+        )
+    except smtplib.SMTPAuthenticationError as error:
+        return EmailResult(
+            False,
+            "smtp_auth_rejected",
+            recipients,
+            submission_state="not_submitted",
+            retryable=400 <= error.smtp_code < 500,
+        )
+    except Exception as error:
+        if started:
+            return EmailResult(
+                False,
+                "smtp_acceptance_unknown",
+                recipients,
+                submission_state="uncertain",
+            )
+        if isinstance(error, smtplib.SMTPResponseException):
+            retryable = 400 <= error.smtp_code < 500
+        elif isinstance(error, smtplib.SMTPServerDisconnected):
+            retryable = True
+        else:
+            retryable = isinstance(error, OSError) and not isinstance(
+                error, smtplib.SMTPException
+            )
+        return EmailResult(
+            False,
+            "smtp_pre_submit_failed",
+            recipients,
+            submission_state="not_submitted",
+            retryable=retryable,
+        )
 
 
 # ============================================

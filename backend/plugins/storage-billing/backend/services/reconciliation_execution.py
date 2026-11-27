@@ -13,11 +13,11 @@ from sqlalchemy import select
 
 from app.core.base_model import utc_now
 from app.core.logging import get_logger
+from app.plugins.exceptions import PluginSecurityError
 
 from ..constants import (
     EXCLUDED_DRIVERS,
     SUPPORTED_CLOUD_DRIVERS,
-    get_provider_implemented_bill_sources,
 )
 from ..models import (
     StorageBillingRun,
@@ -32,9 +32,7 @@ from ..models import (
 )
 from ..providers import (
     BillingChargeItem,
-    BillingFetchRequest,
     BillingFetchResult,
-    get_provider_adapter,
 )
 from .reconciliation_shared import (
     _SCOPE_MATCH_PRIORITY,
@@ -392,94 +390,25 @@ class StorageBillingReconciliationExecutionMixin:
         period_end: date,
         requested_scope: dict[str, Any],
     ) -> BillingFetchResult:
-        adapter = get_provider_adapter(driver_code)
-        if adapter is None:
-            return BillingFetchResult(
-                provider_code=driver_code,
-                driver_code=driver_code,
-                billing_date=billing_date,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                source_status=StorageBillingSourceStatusEnum.SKIPPED.value,
-                error_message="No official billing adapter registered for this driver.",
-                raw_payload_json={"driver_code": driver_code},
+        executor = getattr(self._host_read, "execute_storage_billing_fetch", None)
+        if not callable(executor):
+            raise PluginSecurityError(
+                message="Storage billing host credential execution is unavailable."
             )
-
-        profile = await self._profile_service.get_provider_runtime_profile(driver_code)
-        validation = await self._profile_service.validate_provider_profile(driver_code)
-        supported_period_types = {
-            _stringify(value)
-            for value in (profile.get("supported_period_types") or [])
-            if _stringify(value)
+        _ = requested_scope
+        request = {
+            "billing_date": billing_date,
+            "driver_code": driver_code,
+            "period_type": period_type,
+            "period_start": period_start,
+            "period_end": period_end,
         }
-
-        if not profile.get("enabled"):
-            return BillingFetchResult(
-                provider_code=driver_code,
-                driver_code=driver_code,
-                billing_date=billing_date,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                source_status=StorageBillingSourceStatusEnum.SKIPPED.value,
-                error_message="Provider profile is disabled.",
-                raw_payload_json={
-                    "provider_profile": profile,
-                    "validation": validation,
-                },
-            )
-
-        if _stringify(period_type) not in supported_period_types:
-            return BillingFetchResult(
-                provider_code=driver_code,
-                driver_code=driver_code,
-                billing_date=billing_date,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                source_status=StorageBillingSourceStatusEnum.NOT_IMPLEMENTED.value,
-                error_message=(
-                    f"Provider '{driver_code}' does not support period type '{period_type}'."
-                ),
-                raw_payload_json={
-                    "provider_profile": profile,
-                    "validation": validation,
-                },
-            )
-
-        if validation["errors"]:
-            source_status = StorageBillingSourceStatusEnum.FAILED.value
-            if _stringify(
-                profile.get("bill_source")
-            ) not in get_provider_implemented_bill_sources(driver_code):
-                source_status = StorageBillingSourceStatusEnum.NOT_IMPLEMENTED.value
-            return BillingFetchResult(
-                provider_code=driver_code,
-                driver_code=driver_code,
-                billing_date=billing_date,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                source_status=source_status,
-                error_message="; ".join(validation["errors"]),
-                raw_payload_json={
-                    "provider_profile": profile,
-                    "validation": validation,
-                },
-            )
-
-        return await adapter.fetch_official_bill(
-            BillingFetchRequest(
-                billing_date=billing_date,
-                driver_code=driver_code,
-                period_type=period_type,
-                period_start=period_start,
-                period_end=period_end,
-                profile=profile,
-                request_scope=requested_scope,
-            )
-        )
+        result = executor(request)
+        if inspect.isawaitable(result):
+            result = await result
+        if not isinstance(result, BillingFetchResult):
+            raise RuntimeError("Storage billing host returned an invalid bill result.")
+        return result
 
     async def _replace_daily_charges_for_source(
         self,
@@ -516,8 +445,10 @@ class StorageBillingReconciliationExecutionMixin:
         for row in existing_rows:
             await self._db.delete(row)
 
+        # Flush deletes before replacement inserts reuse the live charge keys.
+        await self._db.flush()
+
         if not charge_items:
-            await self._db.flush()
             return {
                 "matched_items": 0,
                 "unmatched_items": 0,
@@ -688,6 +619,9 @@ class StorageBillingReconciliationExecutionMixin:
         )
         for row in existing_rows:
             await self._db.delete(row)
+
+        # Reconstructed rows reuse the deleted rows' unique keys.
+        await self._db.flush()
 
         merged: dict[tuple[int, str, str], dict[str, Any]] = {}
         for source in sources:

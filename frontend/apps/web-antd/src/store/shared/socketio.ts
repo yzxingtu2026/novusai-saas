@@ -6,9 +6,18 @@
  * 登录后自动建立连接，登出时断开。提供事件 handler 注册/注销机制。
  */
 
+import type { EffectScope } from 'vue';
+
 import type { SocketIOStatus } from '#/composables/use-socketio';
 
-import { computed, ref, watch } from 'vue';
+import {
+  computed,
+  effectScope,
+  getCurrentScope,
+  onScopeDispose,
+  ref,
+  watch,
+} from 'vue';
 
 import { defineStore } from 'pinia';
 
@@ -26,6 +35,10 @@ const NAMESPACE_MAP: Record<string, string> = {
 };
 
 export const useSocketIOStore = defineStore('socketio', () => {
+  // 中文: 连接和状态监听由 Pinia 管理，生命周期独立于使用它的布局组件。
+  // EN: Pinia owns the connection and status watcher across layout unmounts.
+  const storeScope = getCurrentScope();
+
   // ============================================================
   // State / 状态
   // ============================================================
@@ -41,8 +54,7 @@ export const useSocketIOStore = defineStore('socketio', () => {
 
   /** Socket.IO composable instance (lazy-created) / Socket.IO composable 实例 */
   let sioInstance: null | ReturnType<typeof useSocketIO> = null;
-  /** Status watch stop function (avoids accumulating watchers on reconnect) / status watch 停止函数 */
-  let stopStatusWatch: (() => void) | null = null;
+  let connectionScope: EffectScope | null = null;
 
   // ============================================================
   // Connection management / 连接管理
@@ -57,6 +69,8 @@ export const useSocketIOStore = defineStore('socketio', () => {
    * @param endpoint - API endpoint type ('admin' | 'tenant' | 'user') / API 端类型
    */
   function connect(endpoint?: string) {
+    if (!storeScope?.active) return;
+
     const ep = endpoint || _detectEndpoint();
     if (!ep) return;
 
@@ -75,15 +89,10 @@ export const useSocketIOStore = defineStore('socketio', () => {
       return;
     }
 
-    // Disconnect old connection (avoid orphaned socket on endpoint switch) / 断开旧连接
-    if (sioInstance) {
-      sioInstance.disconnect();
-      sioInstance = null;
-    }
-    if (stopStatusWatch) {
-      stopStatusWatch();
-      stopStatusWatch = null;
-    }
+    releaseConnection();
+    const scope = storeScope.run(() => effectScope());
+    if (!scope) return;
+    connectionScope = scope;
 
     currentEndpoint.value = ep;
 
@@ -91,24 +100,31 @@ export const useSocketIOStore = defineStore('socketio', () => {
     // Use getter function to read TokenStorage in real-time, ensuring Socket.IO gets the latest token after refresh / 实时读取 Token
     const tokenGetter = () =>
       TokenStorage.getToken(ep as 'admin' | 'tenant' | 'user') || '';
-    sioInstance = useSocketIO({
-      namespace: ns,
-      token: tokenGetter,
-      serverUrl: getAppApiUrl(),
-      autoConnect: true,
+    scope.run(() => {
+      sioInstance = useSocketIO({
+        namespace: ns,
+        token: tokenGetter,
+        serverUrl: getAppApiUrl(),
+        autoConnect: true,
+      });
+      watch(
+        sioInstance.status,
+        (newStatus) => {
+          status.value = newStatus;
+        },
+        { immediate: true },
+      );
     });
-
-    // Sync status / 同步 status
-    stopStatusWatch = watch(
-      sioInstance.status,
-      (newStatus) => {
-        status.value = newStatus;
-      },
-      { immediate: true },
-    );
 
     // Bind all registered handlers / 绑定所有已注册的 handlers
     _bindHandlers();
+  }
+
+  function releaseConnection() {
+    const scope = connectionScope;
+    connectionScope = null;
+    sioInstance = null;
+    scope?.stop();
   }
 
   /**
@@ -119,14 +135,7 @@ export const useSocketIOStore = defineStore('socketio', () => {
    * 注意：不清 handlers map，保留已注册 handler 以便重连。登出时需调用 $reset()。
    */
   function disconnect() {
-    if (sioInstance) {
-      sioInstance.disconnect();
-      sioInstance = null;
-    }
-    if (stopStatusWatch) {
-      stopStatusWatch();
-      stopStatusWatch = null;
-    }
+    releaseConnection();
     currentEndpoint.value = '';
     status.value = 'disconnected';
   }
@@ -222,18 +231,11 @@ export const useSocketIOStore = defineStore('socketio', () => {
    * Disconnects + clears handlers map to prevent duplicate registrations on re-login.
    */
   function $reset() {
-    if (sioInstance) {
-      sioInstance.disconnect();
-      sioInstance = null;
-    }
-    if (stopStatusWatch) {
-      stopStatusWatch();
-      stopStatusWatch = null;
-    }
     handlers.clear();
-    currentEndpoint.value = '';
-    status.value = 'disconnected';
+    disconnect();
   }
+
+  onScopeDispose($reset);
 
   return {
     status,

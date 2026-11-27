@@ -220,9 +220,11 @@ class BaseTask(Task):
                 )
             except (TypeError, ValueError):
                 config = {}
+        # 中文: Celery 在多次执行间复用任务实例。
+        # EN: Celery reuses task instances between invocations.
+        self._db_config = config or None
         if not config:
             return
-        self._db_config = config
         if config.get("max_retries") is not None:
             self.max_retries = config["max_retries"]
         if config.get("timeout") is not None:
@@ -280,8 +282,8 @@ class BaseTask(Task):
 
         Decides whether to send notification based on task_definitions notify_on_failure config.
         根据 task_definitions 的 notify_on_failure 配置决定是否发送通知。
-        Currently supported: log recording. Reserved: WebSocket push, email notification.
-        当前支持：日志记录。预留接口：WebSocket 实时推送、邮件通知
+        WebSocket targets administrators. Email uses the task definition's configured addresses.
+        WebSocket 通知管理员，邮件投递到任务定义配置的地址。
         """
         if not self._db_config or not self._db_config.get("notify_on_failure"):
             return
@@ -290,11 +292,11 @@ class BaseTask(Task):
         notify_emails = self._db_config.get("notify_emails", "")
 
         logger.warning(
-            "Task failure notification: task={} task_id={} error={} emails={}",
+            "Task failure notification: task={} task_id={} error_type={} has_email_config={}",
             task_name,
             task_id,
-            str(exc)[:200],
-            notify_emails or "(none)",
+            type(exc).__name__,
+            bool(notify_emails),
         )
 
         try:
@@ -320,7 +322,8 @@ class BaseTask(Task):
                 "Failed to send WS task failure notification: {}", str(ws_err)
             )
 
-        if notify_emails:
+        definition_id = self._db_config.get("task_definition_id")
+        if notify_emails and definition_id:
             try:
                 from app.services.common.email_templates import (
                     render_task_failure_email,
@@ -343,6 +346,7 @@ class BaseTask(Task):
                     email_html=html_body,
                     email_subject=subject,
                     email_text=text_body,
+                    task_failure_email_definition_id=definition_id,
                 )
             except Exception as mail_err:
                 logger.warning(
@@ -844,7 +848,9 @@ class TenantTask(BaseTask):
         tenant_id = self._normalize_tenant_id(kwargs.get("tenant_id"))
         if tenant_id is None:
             if not self.allow_null_tenant:
-                logger.warning("Rejected tenant task without tenant_id: task={}", self.name)
+                logger.warning(
+                    "Rejected tenant task without tenant_id: task={}", self.name
+                )
                 raise Ignore()
             # Platform-level task: tenant_id=None is valid
             self._tenant_id = None
@@ -935,15 +941,32 @@ class TenantTask(BaseTask):
 
 
 class PlatformAwareTenantTask(TenantTask):
-    """
-    Tenant task that also supports platform-level (tenant_id=None) execution.
-
-    Use for tasks like KB document processing that may run for admin-only
-    knowledge bases where tenant_id is None.
-    """
+    """Tenant task that also accepts an explicit platform dispatch."""
 
     abstract = True
-    allow_null_tenant: bool = True
+
+    def _before_task_run_start(
+        self,
+        task_id: str,
+        args: tuple,
+        kwargs: dict,
+    ) -> None:
+        if "tenant_id" not in kwargs or kwargs["tenant_id"] is not None:
+            super()._before_task_run_start(task_id, args, kwargs)
+            return
+
+        headers = getattr(self.request, "headers", None)
+        if headers is not None and (
+            not isinstance(headers, dict)
+            or headers.get("effective_tenant_id") is not None
+        ):
+            logger.warning(
+                "Rejected platform task with tenant context: task={}", self.name
+            )
+            raise Ignore()
+
+        self._tenant_id = None
+        logger.info("Task platform context (no tenant): task={}", self.name)
 
 
 def register_task(
@@ -965,6 +988,9 @@ def register_task(
 
     def decorator(func: Callable) -> Task:
         task_name = name or f"{func.__module__}.{func.__qualname__}"
+        leased_path = getattr(base, "LEASE_HANDLER_PATH", None)
+        if leased_path is not None and leased_path != task_name:
+            raise ValueError("Leased task registration must match its declared handler")
 
         task_options: dict[str, Any] = {
             "name": task_name,
@@ -986,7 +1012,10 @@ def register_task(
             "max_retries": max_retries,
             "module": func.__module__,
             "base": base.__name__,
+            "is_tenant_task": isinstance(base, type) and issubclass(base, TenantTask),
         }
+        if leased_path is not None:
+            _task_registry[task_name]["monitors_execution_lease"] = True
 
         return registered_task
 

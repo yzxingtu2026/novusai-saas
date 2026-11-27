@@ -168,7 +168,7 @@ class ConversationQueryEngine:
     ) -> ChatResponse:
         rescue_extra_kwargs = dict(command.extra_kwargs or {})
         rescue_extra_kwargs.setdefault(
-            "_runtime_reasoning_effort_override",
+            "_runtime_reasoning_effort_default",
             _SYNC_RESCUE_REASONING_EFFORT,
         )
         rescue_command = replace(
@@ -390,6 +390,10 @@ class ConversationQueryEngine:
                     command=attempt_command,
                 ):
                     if self.recovery_policy.chunk_should_emit_immediately(chunk):
+                        for buffered_chunk in buffered_chunks:
+                            emitted_chunk_count += 1
+                            yield buffered_chunk
+                        buffered_chunks.clear()
                         emitted_chunk_count += 1
                         yield chunk
                     else:

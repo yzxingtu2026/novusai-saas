@@ -68,7 +68,16 @@ async def test_storage_migration_start_task_clears_stale_error(mock_db):
         migration_module.StorageMigrationService,
     )
     service._db = mock_db
-    service.get_task = AsyncMock(return_value={"status": "pending"})
+    service.get_task = AsyncMock(
+        return_value={
+            "status": "pending",
+            "source_driver": "fixture-source",
+            "target_driver": "fixture-target",
+            "scope": "all",
+        }
+    )
+    service._find_conflicting_active_task = AsyncMock(return_value=None)
+    mock_db.scalar = AsyncMock(side_effect=["", False])
     service._update_task_status = AsyncMock()
     service._run_migration = AsyncMock()
 
@@ -87,7 +96,11 @@ async def test_storage_migration_start_task_clears_stale_error(mock_db):
     assert result == {"status": "running", "task_id": 7}
     assert service._update_task_status.await_args.args[:2] == (7, "running")
     assert service._update_task_status.await_args.kwargs["error_message"] is None
+    run_id = service._update_task_status.await_args.kwargs["forward_run_id"]
+    assert len(run_id) == 32
+    service._run_migration.assert_called_once_with(7, run_id)
     mock_db.commit.assert_awaited_once()
+    assert "FOR UPDATE" in str(mock_db.scalar.await_args_list[0].args[0])
     pause_event = migration_module.runtime_registry.get_pause_event(7)
     assert pause_event is not None
     assert pause_event.is_set() is True
@@ -107,6 +120,7 @@ async def test_storage_migration_retry_failed_restarts_task(mock_db):
 
     reset_result = MagicMock()
     reset_result.rowcount = 2
+    mock_db.scalar = AsyncMock(side_effect=[1, False])
     mock_db.execute = AsyncMock(side_effect=[reset_result, MagicMock()])
 
     result = await migration_module.StorageMigrationService.retry_failed(
@@ -115,6 +129,9 @@ async def test_storage_migration_retry_failed_restarts_task(mock_db):
     )
 
     assert result == {"status": "running", "task_id": 9}
+    admission, hold_check = mock_db.scalar.await_args_list
+    assert "source_cleanup_started_at IS NULL" in str(admission.args[0])
+    assert "commit_unknown" in str(hold_check.args[0])
     mock_db.commit.assert_awaited_once()
     service.start_task.assert_awaited_once_with(9)
 

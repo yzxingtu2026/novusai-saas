@@ -14,7 +14,6 @@ from typing import TYPE_CHECKING
 
 from app.plugins.context import PluginContext, RequestContext
 from app.plugins.exceptions import PluginError
-from app.plugins.host_read_facade import HostReadFacade
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -72,7 +71,5 @@ def create_plugin_context(
         "granted_capabilities": granted_capabilities,
         "request_context": request_context,
     }
-
-    kwargs["host_read"] = HostReadFacade(db)
 
     return ctx_class(**kwargs)

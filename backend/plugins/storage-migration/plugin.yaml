@@ -104,6 +104,19 @@ extensions:
     tenant_routes: []
     public_routes: []
 
+  tasks:
+    - name: recover_forward_runs
+      handler: "tasks.recover_forward_runs"
+      display_name:
+        zh-CN: "存储迁移中断检查"
+        en: "Storage Migration Interruption Check"
+      schedule_type: interval
+      interval_seconds: 60
+      queue: scheduled
+      description:
+        zh-CN: "检查已失去执行进程的迁移任务，标记为暂停或结果待核对。"
+        en: "Mark forward migrations whose execution process is gone as paused or unconfirmed."
+
   frontend:
     pages:
       - name: storage_migration_page

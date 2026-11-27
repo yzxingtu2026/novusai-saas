@@ -16,7 +16,10 @@ import {
 } from '#/constants/endpoints';
 import { accessRoutes, coreRouteNames } from '#/router/routes';
 import { TokenStorage, useMultiAuthStore, usePublicConfigStore } from '#/store';
-import { shouldRequestTenantPublicConfig } from '#/utils/public-config-domain';
+import {
+  isDomainEntryUnavailable,
+  shouldRequestTenantPublicConfig,
+} from '#/utils/public-config-domain';
 
 import { generateAccess } from './access';
 
@@ -112,6 +115,7 @@ export function resetLastEndpoint() {
  */
 function setupAccessGuard(router: Router) {
   router.beforeEach(async (to, from) => {
+    if (to.name === 'DomainUnavailable') return true;
     const accessStore = useAccessStore();
     const userStore = useUserStore();
     const multiAuthStore = useMultiAuthStore();
@@ -153,6 +157,19 @@ function setupAccessGuard(router: Router) {
 
     // ── 域名类型检测（幂等，仅首次导航发一次请求） / domain detect (once) ──
     await publicConfigStore.detectDomainType().catch(() => {});
+
+    if (
+      isDomainEntryUnavailable(
+        publicConfigStore.isDomainDetected,
+        publicConfigStore.isDomainTenantDomain,
+      )
+    ) {
+      return {
+        name: 'DomainUnavailable',
+        query: { redirect: to.fullPath },
+        replace: true,
+      };
+    }
 
     currentEndpoint = resolveEndpointForPath(
       to.path,
@@ -450,6 +467,7 @@ function setupAccessGuard(router: Router) {
  */
 function setupTabbarGuard(router: Router) {
   router.beforeEach(async (to) => {
+    if (to.name === 'DomainUnavailable') return true;
     const tabbarStore = useTabbarStore();
     const publicConfigStore = usePublicConfigStore();
 

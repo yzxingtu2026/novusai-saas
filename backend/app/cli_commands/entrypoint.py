@@ -16,6 +16,7 @@ from app.cli_commands import ai_commands as _ai
 from app.cli_commands import codegen_core as _codegen_core
 from app.cli_commands import core_commands as _core
 from app.cli_commands import health_commands as _health
+from app.cli_commands import plugin_image_operation_commands as _plugin_images
 from app.cli_commands import trace_commands as _trace
 from app.core.config import settings
 
@@ -34,6 +35,7 @@ def _register_commands() -> None:
     cli.add_command(_core.run_cmd)
     cli.add_command(_core.celery_cmd)
     cli.add_command(_core.db_cmd)
+    _core.plugin_cmd.add_command(_plugin_images.image_delivery_cmd)
     cli.add_command(_core.plugin_cmd)
     cli.add_command(_core.license_cmd)
     cli.add_command(_trace.trace_cmd)

@@ -8,7 +8,7 @@ import type {
 } from '#/api/public/config';
 
 import { createPinia, setActivePinia } from 'pinia';
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { usePublicConfigStore } from '../public-config';
 
@@ -108,6 +108,72 @@ describe('usePublicConfigStore tenant config guard', () => {
     window.sessionStorage.clear();
     document.head.innerHTML = '';
     document.body.innerHTML = '';
+  });
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+    vi.unstubAllEnvs();
+  });
+
+  it.each(['acme.novus.local', 'custom.example.test'])(
+    'confirms a registered host with one tenant public config read (%s)',
+    async (hostname) => {
+      vi.stubGlobal('location', { hostname });
+      const store = usePublicConfigStore();
+
+      await Promise.all([store.detectDomainType(), store.detectDomainType()]);
+
+      expect(store.isDomainTenantDomain).toBe(true);
+      expect(store.isDomainDetected).toBe(true);
+      expect((await store.loadTenantConfig())?.brand.siteName).toBe('Acme Tenant');
+      expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
+    },
+  );
+
+  it('uses only an exact configured platform hostname', async () => {
+    vi.stubEnv('VITE_PLATFORM_DOMAINS', ' PLAT.EXAMPLE.TEST. ');
+    vi.stubGlobal('location', { hostname: 'plat.example.test' });
+    const store = usePublicConfigStore();
+
+    await store.detectDomainType();
+
+    expect(store.isDomainTenantDomain).toBe(false);
+    expect(store.isDomainDetected).toBe(true);
+    expect(getPlatformPublicConfigApi).not.toHaveBeenCalled();
+    expect(getTenantPublicConfigApi).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    { code: 4040 },
+    { response: { status: 404 } },
+  ])('keeps an unregistered suffix host out of both entry points', async (error) => {
+    vi.stubGlobal('location', { hostname: 'unregistered.novus.local' });
+    getTenantPublicConfigApi.mockRejectedValueOnce(error);
+    const store = usePublicConfigStore();
+
+    await store.detectDomainType();
+
+    expect(store.isDomainDetected).toBe(true);
+    expect(store.isDomainTenantDomain).toBeNull();
+    expect(store.tenantConfigLoaded).toBe(false);
+    expect(await store.loadTenantConfig()).toBeNull();
+    expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('rechecks temporary tenant lookup failure and restores the registered entry', async () => {
+    vi.stubGlobal('location', { hostname: 'acme.novus.local' });
+    getTenantPublicConfigApi.mockRejectedValueOnce({ response: { status: 503 } });
+    const store = usePublicConfigStore();
+
+    await store.detectDomainType();
+
+    expect(store.isDomainDetected).toBe(false);
+    expect(store.isDomainTenantDomain).toBeNull();
+    await store.retryDomainDetection();
+    expect(store.isDomainDetected).toBe(true);
+    expect(store.isDomainTenantDomain).toBe(true);
+    expect(store.tenantBrand?.siteName).toBe('Acme Tenant');
+    expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(2);
   });
 
   it('skips tenant public config requests on detected platform domains', async () => {

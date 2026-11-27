@@ -6,6 +6,7 @@ Provides pre-login accessible tenant public information endpoints
 """
 
 from fastapi import APIRouter, HTTPException, Request, status
+from pydantic import ValidationError
 
 from app.captcha.runtime import resolve_public_captcha_plugin_bundle
 from app.configs.service import ConfigService
@@ -21,6 +22,7 @@ from app.schemas.public import (
     TenantPublicConfig,
 )
 from app.schemas.public.platform import StoragePublicConfig
+from app.schemas.tenant.domain import TenantDomainCreateRequest
 from app.utils.config_html_sanitize import (
     sanitize_config_html,
     tenant_legal_html_has_meaningful_body,
@@ -134,8 +136,8 @@ async def get_tenant_public_config(request: Request, db: DbSession):
         allowed_extensions=allowed_extensions,
     )
 
-    scheme = request.url.scheme
-    subdomain_url = f"{scheme}://{tenant.code}{settings.TENANT_DOMAIN_SUFFIX}"
+    suffix = settings.TENANT_DOMAIN_SUFFIX
+    subdomain_url = f"{request.url.scheme}://{tenant.code}{suffix}" if suffix else ""
 
     # 品牌 fallback：企业未设置 → 平台默认 / Brand fallback: tenant not set → platform default
     logo_url = (
@@ -315,7 +317,6 @@ async def get_domain_verification_info(
 
     **返回 / Returns:**
     - CNAME 解析目标 / CNAME resolution target
-    - TXT 验证记录（可选） / TXT verification record (optional)
     - 配置说明 / Configuration instructions
 
     此接口无需认证。 / This endpoint requires no authentication.
@@ -328,26 +329,29 @@ async def get_domain_verification_info(
             detail=_("tenant.not_found"),
         )
 
-    tenant = tenant_ctx.tenant
+    try:
+        domain = TenantDomainCreateRequest(domain=domain).domain
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=_("domain.invalid_format"),
+        ) from exc
 
-    # CNAME 目标 / CNAME target
-    cname_target = f"{tenant.code}{settings.TENANT_DOMAIN_SUFFIX}"
-
-    # TXT 验证记录 / TXT verification record
-    txt_name = f"{settings.DOMAIN_VERIFICATION_PREFIX}.{domain}"
-    txt_value = f"novusai-verification={tenant.code}"
-
-    # 配置说明 / Configuration instructions
+    suffix = settings.TENANT_DOMAIN_SUFFIX
+    cname_target = f"{tenant_ctx.tenant.code}{suffix}" if suffix else None
+    if cname_target:
+        routing_instructions = (
+            f"{_('domain.cname_record_required')}:\n"
+            f"   - {_('domain.host_record')}: {domain}\n"
+            f"   - {_('domain.record_type')}: CNAME\n"
+            f"   - {_('domain.record_value')}: {cname_target}"
+        )
+    else:
+        routing_instructions = _("domain.custom_only_routing")
     instructions = (
         f"{_('domain.instructions_header')}\n\n"
-        f"1. {_('domain.cname_record_required')}:\n"
-        f"   - {_('domain.host_record')}: @ {_('domain.or_subdomain')}\n"
-        f"   - {_('domain.record_type')}: CNAME\n"
-        f"   - {_('domain.record_value')}: {cname_target}\n\n"
-        f"2. {_('domain.txt_record_verify')}:\n"
-        f"   - {_('domain.host_record')}: {settings.DOMAIN_VERIFICATION_PREFIX}\n"
-        f"   - {_('domain.record_type')}: TXT\n"
-        f"   - {_('domain.record_value')}: {txt_value}\n\n"
+        f"1. {routing_instructions}\n\n"
+        f"2. {_('domain.binding_verification_required')}\n\n"
         f"{_('domain.dns_propagation_note')}\n"
     )
 
@@ -355,9 +359,7 @@ async def get_domain_verification_info(
         data=DomainVerificationInfo(
             domain=domain,
             cname_target=cname_target,
-            cname_name="@",
-            txt_name=txt_name,
-            txt_value=txt_value,
+            cname_name=domain if cname_target else None,
             is_verified=False,
             instructions=instructions,
         ),

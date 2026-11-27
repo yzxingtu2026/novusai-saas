@@ -7,11 +7,14 @@ Manages application configuration using pydantic-settings, supports environment 
 
 import json
 from functools import lru_cache
+from ipaddress import ip_network
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-from pydantic import field_validator, model_validator
+from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+from app.core.domains import normalize_tenant_suffix
 
 # env_file 固定为 backend/.env，避免 cwd 不同导致加载失败
 # Fix env_file to backend/.env so it loads regardless of startup directory
@@ -40,7 +43,8 @@ class Settings(BaseSettings):
     # 应用基础配置 / Application Basic Configuration
     # ========================================
     APP_NAME: str = "NovusAI SaaS"
-    APP_VERSION: str = "0.1.0"  # 中文: 启动时自动从 VERSION 文件读取，此默认值仅作兜底。
+    # 启动时从 VERSION 文件读取。这里提供文件缺失时的默认值。
+    APP_VERSION: str = "0.1.0"
     APP_ENV: str = "development"  # development, staging, production / 运行环境
     DEBUG: bool = False
     # 中文: 生产镜像由独立 migrate 容器执行迁移，API 启动只做连接校验。
@@ -61,6 +65,8 @@ class Settings(BaseSettings):
     # 允许跨域的前端 Origin（支持 JSON 数组或逗号分隔）
     # Allowed frontend CORS origins (supports JSON array or comma-separated values)
     CORS_ORIGINS: str = ""
+    # 可声明客户端地址的代理 IP 或 CIDR / Proxy IP addresses or CIDRs allowed to report client IPs.
+    TRUSTED_PROXY_IPS: str = ""
 
     # ========================================
     # 安全配置 / Security Configuration
@@ -193,6 +199,11 @@ class Settings(BaseSettings):
     # 企业域名验证前缀 / Tenant domain verification prefix (for DNS TXT record verification)
     DOMAIN_VERIFICATION_PREFIX: str = "_novusai-verification"
 
+    @field_validator("TENANT_DOMAIN_SUFFIX")
+    @classmethod
+    def _normalize_tenant_domain_suffix(cls, value: str) -> str:
+        return normalize_tenant_suffix(value) if value.strip() else ""
+
     @property
     def platform_domains_list(self) -> list[str]:
         """解析平台管理端域名列表 / Parse platform admin domain list"""
@@ -215,6 +226,13 @@ class Settings(BaseSettings):
             values = raw.split(",")
 
         return [str(item).strip() for item in values if str(item).strip()]
+
+    @property
+    def trusted_proxy_ips_list(self) -> list[str]:
+        """解析可信代理 IP 或 CIDR / Parse comma-separated trusted proxy entries."""
+        return [
+            item.strip() for item in self.TRUSTED_PROXY_IPS.split(",") if item.strip()
+        ]
 
     @property
     def dev_bootstrap_allowed_hosts_list(self) -> list[str]:
@@ -240,8 +258,14 @@ class Settings(BaseSettings):
     ACME_ACCOUNT_EMAIL: str = ""
     # 是否使用 staging 环境 / Use staging environment (set True for dev/test)
     ACME_USE_STAGING: bool = True
+    DNS_ALIYUN_ACCESS_KEY_ID: str = Field(default="", repr=False)
+    DNS_ALIYUN_ACCESS_KEY_SECRET: str = Field(default="", repr=False)
+    DNS_ALIYUN_ZONE_NAME: str = ""
+    ACME_ACCOUNT_KEY_DIRECTORY: str = ""
     # 自动续期提前天数 / Auto-renewal advance days
     SSL_AUTO_RENEW_DAYS: int = 30
+    MANAGED_HTTPS_CERTIFICATE_PATH: str = ""
+    MANAGED_HTTPS_AUTO_RENEW: bool = False
 
     # ========================================
     # 插件市场配置 / Plugin Marketplace Configuration
@@ -290,6 +314,25 @@ class Settings(BaseSettings):
             if normalized in falsy:
                 return False
         raise ValueError("DEBUG must be a boolean-like value")
+
+    @field_validator("TRUSTED_PROXY_IPS")
+    @classmethod
+    def _normalize_trusted_proxy_ips(cls, raw: str) -> str:
+        entries = [entry.strip() for entry in raw.split(",") if entry.strip()]
+        for entry in entries:
+            try:
+                ip_network(entry)
+            except ValueError as exc:
+                raise ValueError(
+                    "TRUSTED_PROXY_IPS must contain IP addresses or CIDR networks"
+                ) from exc
+        return ",".join(entries)
+
+    @model_validator(mode="after")
+    def _validate_production_debug(self) -> "Settings":
+        if self.APP_ENV.strip().lower() == "production" and self.DEBUG:
+            raise ValueError("DEBUG must be false in production")
+        return self
 
     @model_validator(mode="after")
     def _load_version_from_file(self) -> "Settings":

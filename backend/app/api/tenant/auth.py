@@ -11,7 +11,7 @@ from app.core.config import settings
 from app.core.deps import ActiveTenantAdmin, DbSession
 from app.core.i18n import _
 from app.core.logging import ImpersonateLoggerMixin
-from app.core.rate_limit import check_login_rate_limit
+from app.core.rate_limit import check_login_rate_limit, get_request_client_ip
 from app.core.response import success
 from app.middleware.tenant import get_tenant_context
 from app.rbac.decorators import auth_only, public
@@ -44,7 +44,7 @@ router = APIRouter(prefix="/auth", tags=["企业管理员认证"])
 
 
 def _client_ip(request: Request) -> str | None:
-    return request.client.host if request.client else None
+    return get_request_client_ip(request)
 
 
 def _tenant_code_from_request_domain(request: Request) -> str | None:
@@ -72,7 +72,7 @@ async def tenant_admin_login(
     - **username**: 用户名或邮箱 / Username or email
     - **password**: 密码 / Password
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
     auth_service = AuthService(db)

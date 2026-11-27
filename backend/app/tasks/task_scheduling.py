@@ -214,6 +214,9 @@ def _build_handler_options(
 def handler_supports_tenant_dispatch(handler_path: str) -> bool:
     get_registered_handler_task(handler_path)
     registry_info = get_task_registry().get(handler_path, {})
+    is_tenant = registry_info.get("is_tenant_task")
+    if isinstance(is_tenant, bool):
+        return is_tenant
     return registry_info.get("base") == "TenantTask"
 
 

@@ -26,6 +26,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from app import models as registered_models
 from app.core.base_model import Base
 from app.core.config import settings
+from app.core.migration_lock import acquire_schema_migration_lock
 from app.plugins.migration_paths import (
     build_migration_version_locations,
     get_migration_plugin_names,
@@ -163,13 +164,8 @@ def run_migrations_online() -> None:
 
     连接数据库并执行迁移
     """
-    connectable = engine_from_config(
-        config.get_section(config.config_ini_section, {}),
-        prefix="sqlalchemy.",
-        poolclass=pool.NullPool,
-    )
 
-    with connectable.connect() as connection:
+    def run_with_connection(connection) -> None:
         context.configure(
             connection=connection,
             target_metadata=target_metadata,
@@ -181,6 +177,24 @@ def run_migrations_online() -> None:
 
         with context.begin_transaction():
             context.run_migrations()
+
+    locked_connection = config.attributes.get("schema_migration_connection")
+    if locked_connection is not None:
+        run_with_connection(locked_connection)
+        return
+
+    connectable = engine_from_config(
+        config.get_section(config.config_ini_section, {}),
+        prefix="sqlalchemy.",
+        poolclass=pool.NullPool,
+    )
+
+    try:
+        with connectable.connect() as connection:
+            acquire_schema_migration_lock(connection)
+            run_with_connection(connection)
+    finally:
+        connectable.dispose()
 
 
 # 根据模式运行迁移

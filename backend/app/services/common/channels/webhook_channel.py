@@ -13,6 +13,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.core.egress_url_policy import request_public_http
 from app.core.logging import LogManager
 from app.services.common.channels.base import NotificationChannel
 
@@ -61,12 +62,14 @@ class WebhookChannel(NotificationChannel):
     ) -> bool:
         """通过 HTTP POST 投递通知到 Webhook URL / Deliver notification via HTTP POST to webhook URL."""
         _ = db
-        _ = kwargs
         try:
-            from app.sio.ws_config import get_ws_configs
+            if kwargs.get("_worker_write_only"):
+                url = kwargs.get("_prepared_webhook_url") or ""
+            else:
+                from app.sio.ws_config import get_ws_configs
 
-            cfg = await get_ws_configs("webhook_url")
-            url = (cfg.get("webhook_url") or "").strip()
+                cfg = await get_ws_configs("webhook_url")
+                url = (cfg.get("webhook_url") or "").strip()
             if not url or not url.startswith(("http://", "https://")):
                 logger.debug("WebhookChannel: no valid URL configured, skip")
                 return False
@@ -83,10 +86,9 @@ class WebhookChannel(NotificationChannel):
                 "data": data or {},
             }
 
-            import httpx
-
-            async with httpx.AsyncClient(timeout=10.0) as client:
-                resp = await client.post(url, json=payload)
+            resp = await request_public_http(
+                "POST", url, json=payload, timeout=10.0, deadline_seconds=30.0
+            )
 
             if resp.is_success:
                 logger.debug(
@@ -97,14 +99,12 @@ class WebhookChannel(NotificationChannel):
                 return True
 
             logger.warning(
-                "WebhookChannel POST failed: url={} status={} body={}",
-                url[:80],
+                "WebhookChannel POST failed: status={}",
                 resp.status_code,
-                resp.text[:200],
             )
             return False
         except Exception as e:
-            logger.warning("WebhookChannel deliver failed: {}", str(e))
+            logger.warning("WebhookChannel deliver failed: type={}", type(e).__name__)
             return False
 
 

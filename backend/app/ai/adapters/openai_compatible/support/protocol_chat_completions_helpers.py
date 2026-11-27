@@ -6,7 +6,9 @@ from typing import Any, Protocol
 
 from openai.types.chat import ChatCompletion, ChatCompletionChunk
 
+from app.ai.exceptions import ProviderError
 from app.ai.types import ChatChunk, ChatMessage, ChatResponse
+from app.core.i18n import _
 
 
 class _UsageExtractor(Protocol):
@@ -32,6 +34,14 @@ def convert_chat_response(
     model: str,
 ) -> ChatResponse:
     """Convert chat.completions sync payload into the shared ChatResponse."""
+    if payload_looks_like_api_error(response):
+        raise ProviderError(
+            _("ai.request_failed"),
+            provider_code="openai",
+            model_code=model,
+            error_code="provider_error_envelope",
+            status_code=200,
+        )
     if not response.choices:
         return ChatResponse(
             message=ChatMessage(role="assistant", content=""),

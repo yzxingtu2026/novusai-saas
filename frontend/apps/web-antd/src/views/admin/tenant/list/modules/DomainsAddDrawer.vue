@@ -7,13 +7,17 @@ import type { TenantDomainInfo } from './domains-types';
 
 import { nextTick, ref } from 'vue';
 
-import { useVbenDrawer, useVbenForm } from '@vben/common-ui';
+import { useVbenDrawer, useVbenForm, z } from '@vben/common-ui';
 
 import { message } from 'ant-design-vue';
 
 import { inputField, textareaField } from '#/adapter/form';
 import { adminApi as admin } from '#/api';
 import { $t } from '#/locales';
+import {
+  isCustomDomain,
+  normalizeDomainHostname,
+} from '#/utils/public-config-domain';
 
 // Emits / 组件事件
 const emits = defineEmits<{
@@ -31,10 +35,16 @@ interface DomainCreateDefaults {
 /** 表单 Schema / Form schema */
 function useFormSchema() {
   return [
-    inputField('domain', $t('admin.tenant.domain.domain'), {
-      required: true,
-      placeholder: $t('admin.tenant.domain.domainPlaceholder'),
-    }),
+    {
+      ...inputField('domain', $t('admin.tenant.domain.domain'), {
+        required: true,
+        placeholder: $t('admin.tenant.domain.domainPlaceholder'),
+      }),
+      rules: z
+        .string()
+        .trim()
+        .refine(isCustomDomain, $t('shared.domain.invalid')),
+    },
     textareaField('remark', $t('admin.tenant.domain.remark'), {
       placeholder: $t('admin.tenant.domain.remarkPlaceholder'),
       maxLength: 500,
@@ -71,7 +81,7 @@ async function onSubmit() {
 
   const values = await formApi.getValues();
   const requestData = {
-    domain: values.domain?.trim(),
+    domain: normalizeDomainHostname(values.domain),
     remark: values.remark?.trim() || null,
   };
 

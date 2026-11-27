@@ -104,10 +104,12 @@ function mergeChildrenToParent(
   payload: ConfigSubmitPayload,
   formModel: ConfigFormModel,
 ) {
+  if (cfg.is_readonly) return;
   if (!cfg.children?.length) return;
   const parentValue = tryParseJson(payload[cfg.key]);
 
   for (const child of cfg.children) {
+    if (child.is_readonly) continue;
     if (child.value_path) {
       const childVal = formModel[child.key];
       if (child.value_type === 'password' && child.is_encrypted) {
@@ -322,6 +324,7 @@ export function useConfigFormModel(options: UseConfigFormModelOptions) {
 
     const collectValues = (items: ConfigItemMeta[]) => {
       for (const cfg of items) {
+        if (cfg.is_readonly) continue;
         const val = formModel[cfg.key];
         if (cfg.value_type === 'password' && cfg.is_encrypted) {
           if (val && val !== '******') {

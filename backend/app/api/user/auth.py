@@ -17,7 +17,7 @@ from app.configs.service import ConfigService
 from app.core.config import settings
 from app.core.deps import ActiveTenantUser, DbSession
 from app.core.i18n import _
-from app.core.rate_limit import check_login_rate_limit
+from app.core.rate_limit import check_login_rate_limit, get_request_client_ip
 from app.core.response import success
 from app.exceptions import BusinessException
 from app.rbac.decorators import auth_only, public
@@ -68,7 +68,7 @@ if settings.APP_ENV.strip().lower() == "development":
             request_host=request.url.hostname or request.headers.get("host"),
             username=bootstrap_data.username,
             tenant_code=bootstrap_data.tenant_code,
-            client_ip=request.client.host if request.client else None,
+            client_ip=get_request_client_ip(request),
         )
         await db.commit()
 
@@ -91,7 +91,7 @@ async def login_oauth2(
     - **username**: 用户名或邮箱 / Username or email
     - **password**: 密码 / Password
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
     auth_service = AuthService(db)
@@ -101,7 +101,7 @@ async def login_oauth2(
         username=form_data.username,
         password=form_data.password,
         tenant_code=form.get("tenant_code"),
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
         captcha_challenge_id=form.get("captcha_challenge_id"),
         captcha_solution=form.get("captcha_solution"),
         captcha_provider_code=form.get("captcha_provider_code"),
@@ -127,7 +127,7 @@ async def login_json(
     - **username**: 用户名或邮箱 / Username or email
     - **password**: 密码 / Password
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
     auth_service = AuthService(db)
@@ -136,7 +136,7 @@ async def login_json(
         username=login_data.username,
         password=login_data.password,
         tenant_code=login_data.tenant_code,
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
         captcha_challenge_id=login_data.captcha_challenge_id,
         captcha_solution=login_data.captcha_solution,
         captcha_provider_code=login_data.captcha_provider_code,
@@ -161,7 +161,7 @@ async def send_login_code(
     """
     发送企业用户登录验证码 / Send tenant-user login verification code.
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
 
@@ -172,7 +172,7 @@ async def send_login_code(
         email=payload.email,
         phone=payload.phone,
         tenant_code=payload.tenant_code,
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
         captcha_challenge_id=payload.captcha_challenge_id,
         captcha_solution=payload.captcha_solution,
         captcha_provider_code=payload.captcha_provider_code,
@@ -193,7 +193,7 @@ async def login_by_code(
     """
     企业用户验证码登录 / Tenant-user login with verification code.
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
 
@@ -205,7 +205,7 @@ async def login_by_code(
         email=payload.email,
         phone=payload.phone,
         tenant_code=payload.tenant_code,
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
     )
     await db.commit()
 
@@ -281,7 +281,7 @@ async def change_password(
     auth_service = AuthService(db)
 
     await auth_service.change_tenant_user_password(
-        user=current_user,
+        tenant_user=current_user,
         old_password=password_data.old_password,
         new_password=password_data.new_password,
     )
@@ -316,7 +316,7 @@ async def register(
         tenant_code=register_data.tenant_code,
         phone=register_data.phone,
         nickname=register_data.nickname,
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
         captcha_challenge_id=register_data.captcha_challenge_id,
         captcha_solution=register_data.captcha_solution,
         captcha_provider_code=register_data.captcha_provider_code,

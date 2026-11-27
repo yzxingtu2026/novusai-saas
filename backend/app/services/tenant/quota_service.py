@@ -12,9 +12,9 @@ from typing import Any
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.configs.service import ConfigService
 from app.core.base_model import utc_now
 from app.core.config import settings
+from app.core.domains import normalize_hostname, normalize_tenant_suffix
 from app.core.i18n import _
 from app.core.redis import get_redis
 from app.models.tenant.tenant import Tenant
@@ -128,17 +128,9 @@ class QuotaService:
         )
 
     async def _get_domain_suffix(self) -> str:
-        """
-        获取平台域名后缀 / Get platform domain suffix.
-
-        优先从平台配置读取，回退到环境变量
-        """
-        config_svc = ConfigService(self.db)
-        suffix = await config_svc.get_platform_config(
-            "tenant_domain_suffix",
-            default=settings.TENANT_DOMAIN_SUFFIX,
-        )
-        return suffix or settings.TENANT_DOMAIN_SUFFIX
+        """Quota classification must use the deployed tenant routing suffix."""
+        suffix = settings.TENANT_DOMAIN_SUFFIX
+        return normalize_tenant_suffix(suffix) if suffix else ""
 
     async def _lock_tenant_row(self) -> None:
         """
@@ -409,18 +401,21 @@ class QuotaService:
                 message=_("quota.no_limit"),
             )
 
-        # 锁定企业行，防止并发超额 / Lock tenant row to prevent concurrent over-allot
-        await self._lock_tenant_row()
+        # Serialize quota-consuming registrations. Read-only entitlement checks
+        # also run before DNS requests and must not acquire the tenant write lock.
+        if additional > 0:
+            await self._lock_tenant_row()
 
-        # 获取平台域名后缀，用于区分默认域名和自定义域名 / Fetch platform domain suffix to tell default vs custom
-        suffix = await self._get_domain_suffix()
-
-        # 统计当前自定义域名数（排除默认域名，按后缀判断） / Count custom domains (exclude default by suffix)
         query = select(func.count(TenantDomain.id)).where(
             TenantDomain.tenant_id == self.tenant.id,
             TenantDomain.is_deleted.is_(False),
-            ~TenantDomain.domain.endswith(suffix),
         )
+        suffix = await self._get_domain_suffix()
+        if suffix:
+            default_domain = normalize_hostname(f"{self.tenant.code}{suffix}")
+            query = query.where(
+                func.lower(func.rtrim(TenantDomain.domain, ".")) != default_domain
+            )
         result = await self.db.execute(query)
         current = result.scalar() or 0
 

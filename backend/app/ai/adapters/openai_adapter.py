@@ -65,7 +65,11 @@ class OpenAIAdapter(
         )
         self.wire_api = self.protocol_capabilities.primary_wire_api
 
-        self.client = build_openai_client(api_key=api_key, base_url=self.base_url)
+        self.client = build_openai_client(
+            api_key=api_key,
+            base_url=self.base_url,
+            provider_config=self.provider_config,
+        )
 
     @staticmethod
     def _resolve_public_entrypoint_wire_api(kwargs: dict[str, Any]) -> Any:

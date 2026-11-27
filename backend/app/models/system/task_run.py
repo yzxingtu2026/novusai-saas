@@ -5,9 +5,11 @@
 Acts as the execution fact table for the next-generation task run center.
 """
 
+from __future__ import annotations
+
 from datetime import datetime
 
-from sqlalchemy import ForeignKey, Index, Integer, String, Text, text
+from sqlalchemy import DateTime, ForeignKey, Index, Integer, String, Text, text
 from sqlalchemy.dialects.postgresql import JSON
 from sqlalchemy.orm import Mapped, mapped_column
 
@@ -88,6 +90,16 @@ class TaskRun(BaseModel):
             "trigger_slot",
         ),
         Index("ix_task_runs_retry_of_run_id", "retry_of_run_id"),
+        Index(
+            "ix_task_runs_lease_reap",
+            "status",
+            "handler_path_snapshot",
+            "lease_token",
+            "lease_expires_at",
+            postgresql_where=text(
+                "lease_token IS NOT NULL AND status IN ('running', 'unknown')"
+            ),
+        ),
     )
 
     celery_task_id: Mapped[str] = mapped_column(
@@ -261,6 +273,30 @@ class TaskRun(BaseModel):
         nullable=False,
         default=0,
         comment="重试次数",
+    )
+
+    # ── 监控租约字段 / Monitor lease fields ─────────────────────────────────
+    # 仅 opt-in 的 LeasedTenantTask 写入；老任务保持 NULL，不参与回收。
+    # Only opt-in LeasedTenantTask writes these; legacy tasks stay NULL and skip reaper.
+    lease_token: Mapped[str | None] = mapped_column(
+        String(64),
+        nullable=True,
+        default=None,
+        comment="本次执行租约令牌 / Lease token for current run",
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment="租约过期时间（带时区）/ Lease expiry (tz-aware)",
+    )
+    # 与 finished_at 分离：失联观察时间，不是业务结束时间。
+    # Distinct from finished_at: observed-lost timestamp, not business end time.
+    monitor_lost_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        default=None,
+        comment="监控失联观察时间 / Monitor-observed lost timestamp",
     )
 
 

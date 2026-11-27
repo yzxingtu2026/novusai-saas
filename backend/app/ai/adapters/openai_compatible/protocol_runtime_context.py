@@ -79,6 +79,10 @@ def prepare_protocol_execution_context(
         "_runtime_reasoning_effort_override",
         None,
     )
+    runtime_reasoning_effort_default = runtime_kwargs.pop(
+        "_runtime_reasoning_effort_default",
+        None,
+    )
     runtime_client_max_retries_override = runtime_kwargs.pop(
         "_runtime_client_max_retries_override",
         None,
@@ -96,6 +100,11 @@ def prepare_protocol_execution_context(
         model_config=runtime_model_config,
         wire_api=active_wire_api,
     )
+    if (
+        runtime_reasoning_effort_override is None
+        and effective_request.get("reasoning_effort") is None
+    ):
+        runtime_reasoning_effort_override = runtime_reasoning_effort_default
     effective_request = adapter._apply_runtime_reasoning_effort_override(
         effective_request,
         reasoning_effort=runtime_reasoning_effort_override,

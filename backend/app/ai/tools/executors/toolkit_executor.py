@@ -43,6 +43,7 @@ from app.ai.tools.executors.toolkit_security import (
     scan_toolkit_security as _scan_toolkit_security_impl,
 )
 from app.ai.tools.types import ToolDefinition, ToolResult
+from app.core.config import settings
 from app.core.logging import LogManager
 from app.core.response import build_public_error_text
 from app.enums.agent import ActionLevelEnum, ActionStatusEnum, ActionTypeEnum
@@ -54,8 +55,7 @@ if TYPE_CHECKING:
 
 logger = LogManager.get_logger("ai.tool.toolkit")
 
-# Sandbox mode: subprocess (child process isolation) or inprocess (in-process, for dev environment)
-# 沙箱模式：subprocess（子进程隔离）或 inprocess（进程内，开发环境用）
+# 子进程仅分离进程故障，沿用应用权限 / The child isolates process failures and runs with application privileges.
 _SANDBOX_MODE = os.environ.get("TOOLKIT_SANDBOX_MODE", "subprocess")
 
 # Sandbox runner script path / 沙箱运行器脚本路径
@@ -84,8 +84,8 @@ class ToolkitExecutor(BaseToolExecutor):
 
     Supports two execution modes (controlled by TOOLKIT_SANDBOX_MODE env var):
     支持两种执行模式（通过 TOOLKIT_SANDBOX_MODE 环境变量控制）:
-    - subprocess: Execute in child process (default, secure isolation)
-      在子进程中执行（默认，安全隔离）
+    - subprocess: Execute trusted code in a child process with application privileges
+      在沿用应用权限的子进程中执行可信代码
     - inprocess: Execute in main process (for dev environment)
       在主进程中执行（开发环境用）
     """
@@ -100,7 +100,7 @@ class ToolkitExecutor(BaseToolExecutor):
     ) -> None:
         self._timeout = timeout
         self._max_output_size = max_output_size
-        self._sandbox_mode = sandbox_mode or _SANDBOX_MODE
+        self._sandbox_mode = _SANDBOX_MODE if sandbox_mode is None else sandbox_mode
         self._security_level = security_level
         self._memory_limit_mb = memory_limit_mb
 
@@ -116,7 +116,8 @@ class ToolkitExecutor(BaseToolExecutor):
         method_name = definition.config.get("_toolkit_method", definition.name)
         toolkit_content = definition.config.get("_toolkit_content", "")
         valves_config = definition.config.get("_valves_config", {})
-        trusted = definition.config.get("_toolkit_trusted", False)
+        # 只接受内部布尔能力标记 / Require the internal boolean capability marker.
+        trusted = definition.config.get("_toolkit_trusted") is True
 
         if not toolkit_content:
             return ToolResult(
@@ -126,26 +127,49 @@ class ToolkitExecutor(BaseToolExecutor):
                 error="Toolkit source code is empty",
             )
 
+        if not trusted:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                name=definition.name,
+                success=False,
+                error="Blocked: untrusted Toolkit execution requires an isolated runtime",
+            )
+
+        if self._sandbox_mode not in ("subprocess", "inprocess"):
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                name=definition.name,
+                success=False,
+                error="Unsupported Toolkit execution mode",
+            )
+
+        if self._sandbox_mode == "inprocess" and settings.APP_ENV.strip().lower() in {
+            "production",
+            "staging",
+        }:
+            return ToolResult(
+                tool_call_id=tool_call_id,
+                name=definition.name,
+                success=False,
+                error="In-process Toolkit execution is disabled outside development",
+            )
+
         try:
-            # 0. Security scan (untrusted toolkits) / 安全扫描（非信任工具包）
-            if not trusted:
-                violations = _scan_toolkit_security(
-                    toolkit_content,
-                    self._security_level,
+            # 可信代码仍做静态检查 / Scan trusted system code before dispatch.
+            violations = _scan_toolkit_security(toolkit_content, self._security_level)
+            if violations:
+                detail = "; ".join(violations[:5])
+                logger.warning(
+                    "Toolkit security violation in {}: {}",
+                    definition.name,
+                    detail,
                 )
-                if violations:
-                    detail = "; ".join(violations[:5])
-                    logger.warning(
-                        "Toolkit security violation in {}: {}",
-                        definition.name,
-                        detail,
-                    )
-                    return ToolResult(
-                        tool_call_id=tool_call_id,
-                        name=definition.name,
-                        success=False,
-                        error=f"Toolkit blocked: {detail}",
-                    )
+                return ToolResult(
+                    tool_call_id=tool_call_id,
+                    name=definition.name,
+                    success=False,
+                    error=f"Toolkit blocked: {detail}",
+                )
 
             # Choose execution mode based on sandbox mode / 根据沙箱模式选择执行方式
             if self._sandbox_mode == "subprocess":
@@ -326,13 +350,12 @@ class ToolkitExecutor(BaseToolExecutor):
         valves_config: dict[str, Any],
     ) -> str:
         """
-        Execute Toolkit code in a child process (secure isolation).
-        在子进程中执行 Toolkit 代码（安全隔离）。
+        Execute trusted Toolkit code in a child process.
+        在子进程中执行可信 Toolkit 代码。
 
-        Runs via the _sandbox_runner.py helper script in an independent process,
-        so the main process is not affected by user code.
-        通过 _sandbox_runner.py 辅助脚本在独立进程中运行，
-        主进程不受用户代码影响。
+        The _sandbox_runner.py helper invokes the tool with the application's
+        privileges and reports its result or exit to the parent.
+        _sandbox_runner.py 以应用权限调用工具，并向父进程回传结果或退出状态。
 
         Raises:
             asyncio.TimeoutError: Execution timeout / 执行超时

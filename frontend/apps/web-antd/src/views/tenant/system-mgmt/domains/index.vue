@@ -1,7 +1,7 @@
 <script lang="ts" setup>
 import type { DnsGuideData, TenantDomainInfo } from './modules/domains-types';
 
-import { onMounted, ref } from 'vue';
+import { computed, onMounted, onScopeDispose, ref } from 'vue';
 
 import { Page } from '@vben/common-ui';
 import { IconifyIcon } from '@vben/icons';
@@ -25,6 +25,7 @@ import {
   setPrimaryDomainApi,
   verifyTenantDomainApi,
 } from '#/api/tenant/domain';
+import DomainManagedHttps from '#/components/business/domain-managed-https.vue';
 import { $t } from '#/locales';
 import { useAccess } from '#/utils';
 import { copyToClipboard, formatDate } from '#/utils/common';
@@ -43,7 +44,9 @@ defineOptions({ name: 'TenantDomains' });
 
 const t = (key: string) => $t(`tenant.system.domain.${key}`);
 const { hasAccessByCodes } = useAccess();
-const canCreateDomain = hasAccessByCodes(['tenant_domain:create']);
+const canCreateDomain = computed(() =>
+  hasAccessByCodes(['tenant_domain:create']),
+);
 const canViewDomainDetail = hasAccessByCodes(['tenant_domain:detail']);
 const canSetPrimaryDomain = hasAccessByCodes(['tenant_domain:set_primary']);
 const canDeleteDomain = hasAccessByCodes(['tenant_domain:delete']);
@@ -51,8 +54,11 @@ const canViewDomainSslDetail = hasAccessByCodes(['tenant_domain:ssl_detail']);
 
 // State / 状态
 const domains = ref<TenantDomainInfo[]>([]);
-const loading = ref(false);
-const refreshing = ref(false);
+const pendingRead = ref<'page' | 'refresh' | null>(null);
+const loading = computed(() => pendingRead.value === 'page');
+const refreshing = computed(() => pendingRead.value === 'refresh');
+let latestRead = 0;
+let disposed = false;
 
 // Refs / 引用
 const addDrawerRef = ref<InstanceType<typeof DomainsAddDrawer>>();
@@ -66,38 +72,35 @@ function onOpenSsl(domain: TenantDomainInfo) {
 
 // Lifecycle / 生命周期
 onMounted(() => {
-  loadDomains();
+  void loadDomains();
+});
+onScopeDispose(() => {
+  disposed = true;
+  latestRead++;
 });
 
 // Actions / 操作
-async function loadDomains() {
-  loading.value = true;
+async function loadDomains(kind: 'page' | 'refresh' = 'page') {
+  if (disposed) return;
+  const owner = ++latestRead;
+  pendingRead.value = kind;
   try {
     const result = await getTenantDomainsApi();
-    domains.value = result.items;
+    if (owner === latestRead) domains.value = result.items;
   } catch {
   } finally {
-    loading.value = false;
-  }
-}
-
-async function onRefresh() {
-  refreshing.value = true;
-  try {
-    const result = await getTenantDomainsApi();
-    domains.value = result.items;
-  } finally {
-    refreshing.value = false;
+    if (owner === latestRead) pendingRead.value = null;
   }
 }
 
 function onOpenAddDrawer() {
+  if (!canCreateDomain.value) return;
   openAddDrawer();
 }
 
 async function onAddSuccess(newDomain: TenantDomainInfo) {
   await loadDomains();
-  if (newDomain.verificationStatus === 'pending') {
+  if (!disposed && newDomain.verificationStatus === 'pending') {
     onOpenDnsGuide(newDomain);
   }
 }
@@ -139,10 +142,12 @@ function openDnsGuideModal(domain: TenantDomainInfo) {
 }
 
 function openSslDrawer(domain: TenantDomainInfo) {
+  if (domain.verificationStatus !== 'verified') return;
   sslDrawerRef.value?.open({
     domainId: domain.id,
     domain: domain.domain,
     isDefault: domain.domainType === 'default',
+    managedHttps: domain.managedHttps,
   });
 }
 
@@ -201,13 +206,14 @@ function onCopy(text: string) {
       <Space>
         <Button
           v-access:code="['tenant_domain:create']"
+          :aria-disabled="!canCreateDomain"
           type="primary"
           @click="onOpenAddDrawer"
         >
           <IconifyIcon icon="lucide:plus" class="mr-1 size-4" />
           {{ t('add') }}
         </Button>
-        <Button :loading="refreshing" @click="onRefresh">
+        <Button :loading="refreshing" @click="loadDomains('refresh')">
           <IconifyIcon icon="lucide:refresh-cw" class="mr-1 size-4" />
           {{ $t('common.refresh') }}
         </Button>
@@ -217,7 +223,7 @@ function onCopy(text: string) {
     <Spin :spinning="loading">
       <!-- Empty State -->
       <div
-        v-if="!loading && domains.length === 0"
+        v-if="!loading && !refreshing && domains.length === 0"
         class="flex min-h-[400px] flex-col items-center justify-center rounded-xl border border-dashed border-border bg-card p-8"
       >
         <Empty :description="t('noDomains')" />
@@ -342,21 +348,34 @@ function onCopy(text: string) {
                   icon="lucide:shield-check"
                   class="mr-2 size-4 opacity-70"
                 />
-                <span>SSL</span>
+                <span>HTTPS / SSL</span>
               </div>
               <div class="flex items-center gap-2">
+                <DomainManagedHttps
+                  v-if="domain.domainType === 'default'"
+                  :info="domain.managedHttps"
+                />
                 <Badge
+                  v-else
                   :status="getSslStatusConfig(domain.sslStatus).status"
                   :text="getSslStatusConfig(domain.sslStatus).text"
                 />
                 <Button
-                  v-if="canViewDomainSslDetail"
+                  v-if="
+                    canViewDomainSslDetail &&
+                    domain.verificationStatus === 'verified'
+                  "
                   type="link"
                   size="small"
                   class="!p-0"
                   @click="onOpenSsl(domain)"
                 >
                   <IconifyIcon icon="lucide:settings" class="size-3" />
+                  {{
+                    domain.domainType === 'default'
+                      ? $t('shared.domain.managedHttps.details')
+                      : $t('shared.domain.managedHttps.setup')
+                  }}
                 </Button>
               </div>
             </div>
@@ -475,7 +494,7 @@ function onCopy(text: string) {
 
     <DomainsAddDrawer ref="addDrawerRef" @success="onAddSuccess" />
     <DomainsDetailDrawer ref="detailDrawerRef" @success="onDetailSuccess" />
-    <DomainsDnsGuideModal ref="dnsGuideModalRef" @success="loadDomains" />
+    <DomainsDnsGuideModal ref="dnsGuideModalRef" @success="loadDomains()" />
     <DomainsSslDrawer ref="sslDrawerRef" />
   </Page>
 </template>

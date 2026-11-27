@@ -8,6 +8,7 @@ Provides tenant domain business logic (platform-level, no tenant isolation).
 import secrets
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import selectinload
 
 from app.configs.service import ConfigService
@@ -18,6 +19,7 @@ from app.core.cors import (
     forget_verified_custom_domain,
     remember_verified_custom_domain,
 )
+from app.core.domains import normalize_hostname, normalize_tenant_suffix
 from app.core.hosts_helper import (
     async_add_host_entry,
     async_get_domain_entry_status,
@@ -31,12 +33,14 @@ from app.enums.domain import DomainSslStatus
 from app.exceptions import BusinessException, NotFoundException
 from app.models.tenant.tenant import Tenant
 from app.models.tenant.tenant_domain import TenantDomain
-from app.repositories.system.tenant_domain_repository import TenantDomainRepository
+from app.repositories.system.tenant_domain_repository import (
+    DomainPrimaryAdmissionError,
+    TenantDomainRepository,
+)
 from app.repositories.tenant.tenant_domain_tenant_repository import (
     TenantDomainTenantRepository,
 )
 
-_CONFIG_KEY_DOMAIN_SUFFIX = "tenant_domain_suffix"
 _CONFIG_KEY_VERIFICATION_PREFIX = "domain_verification_prefix"
 
 
@@ -52,17 +56,9 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
     repository_class = TenantDomainRepository
 
     async def _get_domain_suffix(self) -> str:
-        """
-        获取企业默认域名后缀 / Get tenant default domain suffix.
-
-        优先从平台配置读取，回退到环境变量
-        """
-        config_service = ConfigService(self.db)
-        suffix = await config_service.get_platform_config(
-            _CONFIG_KEY_DOMAIN_SUFFIX,
-            default=settings.TENANT_DOMAIN_SUFFIX,
-        )
-        return suffix or settings.TENANT_DOMAIN_SUFFIX
+        """Use the deployed routing suffix, never a mutable database override."""
+        suffix = settings.TENANT_DOMAIN_SUFFIX
+        return normalize_tenant_suffix(suffix) if suffix else ""
 
     async def _get_verification_prefix(self) -> str:
         """
@@ -85,6 +81,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
             select(Tenant)
             .where(Tenant.id == tenant_id, Tenant.is_deleted.is_(False))
             .options(selectinload(Tenant.tenant_plan))
+            .execution_options(populate_existing=True)
         )
         return result.scalar_one_or_none()
 
@@ -112,7 +109,24 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
 
     async def _is_default_domain(self, domain_obj: TenantDomain) -> bool:
         suffix = await self._get_domain_suffix()
-        return domain_obj.domain.endswith(suffix)
+        if not suffix:
+            return False
+        host = normalize_hostname(domain_obj.domain)
+        label = host.removesuffix(suffix)
+        return host.endswith(suffix) and bool(label) and "." not in label
+
+    async def _create_unique_domain(self, data: dict) -> TenantDomain:
+        """Translate a competing registration without aborting the outer request."""
+        try:
+            async with self.db.begin_nested():
+                return await self.create(data)
+        except IntegrityError as exc:
+            if await self.repo.domain_exists(data["domain"]):
+                raise BusinessException(
+                    message=_("tenant_domain.already_exists"),
+                    code=ErrorCode.DUPLICATE_ENTRY,
+                ) from exc
+            raise
 
     async def ensure_custom_domain_entitled(
         self,
@@ -126,15 +140,25 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         domains require an active plan with custom-domain entitlement at the moment an
         operation activates, extends, or promotes them.
         """
-        if await self._is_default_domain(domain_obj):
-            return
-
+        if getattr(domain_obj, "tenant_id", tenant_id) != tenant_id:
+            raise BusinessException(
+                message=_("tenant_domain.not_found"), code=ErrorCode.FORBIDDEN
+            )
         tenant = await self._get_tenant_with_plan(tenant_id)
         if not tenant:
             raise BusinessException(
                 message=_("tenant_domain.custom_domain_disabled"),
                 code=ErrorCode.FORBIDDEN,
             )
+        if await self._is_default_domain(domain_obj):
+            suffix = await self._get_domain_suffix()
+            if normalize_hostname(domain_obj.domain) != normalize_hostname(
+                f"{tenant.code}{suffix}"
+            ):
+                raise BusinessException(
+                    message=_("tenant_domain.not_found"), code=ErrorCode.FORBIDDEN
+                )
+            return
 
         from app.services.tenant.quota_service import QuotaService
 
@@ -152,7 +176,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         self,
         tenant_id: int,
         tenant_code: str,
-    ) -> TenantDomain:
+    ) -> TenantDomain | None:
         """
         创建企业默认域名 / Create tenant default domain.
 
@@ -165,11 +189,29 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
             tenant_code: 企业编码
 
         Returns:
-            创建的默认域名
+            创建的默认域名；未配置后缀时返回 None / The default domain, if a suffix is configured.
         """
         suffix = await self._get_domain_suffix()
-        domain = f"{tenant_code}{suffix}"
+        if not suffix:
+            return None
+        try:
+            label = normalize_hostname(tenant_code)
+            if "." in label or ":" in label or "." in tenant_code:
+                raise ValueError("Tenant code must be a single DNS label")
+            domain = normalize_hostname(f"{label}{suffix}")
+        except ValueError as exc:
+            raise BusinessException(
+                message=_("tenant_domain.invalid_format"),
+                code=ErrorCode.VALIDATION_ERROR,
+            ) from exc
 
+        tenant = await self._get_tenant_with_plan(tenant_id)
+        if not tenant or normalize_hostname(tenant.code) != label:
+            raise BusinessException(
+                message=_("tenant_domain.not_found"), code=ErrorCode.FORBIDDEN
+            )
+
+        await self.repo.release_deleted_domain(domain)
         if await self.repo.domain_exists(domain):
             raise BusinessException(
                 message=_("tenant_domain.already_exists"),
@@ -186,7 +228,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
             "remark": _("tenant_domain.default_domain_remark"),
         }
 
-        result = await self.create(data)
+        result = await self._create_unique_domain(data)
 
         # ⚠️  LOCAL DEV ENVIRONMENT: auto-inject default domain into hosts file / 本地开发自动写 hosts / local dev hosts inject
         if self._should_inject_hosts() and is_dev_local():
@@ -216,6 +258,18 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         Raises:
             BusinessException: 域名已存在、配额超限或套餐不允许自定义域名
         """
+        from app.schemas.tenant.domain import TenantDomainCreateRequest
+
+        # Share validation with the transport so direct service callers cannot
+        # bypass canonicalization or register the platform's managed namespace.
+        try:
+            domain = TenantDomainCreateRequest(domain=domain).domain
+        except ValueError as exc:
+            raise BusinessException(
+                message=_("tenant_domain.invalid_format"),
+                code=ErrorCode.VALIDATION_ERROR,
+            ) from exc
+
         is_allowed, max_domains = await self._check_custom_domain_allowed(tenant_id)
         if not is_allowed:
             raise BusinessException(
@@ -223,9 +277,11 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 code=ErrorCode.FORBIDDEN,
             )
 
-        suffix = await self._get_domain_suffix()
         domains = await self.repo.get_tenant_domains(tenant_id)
-        custom_count = sum(1 for d in domains if not d.domain.endswith(suffix))
+        custom_count = 0
+        for existing in domains:
+            if not await self._is_default_domain(existing):
+                custom_count += 1
 
         if max_domains > 0 and custom_count >= max_domains:
             raise BusinessException(
@@ -233,6 +289,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 code=ErrorCode.DOMAIN_QUOTA_EXCEEDED,
             )
 
+        await self.repo.release_deleted_domain(domain)
         if await self.repo.domain_exists(domain):
             raise BusinessException(
                 message=_("tenant_domain.already_exists"),
@@ -251,7 +308,25 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
             "remark": remark,
         }
 
-        return await self.create(data)
+        return await self._create_unique_domain(data)
+
+    async def _get_domain_target_for_update(
+        self,
+        tenant_id: int,
+        domain_id: int,
+    ) -> TenantDomain:
+        """Reuse primary admission without completing the caller's transaction."""
+        try:
+            domain = await self.repo.get_primary_target_for_update(tenant_id, domain_id)
+        except DomainPrimaryAdmissionError as exc:
+            raise BusinessException(
+                message=_(f"tenant_domain.primary_switch_{exc.reason}"),
+                code=ErrorCode.CONFLICT,
+                data={"reason": f"domain_primary_{exc.reason}"},
+            ) from None
+        if not domain:
+            raise NotFoundException(message=_("tenant_domain.not_found"))
+        return domain
 
     async def remove_domain(self, domain_id: int) -> bool:
         """
@@ -273,9 +348,11 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 message=_("tenant_domain.not_found"),
             )
 
-        suffix = await self._get_domain_suffix()
+        domain_obj = await self._get_domain_target_for_update(
+            domain_obj.tenant_id, domain_id
+        )
 
-        if domain_obj.domain.endswith(suffix):
+        if await self._is_default_domain(domain_obj):
             raise BusinessException(
                 message=_("tenant_domain.cannot_delete_default"),
                 code=ErrorCode.FORBIDDEN,
@@ -290,6 +367,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         domain_str = domain_obj.domain
         deleted = await self.delete(domain_id)
         if deleted:
+            await self.repo.release_deleted_domain(domain_str)
             forget_verified_custom_domain(domain_str)
 
         # ⚠️  LOCAL DEV ENVIRONMENT: remove deleted custom domain from hosts file / 本地开发移除 hosts / local dev hosts remove
@@ -331,6 +409,8 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 code=ErrorCode.FORBIDDEN,
             )
 
+        domain = await self._get_domain_target_for_update(tenant_id, domain_id)
+
         if not domain.is_verified:
             raise BusinessException(
                 message=_("tenant_domain.not_verified"),
@@ -354,21 +434,117 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         """
         return not settings.DEBUG
 
-    def _send_ssl_provision_task(self, domain_id: int) -> None:
+    def _send_ssl_provision_task(
+        self, domain_id: int, *, expected_certificate_id: int | None = None
+    ) -> None:
         """发送 SSL 签发任务 / Enqueue SSL provisioning task."""
         from app.celery_app import celery_app
 
+        replacement = (
+            {"kwargs": {"expected_certificate_id": expected_certificate_id}}
+            if expected_certificate_id is not None
+            else {}
+        )
         celery_app.send_task(
             "app.tasks.ssl_tasks.task_provision_ssl",
             args=[domain_id],
             queue="default",
             countdown=2,
+            **replacement,
         )
 
-    async def start_ssl_provision(self, domain_id: int) -> TenantDomain:
+    async def _get_current_ssl_certificate(self, domain_id: int):
+        from app.services.system.ssl_certificate_service import SslCertificateService
+
+        return await SslCertificateService(self.db).get_cert_detail(domain_id)
+
+    async def trigger_ssl_provision(
+        self, domain_id: int, *, force_replace: bool = False
+    ) -> dict:
+        """Prepare, commit, then dispatch; shared HTTPS creates no domain job."""
+        from app.core.managed_https import get_managed_https
+        from app.enums.domain import SslCertStatus
+
+        domain = await self.get_by_id(domain_id)
+        if not domain:
+            raise NotFoundException(message=_("tenant_domain.not_found"))
+        await self.ensure_custom_domain_entitled(domain.tenant_id, domain)
+        expected_certificate_id = None
+        managed = await self._is_default_domain(domain)
+        if force_replace and not managed:
+            current = await self._get_current_ssl_certificate(domain_id)
+            if not current or current.status not in {
+                SslCertStatus.ACTIVE.value,
+                SslCertStatus.EXPIRED.value,
+            }:
+                raise BusinessException(
+                    message=_("ssl_certificate.cert_not_current"),
+                    code=ErrorCode.CONFLICT,
+                    status_code=409,
+                )
+            expected_certificate_id = current.id
+        domain = await self.start_ssl_provision(
+            domain_id, expected_certificate_id=expected_certificate_id
+        )
+        if managed:
+            return {
+                "status": "managed_wildcard",
+                "managed_https": get_managed_https(domain.domain),
+            }
+        await self.db.commit()
+        await self.dispatch_ssl_provision(
+            domain_id, expected_certificate_id=expected_certificate_id
+        )
+        return {"status": DomainSslStatus.PROVISIONING.value}
+
+    async def trigger_ssl_renew(self, domain_id: int) -> None:
+        """Renew only the current recoverable platform-issued domain certificate."""
+        from app.enums.domain import SslCertStatus, SslCertType
+        from app.services.system.dns_provider import ensure_dns_provider_ready
+
+        domain = await self.get_by_id(domain_id)
+        if not domain:
+            raise NotFoundException(message=_("tenant_domain.not_found"))
+        await self.ensure_custom_domain_entitled(domain.tenant_id, domain)
+        if not domain.is_verified:
+            raise BusinessException(
+                message=_("ssl_certificate.domain_not_verified"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+        if await self._is_default_domain(domain):
+            raise BusinessException(
+                message=_("ssl_certificate.managed_wildcard"),
+                code=ErrorCode.CONFLICT,
+                status_code=409,
+            )
+        cert = await self._get_current_ssl_certificate(domain_id)
+        if (
+            not cert
+            or cert.cert_type != SslCertType.PLATFORM.value
+            or cert.status
+            not in {SslCertStatus.ACTIVE.value, SslCertStatus.EXPIRED.value}
+        ):
+            raise BusinessException(
+                message=_("ssl_certificate.cert_not_current"),
+                code=ErrorCode.CONFLICT,
+                status_code=409,
+            )
+        await ensure_dns_provider_ready(self.db)
+        from app.celery_app import celery_app
+
+        celery_app.send_task(
+            "app.tasks.ssl_tasks.task_renew_ssl",
+            kwargs={"cert_id": cert.id},
+            queue="default",
+        )
+
+    async def start_ssl_provision(
+        self, domain_id: int, *, expected_certificate_id: int | None = None
+    ) -> TenantDomain:
         """
         校验 DNS 自动化能力并触发签发 / Validate DNS automation readiness and enqueue provisioning.
         """
+        from app.enums.domain import SslCertStatus
         from app.services.system.dns_provider import ensure_dns_provider_ready
 
         domain = await self.get_by_id(domain_id)
@@ -379,13 +555,37 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 message=_("ssl_certificate.domain_not_verified"),
                 code=ErrorCode.VALIDATION_ERROR,
             )
+        # The deployed wildcard serves managed tenant subdomains. Per-domain ACME
+        # issuance would require needless DNS challenges for every new tenant.
+        if await self._is_default_domain(domain):
+            await self.ensure_custom_domain_entitled(domain.tenant_id, domain)
+            return domain
         if domain.ssl_status == DomainSslStatus.PROVISIONING.value:
             raise BusinessException(
                 message=_("ssl_certificate.provision_in_progress"),
                 code=ErrorCode.CONFLICT,
+                status_code=409,
             )
 
         await self.ensure_custom_domain_entitled(domain.tenant_id, domain)
+        current = await self._get_current_ssl_certificate(domain_id)
+        recoverable = current and current.status in {
+            SslCertStatus.ACTIVE.value,
+            SslCertStatus.EXPIRED.value,
+        }
+        if expected_certificate_id is not None:
+            if not recoverable or current.id != expected_certificate_id:
+                raise BusinessException(
+                    message=_("ssl_certificate.cert_not_current"),
+                    code=ErrorCode.CONFLICT,
+                    status_code=409,
+                )
+        elif recoverable:
+            raise BusinessException(
+                message=_("ssl_certificate.replace_required"),
+                code=ErrorCode.CONFLICT,
+                status_code=409,
+            )
         await ensure_dns_provider_ready(self.db)
         result = await self.update(
             domain_id,
@@ -394,8 +594,34 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         if not result:
             raise NotFoundException(message=_("tenant_domain.not_found"))
 
-        self._send_ssl_provision_task(domain_id)
         return result
+
+    async def dispatch_ssl_provision(
+        self, domain_id: int, *, expected_certificate_id: int | None = None
+    ) -> None:
+        """Dispatch only after the caller has committed the provisioning state."""
+        domain = await self.get_by_id(domain_id)
+        if not domain or await self._is_default_domain(domain):
+            return
+        if domain.ssl_status != DomainSslStatus.PROVISIONING.value:
+            return
+        try:
+            if expected_certificate_id is None:
+                self._send_ssl_provision_task(domain_id)
+            else:
+                self._send_ssl_provision_task(
+                    domain_id, expected_certificate_id=expected_certificate_id
+                )
+        except Exception:
+            from app.services.system.ssl_certificate_service import (
+                SslCertificateService,
+            )
+
+            await SslCertificateService(self.db).mark_provision_failed(
+                domain_id, "SSL task dispatch failed"
+            )
+            await self.db.commit()
+            raise
 
     async def maybe_auto_start_ssl_after_verify(
         self,
@@ -445,6 +671,12 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
 
         await self.ensure_custom_domain_entitled(domain.tenant_id, domain)
 
+        expected_identity = (
+            domain.tenant_id,
+            normalize_hostname(domain.domain),
+            domain.verification_token,
+        )
+
         # 开发模式跳过 DNS 验证
         if settings.DEBUG:
             is_valid = True
@@ -457,6 +689,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
                 code=ErrorCode.VALIDATION_ERROR,
             )
 
+        domain = await self._admit_domain_verification(domain_id, expected_identity)
         result = await self.update(
             domain_id,
             {
@@ -474,6 +707,37 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         remember_verified_custom_domain(domain.domain)
 
         return result
+
+    async def _admit_domain_verification(
+        self,
+        domain_id: int,
+        expected_identity: tuple[int, str, str | None],
+    ) -> TenantDomain:
+        """中文: 写入前将 DNS 证明绑定到锁定的当前域名。
+
+        EN: Bind completed DNS proof to the locked live domain before writing it.
+        """
+        # 中文: DNS 查询不持锁，标量身份不会被 ORM 刷新覆盖。
+        # EN: DNS runs before locking; scalar proof identity survives ORM refresh.
+        domain = await self._get_domain_target_for_update(
+            expected_identity[0], domain_id
+        )
+        if (
+            domain.tenant_id,
+            normalize_hostname(domain.domain),
+            domain.verification_token,
+        ) != expected_identity:
+            raise BusinessException(
+                message=_("tenant_domain.verify_failed"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+        if domain.is_verified:
+            raise BusinessException(
+                message=_("tenant_domain.already_verified"),
+                code=ErrorCode.VALIDATION_ERROR,
+            )
+        await self.ensure_custom_domain_entitled(expected_identity[0], domain)
+        return domain
 
     async def _verify_dns_txt_record(self, domain: TenantDomain) -> bool:
         """
@@ -493,25 +757,22 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
 
         txt_record_name = f"{prefix}.{domain.domain}"
         expected_value = domain.verification_token
+        if not expected_value:
+            return False
 
         try:
             answers = await asyncio.to_thread(
-                dns.resolver.resolve, txt_record_name, "TXT"
+                dns.resolver.resolve, txt_record_name, "TXT", lifetime=5.0
             )
 
             for rdata in answers:
-                txt_value = str(rdata).strip('"').strip()
-                if txt_value == expected_value:
+                txt_value = b"".join(rdata.strings)
+                if txt_value == expected_value.encode("utf-8"):
                     return True
 
             return False
 
-        except (
-            dns.resolver.NXDOMAIN,
-            dns.resolver.NoAnswer,
-            dns.resolver.NoNameservers,
-            Exception,
-        ):
+        except dns.exception.DNSException:
             return False
 
     async def get_tenant_domains(self, tenant_id: int) -> list[TenantDomain]:
@@ -548,7 +809,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         Returns:
             域名实例或 None
         """
-        return await self.repo.get_by_domain(domain)
+        return await self.repo.get_by_domain(normalize_hostname(domain))
 
     async def update_domain(
         self,
@@ -595,7 +856,7 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         """
         return secrets.token_hex(16)
 
-    async def get_cname_target(self, tenant_id: int) -> str:
+    async def get_cname_target(self, tenant_id: int) -> str | None:
         """
         获取企业的 CNAME 解析目标 / Get tenant CNAME target.
 
@@ -605,11 +866,11 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         Returns:
             CNAME 目标（如 tenant_code.novusai.com）
         """
-        tenant = await self._get_tenant_with_plan(tenant_id)
-        if not tenant:
-            return ""
         suffix = await self._get_domain_suffix()
-        return f"{tenant.code}{suffix}"
+        if not suffix:
+            return None
+        tenant = await self._get_tenant_with_plan(tenant_id)
+        return f"{tenant.code}{suffix}" if tenant else None
 
     async def get_verification_record(self, domain_obj: TenantDomain) -> dict:
         """
@@ -777,38 +1038,60 @@ class TenantDomainService(GlobalService[TenantDomain, TenantDomainRepository]):
         Returns:
             触发签发的域名数量
         """
-        from app.enums.domain import DomainSslStatus
+        from app.enums.domain import DomainSslStatus, SslCertStatus
         from app.services.system.dns_provider import ensure_dns_provider_ready
 
+        domains = await self.repo.get_ssl_provision_candidates(tenant_id)
+        custom_domains = []
+        self._ssl_batch_skipped = 0
+        for domain in domains:
+            if await self._is_default_domain(domain):
+                self._ssl_batch_skipped += 1
+                continue
+            await self.ensure_custom_domain_entitled(tenant_id, domain)
+            current = await self._get_current_ssl_certificate(domain.id)
+            if current and current.status in {
+                SslCertStatus.ACTIVE.value,
+                SslCertStatus.EXPIRED.value,
+            }:
+                self._ssl_batch_skipped += 1
+                continue
+            custom_domains.append(domain)
+        if not custom_domains:
+            self._pending_ssl_domain_ids = []
+            return 0
         await ensure_dns_provider_ready(self.db)
 
-        result = await self.db.execute(
-            select(TenantDomain).where(
-                TenantDomain.tenant_id == tenant_id,
-                TenantDomain.is_verified.is_(True),
-                TenantDomain.ssl_status.in_(
-                    [
-                        DomainSslStatus.NONE.value,
-                        DomainSslStatus.FAILED.value,
-                        DomainSslStatus.EXPIRED.value,
-                    ]
-                ),
-                TenantDomain.is_deleted.is_(False),
-            )
-        )
-        domains = list(result.scalars().all())
-
         triggered = 0
-        for domain in domains:
-            await self.ensure_custom_domain_entitled(tenant_id, domain)
-            await self.update(
+        self._pending_ssl_domain_ids = []
+        for domain in custom_domains:
+            result = await self.update(
                 domain.id,
                 {"ssl_status": DomainSslStatus.PROVISIONING.value},
             )
-            self._send_ssl_provision_task(domain.id)
+            if not result:
+                self._ssl_batch_skipped += 1
+                continue
+            self._pending_ssl_domain_ids.append(domain.id)
             triggered += 1
 
         return triggered
+
+    @property
+    def ssl_batch_skipped(self) -> int:
+        """Candidates skipped by the most recent batch preparation."""
+        return self._ssl_batch_skipped
+
+    async def dispatch_batch_ssl_provision(self) -> None:
+        """Dispatch this service instance's batch after the caller commits it."""
+        failure = None
+        for domain_id in self._pending_ssl_domain_ids:
+            try:
+                await self.dispatch_ssl_provision(domain_id)
+            except Exception as exc:
+                failure = exc
+        if failure is not None:
+            raise failure
 
 
 class TenantDomainTenantService(
@@ -836,15 +1119,18 @@ class TenantDomainTenantService(
         domain = await self.get_by_id(domain_id)
         if not domain or domain.tenant_id != tenant_id:
             raise NotFoundException(message=_("tenant_domain.not_found"))
-        await self.ensure_custom_domain_entitled(tenant_id, domain)
         return await super().set_primary_domain(tenant_id, domain_id)
 
-    async def start_ssl_provision(self, domain_id: int) -> TenantDomain:
+    async def start_ssl_provision(
+        self, domain_id: int, *, expected_certificate_id: int | None = None
+    ) -> TenantDomain:
         domain = await self.get_by_id(domain_id)
         if not domain or domain.tenant_id != self.tenant_id:
             raise NotFoundException(message=_("tenant_domain.not_found"))
         await self.ensure_custom_domain_entitled(self.tenant_id, domain)
-        return await super().start_ssl_provision(domain_id)
+        return await super().start_ssl_provision(
+            domain_id, expected_certificate_id=expected_certificate_id
+        )
 
     async def verify_domain(self, domain_id: int) -> TenantDomain:
         """
@@ -866,6 +1152,12 @@ class TenantDomainTenantService(
 
         await self.ensure_custom_domain_entitled(self.tenant_id, domain)
 
+        expected_identity = (
+            domain.tenant_id,
+            normalize_hostname(domain.domain),
+            domain.verification_token,
+        )
+
         # 企业端始终执行真实 DNS 验证，不跳过
         is_valid = await self._verify_dns_txt_record(domain)
 
@@ -875,6 +1167,7 @@ class TenantDomainTenantService(
                 code=ErrorCode.VALIDATION_ERROR,
             )
 
+        domain = await self._admit_domain_verification(domain_id, expected_identity)
         result = await self.update(
             domain_id,
             {

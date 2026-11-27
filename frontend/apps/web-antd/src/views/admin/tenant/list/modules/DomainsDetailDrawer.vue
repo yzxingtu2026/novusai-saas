@@ -5,7 +5,7 @@
  */
 import type { DomainDetailData, TenantDomainInfo } from './domains-types';
 
-import { ref } from 'vue';
+import { onScopeDispose, ref } from 'vue';
 
 import { useVbenDrawer } from '@vben/common-ui';
 import { IconifyIcon } from '@vben/icons';
@@ -22,9 +22,11 @@ import {
 } from 'ant-design-vue';
 
 import { adminApi as admin } from '#/api';
+import DomainManagedHttps from '#/components/business/domain-managed-https.vue';
 import { $t } from '#/locales';
 import { useAccess } from '#/utils';
 import { formatDate } from '#/utils/common';
+import { getDomainSslPresentation } from '#/utils/domain-presentation';
 
 import DomainsDnsGuideModal from './DomainsDnsGuideModal.vue';
 
@@ -40,6 +42,40 @@ const loading = ref(false);
 const submitting = ref(false);
 const editMode = ref(false);
 const editRemark = ref('');
+let disposed = false;
+let generation = 0;
+let readGeneration = 0;
+
+function currentOwner() {
+  return detailData.value && !disposed
+    ? { ...detailData.value, generation }
+    : null;
+}
+
+function ownsView(owner: NonNullable<ReturnType<typeof currentOwner>>) {
+  return (
+    !disposed &&
+    generation === owner.generation &&
+    detailData.value?.tenantId === owner.tenantId &&
+    detailData.value?.domainId === owner.domainId
+  );
+}
+
+function resetView() {
+  generation++;
+  readGeneration++;
+  detailData.value = null;
+  domainDetail.value = null;
+  loading.value = false;
+  submitting.value = false;
+  editMode.value = false;
+  editRemark.value = '';
+}
+
+onScopeDispose(() => {
+  disposed = true;
+  resetView();
+});
 
 // Child component refs / 子组件引用
 const dnsGuideModalRef = ref<InstanceType<typeof DomainsDnsGuideModal>>();
@@ -49,17 +85,14 @@ const canUpdateDomain = hasAccessByCodes(['tenant_domain:update']);
 // Drawer / 抽屉
 const [Drawer, drawerApi] = useVbenDrawer({
   async onOpenChange(isOpen) {
+    if (disposed) return;
+    resetView();
     if (isOpen) {
       const data = drawerApi.getData<DomainDetailData>();
       if (data?.domainId && data?.tenantId) {
         detailData.value = data;
         await loadDetail();
       }
-    } else {
-      detailData.value = null;
-      domainDetail.value = null;
-      editMode.value = false;
-      editRemark.value = '';
     }
   },
   footer: false,
@@ -67,52 +100,61 @@ const [Drawer, drawerApi] = useVbenDrawer({
 
 /** 加载域名详情 / Load domain detail */
 async function loadDetail() {
-  if (!detailData.value) return;
+  const owner = currentOwner();
+  if (!owner) return;
+  const read = ++readGeneration;
 
   loading.value = true;
   try {
     const result = await admin.getTenantDomainApi(
-      detailData.value.tenantId,
-      detailData.value.domainId,
+      owner.tenantId,
+      owner.domainId,
     );
+    if (!ownsView(owner) || read !== readGeneration) return;
     domainDetail.value = result as TenantDomainInfo;
     editRemark.value = result.remark || '';
   } catch {
   } finally {
-    loading.value = false;
+    if (ownsView(owner) && read === readGeneration) loading.value = false;
   }
 }
 
 /** 进入编辑模式 / Enter edit mode */
 function onEnterEdit() {
+  if (disposed || loading.value || submitting.value || !canUpdateDomain) return;
   editMode.value = true;
   editRemark.value = domainDetail.value?.remark || '';
 }
 
 /** 取消编辑 / Cancel edit */
 function onCancelEdit() {
+  if (disposed || submitting.value) return;
   editMode.value = false;
   editRemark.value = domainDetail.value?.remark || '';
 }
 
 /** 保存备注 / Save remark */
 async function onSaveRemark() {
-  if (!detailData.value) return;
+  const owner = currentOwner();
+  if (!owner || submitting.value || loading.value || !canUpdateDomain) return;
+  const remark = editRemark.value.trim();
 
   submitting.value = true;
   try {
-    await admin.updateTenantDomainApi(
-      detailData.value.tenantId,
-      detailData.value.domainId,
-      { remark: editRemark.value.trim() || null },
-    );
+    await admin.updateTenantDomainApi(owner.tenantId, owner.domainId, {
+      remark,
+    });
+    if (disposed) return;
+    // 中文：已提交写入仍通知父列表刷新，面板变化只撤销当前视图反馈。
+    // EN: A committed write still refreshes the parent; panel changes revoke only view feedback.
+    emits('success');
+    if (!ownsView(owner)) return;
     message.success($t('admin.tenant.domain.updateSuccess'));
     editMode.value = false;
     await loadDetail();
-    emits('success');
   } catch {
   } finally {
-    submitting.value = false;
+    if (ownsView(owner)) submitting.value = false;
   }
 }
 
@@ -132,33 +174,12 @@ function getVerificationTagConfig(status: string) {
 }
 
 /** 获取 SSL 状态标签配置 / Get SSL status tag config */
-function getSslTagConfig(status: string) {
-  switch (status) {
-    case 'active': {
-      return {
-        color: 'success',
-        text: $t('admin.tenant.domain.ssl.status.active'),
-      };
-    }
-    case 'expired': {
-      return {
-        color: 'error',
-        text: $t('admin.tenant.domain.ssl.status.expired'),
-      };
-    }
-    case 'pending': {
-      return {
-        color: 'processing',
-        text: $t('admin.tenant.domain.ssl.status.pending'),
-      };
-    }
-    default: {
-      return {
-        color: 'default',
-        text: $t('admin.tenant.domain.ssl.status.none'),
-      };
-    }
-  }
+function getSslTagConfig(status?: string) {
+  const presentation = getDomainSslPresentation(status);
+  return {
+    ...presentation,
+    text: $t(`admin.tenant.domain.ssl.status.${presentation.key}`),
+  };
 }
 
 /** 打开 DNS 引导 / Open DNS guide */
@@ -245,16 +266,23 @@ defineExpose({ open });
           </Descriptions.Item>
 
           <Descriptions.Item label="SSL">
-            <Tag :color="getSslTagConfig(domainDetail.sslStatus).color">
-              {{ getSslTagConfig(domainDetail.sslStatus).text }}
-            </Tag>
-            <span
-              v-if="domainDetail.sslExpiresAt"
-              class="ml-2 text-xs text-muted-foreground"
-            >
-              {{ $t('admin.tenant.domain.ssl.info.validTo') }}:
-              {{ formatDate(domainDetail.sslExpiresAt) }}
-            </span>
+            <DomainManagedHttps
+              v-if="domainDetail.domainType === 'default'"
+              :info="domainDetail.managedHttps"
+              detail
+            />
+            <template v-else>
+              <Tag :color="getSslTagConfig(domainDetail.sslStatus).color">
+                {{ getSslTagConfig(domainDetail.sslStatus).text }}
+              </Tag>
+              <span
+                v-if="domainDetail.sslExpiresAt"
+                class="ml-2 text-xs text-muted-foreground"
+              >
+                {{ $t('admin.tenant.domain.ssl.info.validTo') }}:
+                {{ formatDate(domainDetail.sslExpiresAt) }}
+              </span>
+            </template>
           </Descriptions.Item>
 
           <Descriptions.Item :label="$t('admin.tenant.domain.createdAt')">

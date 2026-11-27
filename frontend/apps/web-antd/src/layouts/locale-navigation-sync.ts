@@ -7,6 +7,9 @@ import type { RefreshPluginSlotsOptions } from '#/composables/use-plugin-fronten
 
 import { resolveRouteMetaTitle } from '@vben/utils';
 
+import { normalizeHttpError } from '#/utils/request/app-error';
+import { ErrorCode } from '#/utils/request/error-codes';
+
 type AccessibleResult = {
   accessibleMenus: unknown[];
   accessibleRoutes: unknown[];
@@ -50,6 +53,7 @@ export interface SyncLocaleNavigationOptions {
   ) => Promise<void>;
   router: RouterLike;
   routes: RouteRecordRaw[];
+  syncRuntimeLocale: (locale: string) => Promise<void>;
   tabbarStore: TabbarStoreLike;
   translate: TranslateFn;
   userRoles: string[];
@@ -112,6 +116,10 @@ export function syncOpenTabTitles(options: {
 export async function syncLocaleNavigation(
   options: SyncLocaleNavigationOptions,
 ) {
+  // The preference watcher can run before lazy locale messages finish loading.
+  // Requests must observe the active runtime language before rebuilding menus.
+  await options.syncRuntimeLocale(options.locale);
+
   const { accessibleMenus, accessibleRoutes } = await options.generateAccess(
     {
       roles: options.userRoles,
@@ -123,9 +131,25 @@ export async function syncLocaleNavigation(
 
   options.accessStore.setAccessMenus(accessibleMenus);
   options.accessStore.setAccessRoutes(accessibleRoutes);
-  await options.refreshPluginSlots(options.endpoint, options.router as Router, {
-    reloadAssets: false,
-  });
+  try {
+    await options.refreshPluginSlots(
+      options.endpoint,
+      options.router as Router,
+      {
+        reloadAssets: false,
+      },
+    );
+  } catch (error) {
+    const { code, status } = normalizeHttpError(error);
+    // A denied admin plugin catalog is optional for host navigation.
+    if (
+      options.endpoint !== 'admin' ||
+      status !== 403 ||
+      code !== ErrorCode.FORBIDDEN
+    ) {
+      throw error;
+    }
+  }
 
   syncOpenTabTitles({
     hasLocaleKey: options.hasLocaleKey,

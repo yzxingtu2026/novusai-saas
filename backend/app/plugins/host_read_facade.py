@@ -12,19 +12,27 @@ No raw session or arbitrary SQL is exposed to plugins.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from decimal import Decimal
-from typing import Any
+from typing import TYPE_CHECKING, Any
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 from app.core.response import serialize_datetime_for_api
+from app.core.security import TOKEN_SCOPE_ADMIN
 from app.models.system.plugin import Plugin
 from app.models.tenant.tenant import Tenant
 from app.models.tenant.tenant_plan import TenantPlan
+from app.plugins.context_primitives import RequestContext
+from app.plugins.exceptions import PluginSecurityError
 from app.services.common.storage_config_resolver import StorageConfigResolver
 from app.storage.manager import storage_manager
+
+if TYPE_CHECKING:
+    from app.plugins.storage_billing_execution import StorageBillingFetchRequest
 
 
 def _serialize_decimal(value: Decimal | int | float | None) -> float | int | None:
@@ -52,13 +60,75 @@ def _serialize_plan(plan: TenantPlan) -> dict[str, Any]:
     }
 
 
+_SENSITIVE_STORAGE_KEY_PARTS = (
+    "secret",
+    "password",
+    "passwd",
+    "token",
+    "credential",
+    "privatekey",
+    "accesskey",
+    "apikey",
+    "authorization",
+    "signature",
+)
+
+
+def _is_sensitive_storage_key(key: object) -> bool:
+    normalized = "".join(char for char in str(key).lower() if char.isalnum())
+    return normalized == "sig" or any(
+        part in normalized for part in _SENSITIVE_STORAGE_KEY_PARTS
+    )
+
+
+def _redact_storage_options(value: Any) -> Any:
+    """Copy snapshots with recursive credential redaction / 递归脱敏并复制快照。"""
+    if isinstance(value, dict):
+        return {
+            key: (
+                (item if item is None or item == "" else "***")
+                if _is_sensitive_storage_key(key)
+                else _redact_storage_options(item)
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        return [_redact_storage_options(item) for item in value]
+    if isinstance(value, str):
+        return _redact_storage_url(value)
+    return value
+
+
+def _redact_storage_url(value: Any) -> Any:
+    """Remove URL credentials, signed queries and fragments / 移除 URL 凭据、签名及片段。"""
+    if not isinstance(value, str) or not value:
+        return value
+    try:
+        parsed = urlsplit(value)
+        if not parsed.netloc:
+            return value
+        hostname = parsed.hostname or ""
+        if ":" in hostname:
+            hostname = f"[{hostname}]"
+        port = f":{parsed.port}" if parsed.port is not None else ""
+    except ValueError:
+        return "***"
+    query = [
+        (key, "***" if item and _is_sensitive_storage_key(key) else item)
+        for key, item in parse_qsl(parsed.query, keep_blank_values=True)
+    ]
+    return urlunsplit(
+        (parsed.scheme, hostname + port, parsed.path, urlencode(query), "")
+    )
+
+
 def _serialize_storage_config(storage_config) -> dict[str, Any]:
-    """Build a read-only storage config snapshot. / 构建只读存储配置快照。"""
+    """Build a credential-free storage snapshot / 构建不含凭据的存储快照。"""
     return {
         "driver": storage_config.driver,
         "root_path": storage_config.root_path,
-        "base_url": storage_config.base_url,
-        "options": storage_config.options or {},
+        "base_url": _redact_storage_url(storage_config.base_url),
+        "options": _redact_storage_options(storage_config.options or {}),
     }
 
 
@@ -69,14 +139,87 @@ class HostReadFacade:
     暴露给插件运行时的只读门面。
     """
 
-    def __init__(self, db: AsyncSession) -> None:
+    def __init__(
+        self,
+        db: AsyncSession,
+        *,
+        request_context: RequestContext | None = None,
+        plugin_name: str = "",
+        granted_capabilities: Iterable[str] | None = None,
+    ) -> None:
         self._db = db
+        self._request_context = request_context
+        self._plugin_name = plugin_name
+        self._granted_capabilities = frozenset(granted_capabilities or ())
+
+    async def execute_storage_billing_fetch(
+        self, request: StorageBillingFetchRequest | dict[str, Any]
+    ) -> Any:
+        """Execute fixed billing without disclosing credentials / 固定执行账单采集，不暴露凭据。"""
+        if self._plugin_name != "storage-billing" or not {
+            "platform:read",
+            "storage:credential_use",
+        }.issubset(self._granted_capabilities):
+            raise PluginSecurityError(
+                message="Storage billing execution requires explicit plugin capability grants.",
+            )
+        self._authorize_platform()
+        from app.plugins.storage_billing_execution import _execute_storage_billing_fetch
+
+        return await _execute_storage_billing_fetch(self._db, request, host_read=self)
+
+    async def read_storage_billing_prerequisites(self, tenant_id: int) -> dict[str, Any]:
+        """Read billing readiness for the authenticated tenant."""
+        if self._plugin_name != "storage-billing":
+            raise PluginSecurityError(message="Storage billing readiness is unavailable.")
+        self._authorize_tenant(tenant_id)
+        from app.plugins.storage_billing_execution import _read_billing_prerequisites
+
+        return await _read_billing_prerequisites(
+            self._db, tenant_id, granted_capabilities=self._granted_capabilities
+        )
+
+    def _is_platform_admin(self) -> bool:
+        context = self._request_context
+        return (
+            context is not None
+            and context.user_role == TOKEN_SCOPE_ADMIN
+            and context.user_id is not None
+            and context.tenant_id is None
+        )
+
+    def _authorize_tenant(self, tenant_id: int) -> None:
+        """Bind request reads to their tenant / 将请求读取绑定到其租户。"""
+        if self._plugin_name and "platform:read" not in self._granted_capabilities:
+            raise PluginSecurityError(
+                message="Plugin host reads require the platform:read capability."
+            )
+        context = self._request_context
+        # Host lifecycle/tasks have no request identity / 宿主生命周期和任务无请求身份。
+        if context is None or self._is_platform_admin():
+            return
+        if context.tenant_id is None or context.tenant_id != tenant_id:
+            raise PluginSecurityError(
+                message="Plugin host read is restricted to the current tenant.",
+            )
+
+    def _authorize_platform(self) -> None:
+        """Limit platform storage reads to host/admin / 平台存储仅读取宿主或管理员身份。"""
+        if self._plugin_name and "platform:read" not in self._granted_capabilities:
+            raise PluginSecurityError(
+                message="Plugin host reads require the platform:read capability."
+            )
+        if self._request_context is not None and not self._is_platform_admin():
+            raise PluginSecurityError(
+                message="Plugin platform storage read requires a platform administrator.",
+            )
 
     async def get_enabled_storage_drivers(self) -> list[dict[str, Any]]:
         """
         Return currently available storage drivers with plugin ownership hints.
         / 返回当前可用存储驱动及其插件归属提示。
         """
+        self._authorize_platform()
         result = await self._db.execute(
             select(Plugin.name, Plugin.status, Plugin.manifest).where(
                 Plugin.is_deleted.is_(False),
@@ -131,6 +274,7 @@ class HostReadFacade:
         Return host-side plugin runtime snapshots.
         / 返回宿主侧插件运行时快照。
         """
+        self._authorize_platform()
         stmt = select(
             Plugin.id,
             Plugin.name,
@@ -173,6 +317,7 @@ class HostReadFacade:
         Return a read-only snapshot of a tenant plan.
         / 返回企业套餐只读快照。
         """
+        self._authorize_platform()
         result = await self._db.execute(
             select(TenantPlan).where(
                 TenantPlan.id == plan_id,
@@ -189,6 +334,7 @@ class HostReadFacade:
         Return tenant + assigned plan snapshot.
         / 返回企业及其已分配套餐快照。
         """
+        self._authorize_tenant(tenant_id)
         result = await self._db.execute(
             select(Tenant)
             .where(
@@ -219,6 +365,7 @@ class HostReadFacade:
         Resolve tenant effective storage context snapshot.
         / 解析企业有效存储上下文快照。
         """
+        self._authorize_tenant(tenant_id)
         resolver = StorageConfigResolver(self._db)
         storage_mode, storage_config, apply_quota = await resolver.resolve_context(
             tenant_id
@@ -235,6 +382,7 @@ class HostReadFacade:
         Resolve platform storage context snapshot.
         / 解析平台对象存储上下文快照。
         """
+        self._authorize_platform()
         resolver = StorageConfigResolver(self._db)
         storage_config = await resolver.resolve_platform_config()
         return {

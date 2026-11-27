@@ -203,7 +203,6 @@ class AdminNotificationTemplateController(GlobalController):
             template_id: int,
             admin: ActiveAdmin,
         ):
-            _ = (request, admin)
             repo = NotificationTemplateRepository(db)
             template = await repo.get_by_id(template_id)
             if not template:
@@ -222,7 +221,6 @@ class AdminNotificationTemplateController(GlobalController):
             template_id: int,
             admin: ActiveAdmin,
         ):
-            _ = (request, admin)
             repo = NotificationTemplateRepository(db)
             template = await repo.get_by_id(template_id)
             if not template:
@@ -307,17 +305,15 @@ class AdminNotificationTemplateController(GlobalController):
             }
 
             service = NotificationService(db)
-            count = await service.send(
+            accepted_count = await service.send_test(
                 template_code=template.code,
-                recipients=[("admin", admin.id)],
+                admin_id=admin.id,
                 data=sample_data,
-                tenant_id=None,
-                force_all_channels=True,
             )
             await db.commit()
 
             return success(
-                data={"sent": count, "template_code": template.code},
+                data={"accepted_count": accepted_count, "template_code": template.code},
                 message=_("common.success"),
             )
 

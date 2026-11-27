@@ -290,6 +290,7 @@ pnpm build:antd
 - `docker-compose.dev.yml` 用于本地 PostgreSQL 与 Redis。
 - `docker-compose.prod.yml` 作为生产编排参考，实际部署时需要结合私有环境变量、反向代理、HTTPS、日志、监控、备份和容量规划。
 - `production.env.example` 是生产环境变量示例文件，复制为 `production.env` 后按部署环境修改。
+- 使用 Compose 前，确认 `NOVUSAI_IMAGE_PREFIX` 和 `NOVUSAI_IMAGE_TAG` 对应同一版本的四个已发布镜像。默认前缀与当前仓库的镜像发布工作流一致。
 
 生产 Compose 参考启动方式：
 

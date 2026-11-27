@@ -22,6 +22,7 @@ _SUPPORTED_REASONING_EFFORTS: tuple[str, ...] = (
     "medium",
     "high",
     "xhigh",
+    "max",
 )
 _OPENAI_RUNTIME_OVERRIDE_PATHS: dict[str, str] = {
     "responses_reasoning_effort": (
@@ -153,13 +154,14 @@ class OpenAIAdapterModelRequestMixin:
         )
 
     @classmethod
-    def _supports_reasoning_effort_model(cls, model: str) -> bool:
+    def _supports_reasoning_effort_model(cls, model: str, *, effort: str) -> bool:
         normalized = str(model or "").strip().lower()
-        if not normalized:
-            return False
-        return any(
-            normalized.startswith(prefix)
-            for prefix in RESPONSES_REASONING_SUMMARY_MODEL_PREFIXES
+        # 中文: GPT-6 的档位支持独立于 Responses 自动摘要，旧型号沿用已有档位。
+        # EN: GPT-6 effort is independent of automatic Responses summaries. Older models retain their established levels.
+        if normalized == "gpt-6" or normalized.startswith(("gpt-6.", "gpt-6-")):
+            return True
+        return effort != "max" and normalized.startswith(
+            RESPONSES_REASONING_SUMMARY_MODEL_PREFIXES
         )
 
     @classmethod
@@ -191,7 +193,9 @@ class OpenAIAdapterModelRequestMixin:
             if config_effort is None:
                 effective_request["ignored_overrides"].append(config_path)
                 effective_request["ignore_reasons"][config_path] = "invalid_value"
-            elif not cls._supports_reasoning_effort_model(logical_model_code):
+            elif not cls._supports_reasoning_effort_model(
+                logical_model_code, effort=config_effort
+            ):
                 effective_request["ignored_overrides"].append(config_path)
                 effective_request["ignore_reasons"][config_path] = (
                     "unsupported_model_family"
@@ -281,7 +285,9 @@ class OpenAIAdapterModelRequestMixin:
             or effective_request.get("upstream_model")
             or ""
         )
-        if not cls._supports_reasoning_effort_model(logical_model_code):
+        if not cls._supports_reasoning_effort_model(
+            logical_model_code, effort=override
+        ):
             ignored_overrides = list(
                 effective_request.get("ignored_overrides", []) or []
             )

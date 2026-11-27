@@ -3,6 +3,7 @@
  */
 import type {
   DomainType,
+  ManagedHttpsInfo,
   SslStatus,
   SslType,
   VerificationStatus,
@@ -24,6 +25,7 @@ export interface TenantDomainInfo {
   isPrimary: boolean;
   verificationStatus: VerificationStatus;
   sslStatus: SslStatus;
+  managedHttps?: ManagedHttpsInfo | null;
   cnameTarget?: string;
   txtRecord?: string;
   verificationToken?: null | string;

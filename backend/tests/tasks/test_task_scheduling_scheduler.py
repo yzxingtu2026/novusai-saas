@@ -56,6 +56,32 @@ def test_build_task_definition_schedule_uses_wrapper_task() -> None:
     assert entry["options"] == {"queue": "scheduled", "priority": 3}
 
 
+@pytest.mark.parametrize(
+    "invalid_cron", ["missing-fields", "91 2 * * *", "*/bad 2 * * *"]
+)
+def test_invalid_cron_does_not_discard_other_schedules(invalid_cron: str) -> None:
+    invalid = SimpleNamespace(
+        id=21,
+        code="system.bad",
+        default_schedule_type="cron",
+        default_cron_expression=invalid_cron,
+        default_interval_seconds=None,
+        default_priority=None,
+    )
+    valid = SimpleNamespace(
+        id=22,
+        code="system.good",
+        default_schedule_type="cron",
+        default_cron_expression="0 2 * * *",
+        default_interval_seconds=None,
+        default_priority=None,
+    )
+
+    assert set(_build_task_definition_schedule([invalid, valid])) == {
+        "task_definition:22:system.good"
+    }
+
+
 def test_build_tenant_task_binding_schedule_prefers_override_values() -> None:
     binding = SimpleNamespace(
         id=7,

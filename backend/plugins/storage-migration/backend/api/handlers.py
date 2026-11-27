@@ -18,8 +18,20 @@ ALLOWED_TASK_STATUSES = {
     "failed",
     "cancelled",
     "rolling_back",
+    "rollback_failed",
+    "rollback_interrupted",
+    "source_cleaning",
+    "cleanup_interrupted",
+    "migration_uncertain",
 }
-ALLOWED_LOG_STATUSES = {"pending", "success", "failed", "skipped"}
+ALLOWED_LOG_STATUSES = {
+    "pending",
+    "success",
+    "failed",
+    "skipped",
+    "transferring",
+    "commit_unknown",
+}
 
 
 def _bad_request(message: str, code: int = 4001) -> JSONResponse:
@@ -79,6 +91,19 @@ def _normalize_log_status(raw_status: object) -> str | None:
     if status not in ALLOWED_LOG_STATUSES:
         raise ValueError("invalid log status filter")
     return status
+
+
+def _project_task(task: dict) -> dict:
+    """Keep only non-secret storage fields on the wire / 只投影不含凭据的存储字段。"""
+    result = dict(task)
+    for name in ("source_config_snapshot", "target_config_snapshot"):
+        snapshot = task.get(name)
+        result[name] = (
+            {"driver": snapshot["driver"]}
+            if isinstance(snapshot, dict) and "driver" in snapshot
+            else None
+        )
+    return result
 
 
 async def get_impact_analysis(request: Request, ctx: object) -> JSONResponse:
@@ -180,6 +205,7 @@ async def list_migration_tasks(request: Request, ctx: object) -> JSONResponse:
         page_size=page_size,
         status_filter=status_filter,
     )
+    result["items"] = [_project_task(task) for task in result["items"]]
     return result
 
 
@@ -225,8 +251,7 @@ async def get_migration_task(request: Request, ctx: object) -> JSONResponse:
         page=log_page,
         page_size=log_page_size,
     )
-    task["logs"] = logs
-    return task
+    return {**_project_task(task), "logs": logs}
 
 
 async def pause_migration_task(request: Request, ctx: object) -> JSONResponse:

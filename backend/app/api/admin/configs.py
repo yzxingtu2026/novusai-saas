@@ -95,6 +95,7 @@ def _translate_config_item(config: dict) -> ConfigItemResponse:
         validation_rules=translated_rules,
         is_required=config["is_required"],
         is_encrypted=config["is_encrypted"],
+        is_readonly=config.get("is_readonly", False),
         sort_order=config["sort_order"],
         display_rules=display_rules,
         value_path=config.get("value_path", ""),

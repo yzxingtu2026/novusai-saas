@@ -77,7 +77,7 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
           build-args: |
-            VITE_GLOB_API_URL=${{ secrets.VITE_GLOB_API_URL || 'https://api.novusai.example.com' }}
+            VITE_GLOB_API_URL=${{ secrets.VITE_GLOB_API_URL || '/' }}
             VITE_PLATFORM_DOMAINS=${{ secrets.VITE_PLATFORM_DOMAINS || 'novusai.example.com' }}
             VITE_APP_STORE_SECURE_KEY=${{ secrets.VITE_APP_STORE_SECURE_KEY || 'ci-placeholder-replace-in-secrets' }}
 

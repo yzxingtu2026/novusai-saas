@@ -11,6 +11,67 @@ import { describe, expect, it } from 'vitest';
 import { useConfigFormModel } from '../composables/use-config-form-model';
 
 describe('useConfigFormModel', () => {
+  it('displays runtime domain values but omits them from editable config payloads', () => {
+    const model = useConfigFormModel({
+      configs: () => [
+        {
+          key: 'tenant_domain_suffix',
+          value: '.e2.dakkii.cn',
+          default_value: '.e2.dakkii.cn',
+          value_type: 'string',
+          is_readonly: true,
+        },
+        { key: 'site_name', value: 'ERP', value_type: 'string' },
+      ],
+    });
+    expect(model.getValues()).toEqual({
+      tenant_domain_suffix: '.e2.dakkii.cn',
+      site_name: 'ERP',
+    });
+    model.fieldApi.setStringValue('site_name', 'New ERP');
+    model.fieldApi.setStringValue('tenant_domain_suffix', '.wrong.example.com');
+    expect(model.prepareSubmitData()).toEqual({ site_name: 'New ERP' });
+  });
+
+  it('omits readonly JSON parents and preserves readonly children of editable JSON', () => {
+    const model = useConfigFormModel({
+      configs: () => [
+        {
+          key: 'runtime',
+          is_readonly: true,
+          value_type: 'json',
+          value: { suffix: '.e2.dakkii.cn' },
+          children: [
+            {
+              key: 'runtime_suffix',
+              value_path: 'suffix',
+              value_type: 'string',
+            },
+          ],
+        },
+        {
+          key: 'editable',
+          value_type: 'json',
+          value: { suffix: '.e2.dakkii.cn', label: 'ERP' },
+          children: [
+            {
+              key: 'suffix',
+              value_path: 'suffix',
+              value_type: 'string',
+              is_readonly: true,
+            },
+            { key: 'label', value_path: 'label', value_type: 'string' },
+          ],
+        },
+      ],
+    });
+    model.fieldApi.setStringValue('suffix', '.wrong.example.com');
+    model.fieldApi.setStringValue('label', 'Updated');
+    expect(model.prepareSubmitData()).toEqual({
+      editable: { suffix: '.e2.dakkii.cn', label: 'Updated' },
+    });
+  });
+
   it('hydrates JSON child fields and merges them back into the parent payload', async () => {
     const configs = shallowRef<ConfigItemMeta[]>([
       {

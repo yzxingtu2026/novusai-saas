@@ -13,6 +13,7 @@ class TaskStatusEnum(StrEnum):
     SUCCESS = ("success", "enum.task_status.success")
     FAILED = ("failed", "enum.task_status.failed")
     RETRYING = ("retrying", "enum.task_status.retrying")
+    UNKNOWN = ("unknown", "enum.task_status.unknown")
 
 
 class ScheduleTypeEnum(StrEnum):

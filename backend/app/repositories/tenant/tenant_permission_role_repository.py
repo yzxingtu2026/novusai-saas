@@ -10,12 +10,19 @@ from sqlalchemy.orm import selectinload
 from app.core.base_repository import TenantRepository
 from app.enums.role import RoleType
 from app.models.auth.tenant_admin_role import TenantAdminRole
+from app.repositories.tenant.role_unique_write_mixin import TenantRoleUniqueWriteMixin
 
 
-class TenantPermissionRoleRepository(TenantRepository[TenantAdminRole]):
+class TenantPermissionRoleRepository(
+    TenantRoleUniqueWriteMixin, TenantRepository[TenantAdminRole]
+):
     """Tenant admin permission role repository / 企业管理员权限角色仓储"""
 
     model = TenantAdminRole
+    _role_unique_constraints = {
+        "uq_tenant_admin_roles_flat_name": "tenant_user_role.name_exists",
+        "uq_tenant_admin_roles_flat_code": "tenant_user_role.code_exists",
+    }
 
     _scope_fields = {
         "tenant": {
@@ -80,8 +87,7 @@ class TenantPermissionRoleRepository(TenantRepository[TenantAdminRole]):
         )
         if exclude_id:
             query = query.where(self.model.id != exclude_id)
-        result = await self.db.execute(query)
-        return result.scalar_one_or_none() is not None
+        return bool(await self.db.scalar(select(query.exists())))
 
     async def name_exists(
         self,
@@ -100,8 +106,7 @@ class TenantPermissionRoleRepository(TenantRepository[TenantAdminRole]):
         )
         if exclude_id:
             query = query.where(self.model.id != exclude_id)
-        result = await self.db.execute(query)
-        return result.scalar_one_or_none() is not None
+        return bool(await self.db.scalar(select(query.exists())))
 
     async def create(self, data: dict) -> TenantAdminRole:
         data["type"] = RoleType.ROLE.value

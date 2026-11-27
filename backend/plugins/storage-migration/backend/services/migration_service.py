@@ -19,6 +19,7 @@ from app.storage.base import StorageConfig
 from app.storage.manager import storage_manager
 
 from . import migration_runtime_registry as runtime_registry
+from .migration_forward_recovery import hold_forward_owner
 from .migration_helpers import (
     deserialize_json_field,
     execute_single_file_migration,
@@ -50,7 +51,17 @@ __all__ = ["MigrationImpactAnalyzer", "StorageMigrationService"]
 
 logger = LogManager.get_logger("storage")
 
-ACTIVE_TASK_STATUSES = ("pending", "running", "paused", "rolling_back")
+ACTIVE_TASK_STATUSES = (
+    "pending",
+    "running",
+    "paused",
+    "rolling_back",
+    "rollback_failed",
+    "rollback_interrupted",
+    "source_cleaning",
+    "cleanup_interrupted",
+    "migration_uncertain",
+)
 TASK_JSON_FIELDS = ("source_config_snapshot", "target_config_snapshot")
 LOG_JSON_FIELDS = ("old_meta",)
 
@@ -68,6 +79,8 @@ class StorageMigrationService:
 
     def _normalize_task_row(self, row: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
+        normalized.pop("recovery_token", None)
+        normalized.pop("forward_run_id", None)
         for field in TASK_JSON_FIELDS:
             normalized[field] = deserialize_json_field(normalized.get(field))
         normalized["scope"] = normalize_scope(str(normalized.get("scope") or "all"))
@@ -81,6 +94,9 @@ class StorageMigrationService:
 
     def _normalize_log_row(self, row: dict[str, Any]) -> dict[str, Any]:
         normalized = dict(row)
+        normalized.pop("rollback_snapshot", None)
+        normalized.pop("forward_token", None)
+        normalized.pop("forward_snapshot", None)
         for field in LOG_JSON_FIELDS:
             normalized[field] = deserialize_json_field(normalized.get(field))
         return normalized
@@ -112,7 +128,10 @@ class StorageMigrationService:
         )
 
     async def get_task(self, task_id: int) -> dict[str, Any] | None:
-        query = text(f"SELECT * FROM {self.TASK_TABLE} WHERE id = :id")
+        query = text(
+            f"SELECT task.*, {self._rollback_resume_projection()} "
+            f"FROM {self.TASK_TABLE} task WHERE id = :id"
+        )
         result = await self._db.execute(query, {"id": task_id})
         row = result.mappings().one_or_none()
         if not row:
@@ -139,7 +158,7 @@ class StorageMigrationService:
 
         query = text(
             f"""
-            SELECT * FROM {self.TASK_TABLE}
+            SELECT task.*, {self._rollback_resume_projection()} FROM {self.TASK_TABLE} task
             {where_clause}
             ORDER BY created_at DESC
             LIMIT :limit OFFSET :offset
@@ -155,6 +174,21 @@ class StorageMigrationService:
             "page": page,
             "page_size": page_size,
         }
+
+    def _rollback_resume_projection(self) -> str:
+        """A read-only UI hint; the write workflow validates every journal field."""
+        return f"""(task.status='rollback_interrupted' AND task.recovery_token IS NULL
+            AND task.migrated_files>0
+            AND task.source_cleanup_started_at IS NULL
+            AND task.source_cleanup_completed_at IS NULL
+            AND COALESCE(task.source_cleanup_deleted_files,0)=0
+            AND (SELECT COUNT(*)=task.migrated_files AND COALESCE(bool_and(COALESCE(
+                journal.rollback_state IN ('source_restored','target_deleting','target_deleted')
+                AND jsonb_typeof(CAST(journal.rollback_snapshot AS jsonb))='object'
+                AND CAST(journal.rollback_snapshot AS jsonb)->'version'
+                    IN ('1'::jsonb,'2'::jsonb,'3'::jsonb),false)),false)
+                FROM {self.LOG_TABLE} journal WHERE journal.task_id=task.id
+                    AND journal.status='success')) AS rollback_can_resume"""
 
     async def get_task_logs(
         self,
@@ -213,6 +247,7 @@ class StorageMigrationService:
         return await pause_task_part(
             self,
             task_id,
+            get_background_run_id=runtime_registry.get_background_run_id,
             pause_runtime_task=runtime_registry.pause_task,
         )
 
@@ -223,7 +258,7 @@ class StorageMigrationService:
             asyncio_module=asyncio,
             activate_task=runtime_registry.activate_task,
             clear_cancelled=runtime_registry.clear_cancelled,
-            has_background_task=runtime_registry.has_background_task,
+            get_background_run_id=runtime_registry.get_background_run_id,
             register_background_task=runtime_registry.register_background_task,
         )
 
@@ -265,22 +300,30 @@ class StorageMigrationService:
             logger=logger,
         )
 
-    async def _run_migration(self, task_id: int) -> None:
-        from app.core.database import async_session_factory
+    async def _run_migration(self, task_id: int, run_id: str) -> None:
+        from app.core.database import async_engine, async_session_factory
 
-        await run_migration_part(
-            self,
-            task_id,
-            service_factory=self.__class__,
-            async_session_factory=async_session_factory,
-            storage_manager=storage_manager,
-            text=text,
-            utc_now=utc_now,
-            logger=logger,
-            get_pause_event=runtime_registry.get_pause_event,
-            is_cancelled=runtime_registry.is_cancelled,
-            clear_runtime=runtime_registry.clear_runtime,
-        )
+        try:
+            async with hold_forward_owner(async_engine, task_id) as acquired:
+                if not acquired:
+                    return
+                await run_migration_part(
+                    self,
+                    task_id,
+                    run_id,
+                    service_factory=self.__class__,
+                    async_session_factory=async_session_factory,
+                    storage_manager=storage_manager,
+                    text=text,
+                    utc_now=utc_now,
+                    logger=logger,
+                    get_pause_event=runtime_registry.get_pause_event,
+                    is_cancelled=runtime_registry.is_cancelled,
+                )
+        except Exception:
+            logger.warning("Storage migration owner session failed task={}", task_id)
+        finally:
+            runtime_registry.clear_current_worker(task_id)
 
     async def _migrate_single_file(
         self,
@@ -318,6 +361,9 @@ class StorageMigrationService:
         started_at: datetime | None = None,
         completed_at: datetime | None = None,
         error_message: object = _UNSET,
+        *,
+        release_owner: bool = False,
+        forward_run_id: str | None = None,
     ) -> None:
         set_parts = ["status = :status", "updated_at = now()"]
         params: dict[str, Any] = {"id": task_id, "status": status}
@@ -331,6 +377,11 @@ class StorageMigrationService:
         if error_message is not _UNSET:
             set_parts.append("error_message = :error_message")
             params["error_message"] = error_message
+        if release_owner:
+            set_parts.extend(["recovery_token = NULL", "forward_run_id = NULL"])
+        elif forward_run_id is not None:
+            set_parts.append("forward_run_id = :forward_run_id")
+            params["forward_run_id"] = forward_run_id
 
         query = text(
             f"UPDATE {self.TASK_TABLE} SET {', '.join(set_parts)} WHERE id = :id"
@@ -348,7 +399,9 @@ class StorageMigrationService:
         query = f"""
             SELECT id, source_driver, target_driver, scope, status
             FROM {self.TASK_TABLE}
-            WHERE status IN ('pending', 'running', 'paused', 'rolling_back')
+            WHERE status IN ('pending', 'running', 'paused', 'rolling_back',
+                             'rollback_failed', 'rollback_interrupted',
+                             'source_cleaning', 'cleanup_interrupted', 'migration_uncertain')
         """
         if exclude_task_id is not None:
             query += " AND id != :exclude_task_id"

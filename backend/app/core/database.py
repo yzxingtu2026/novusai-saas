@@ -528,32 +528,38 @@ def run_migrations() -> bool:
         migration_script = (  # nosec B608
             f"""
 import sys
-import os
+from pathlib import Path
 from alembic.config import Config
 from alembic import command
+from sqlalchemy import create_engine
+from sqlalchemy.pool import NullPool
 
 backend_dir = {str(backend_dir)!r}
 if backend_dir not in sys.path:
     sys.path.insert(0, backend_dir)
 
-# Step 1: 准备迁移图；启动期不自动删除或补写 alembic_version。
-# Step 1: Prepare the migration graph; startup never deletes or stamps alembic_version automatically.
-db_url = {db_url!r}
-version_locations = {version_locations!r}
+from app.core.config import settings
+from app.core.migration_lock import acquire_schema_migration_lock
+from app.plugins.migration_paths import build_migration_version_locations
 
-print(
-    f'[migration] Version locations: {{len(version_locations)}}'
-)
-
-# Step 2: 运行迁移（主应用 + 插件 revision 可解析）
-cfg = Config({str(alembic_ini)!r})
-cfg.set_main_option('script_location', {str(backend_dir / "migrations")!r})
-cfg.set_main_option('sqlalchemy.url', db_url)
-
-# 关键：command.upgrade 在创建 ScriptDirectory 时就会读取 version_locations，
-# 不能只依赖 env.py 里后置 set_main_option（那时已太晚）。
-cfg.set_main_option('version_locations', '\\n'.join(version_locations))
-command.upgrade(cfg, 'heads')
+db_url = settings.DATABASE_URL_SYNC
+engine = create_engine(db_url, poolclass=NullPool)
+try:
+    with engine.connect() as connection:
+        acquire_schema_migration_lock(connection)
+        # 等待锁后重建图，读取已提交的插件版本 / Rebuild the graph after any concurrent plugin upgrade.
+        version_locations = build_migration_version_locations(
+            backend_dir=Path(backend_dir), db_url=db_url,
+        )
+        print(f'[migration] Version locations: {{len(version_locations)}}')
+        cfg = Config({str(alembic_ini)!r})
+        cfg.set_main_option('script_location', {str(backend_dir / "migrations")!r})
+        cfg.set_main_option('sqlalchemy.url', db_url)
+        cfg.set_main_option('version_locations', '\\n'.join(version_locations))
+        cfg.attributes['schema_migration_connection'] = connection
+        command.upgrade(cfg, 'heads')
+finally:
+    engine.dispose()
 """  # nosec B608
         )
 

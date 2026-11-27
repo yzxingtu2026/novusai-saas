@@ -12,6 +12,7 @@ import { ConfigImagePicker } from '../../config-image-picker';
 
 interface Props {
   config: ConfigItemMeta;
+  readonly?: boolean;
   fieldApi: ConfigFormFieldApi;
   formModel: ConfigFormModel;
   formatJsonValue: (val: ConfigValue | undefined) => string;
@@ -43,7 +44,19 @@ function updateJson(val: string) {
 
 <template>
   <Input
-    v-if="config.value_type === 'string'"
+    v-if="readonly || config.is_readonly"
+    :type="config.value_type === 'password' ? 'password' : 'text'"
+    :value="
+      config.value_type === 'json'
+        ? formatJsonValue(formModel[config.key])
+        : String(formModel[config.key] ?? '')
+    "
+    readonly
+    :aria-readonly="true"
+  />
+
+  <Input
+    v-else-if="config.value_type === 'string'"
     :value="fieldApi.getStringValue(config.key)"
     :autocomplete="withPasswordGenerator ? 'new-password' : undefined"
     @update:value="(val) => fieldApi.setStringValue(config.key, val)"

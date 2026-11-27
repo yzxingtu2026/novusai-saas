@@ -5,6 +5,7 @@ import type {
 } from './modules/domains-types';
 
 import { $t } from '#/locales';
+import { getDomainSslPresentation } from '#/utils/domain-presentation';
 
 /**
  * 获取验证状态配置 (Tag 颜色与文本)
@@ -36,44 +37,11 @@ export function getVerificationStatusConfig(status: VerificationStatus) {
  * 获取 SSL 状态配置 (Badge 状态与文本)
  */
 export function getSslStatusConfig(status: SslStatus) {
-  switch (status) {
-    case 'active': {
-      return {
-        status: 'success' as const,
-        text: $t('tenant.system.domain.ssl.active'),
-      };
-    }
-    case 'expired': {
-      return {
-        status: 'error' as const,
-        text: $t('tenant.system.domain.ssl.expired'),
-      };
-    }
-    case 'failed': {
-      return {
-        status: 'error' as const,
-        text: $t('tenant.system.domain.ssl.failed'),
-      };
-    }
-    case 'pending': {
-      return {
-        status: 'processing' as const,
-        text: $t('tenant.system.domain.ssl.pending'),
-      };
-    }
-    case 'provisioning': {
-      return {
-        status: 'processing' as const,
-        text: $t('tenant.system.domain.ssl.provisioning'),
-      };
-    }
-    default: {
-      return {
-        status: 'default' as const,
-        text: $t('tenant.system.domain.ssl.none'),
-      };
-    }
-  }
+  const presentation = getDomainSslPresentation(status);
+  return {
+    ...presentation,
+    text: $t(`tenant.system.domain.ssl.${presentation.key}`),
+  };
 }
 
 /**

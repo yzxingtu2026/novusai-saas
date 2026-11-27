@@ -233,8 +233,12 @@ class AdminTenantController(GlobalController):
             """
             service = TenantService(db)
 
-            # 移除 None 值 / Remove None values
-            update_data = {k: v for k, v in data.model_dump().items() if v is not None}
+            # 保留显式空值和原生日期 / Keep supplied nulls and native datetimes.
+            update_data = {
+                field: getattr(data, field)
+                for field in data.model_fields_set
+                if field in type(data).model_fields
+            }
 
             tenant = await service.update_tenant(tenant_id, update_data)
             await db.commit()

@@ -87,6 +87,8 @@ export interface ConfigItemMeta {
   options?: ConfigOptionMeta[];
   validation_rules?: ValidationRuleMeta[];
   is_required?: boolean;
+  /** 中文: 后端运行时拥有的值仅供展示。 EN: Runtime-owned values are display-only. */
+  is_readonly?: boolean;
   is_encrypted?: boolean;
   sort_order?: number;
   /** Group code / 所属分组代码 */

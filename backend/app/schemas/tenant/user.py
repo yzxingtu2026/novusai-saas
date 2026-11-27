@@ -11,6 +11,7 @@ from typing import Literal
 from pydantic import Field, field_validator, model_validator
 
 from app.core.base_schema import BaseSchema
+from app.core.i18n import _
 
 
 def _validate_writable_avatar_value(value: object) -> str | None:
@@ -160,6 +161,14 @@ class TenantUserUpdateRequest(BaseSchema):
     role_id: int | None = Field(None, description="权限角色 ID")
     org_node_id: int | None = Field(None, description="组织归属节点 ID")
     gender: int | None = Field(None, ge=0, le=2, description="性别: 0未知 1男 2女")
+
+    @field_validator("is_active", "gender")
+    @classmethod
+    def reject_null_required_columns(cls, value: bool | int | None) -> bool | int:
+        """省略时保留原值，显式空值无效 / Omission retains values and explicit null is invalid."""
+        if value is None:
+            raise ValueError(_("common.validation_error"))
+        return value
 
     @field_validator("avatar", mode="before")
     @classmethod

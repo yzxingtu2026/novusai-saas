@@ -57,6 +57,7 @@ class ConfigItemResponse(BaseSchema):
     )
     is_required: bool = Field(False, description="是否必填")
     is_encrypted: bool = Field(False, description="是否加密")
+    is_readonly: bool = Field(False, description="是否由部署配置管理，只读")
     sort_order: int = Field(0, description="排序顺序")
     display_rules: list[DisplayRuleSchema] = Field(
         default_factory=list, description="显示/隐藏规则"

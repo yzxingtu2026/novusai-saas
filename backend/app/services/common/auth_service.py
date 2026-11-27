@@ -10,22 +10,31 @@ from __future__ import annotations
 from datetime import datetime
 from typing import Any
 
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.service import ConfigService
+from app.core.i18n import _
 from app.core.logging import LogManager
-from app.core.redis import cache_delete, cache_get, cache_set
+from app.core.redis import (
+    cache_get,
+    cache_getdel_if_matches,
+    cache_set,
+    cache_set_if_absent,
+)
 from app.core.security import (
     TOKEN_TYPE_REFRESH,
     create_access_token,
     create_refresh_token,
     create_token_pair,
     get_password_hash,
+    normalize_nonnegative_integer,
     verify_impersonate_token,
     verify_password,
     verify_token_with_scope,
 )
-from app.models import Admin, TenantAdmin, TenantUser
+from app.exceptions import AuthenticationException
+from app.models import Admin, Tenant, TenantAdmin, TenantUser
 from app.services.common.auth_domains import (
     AdminAuthFacade,
     AuthAdminDomain,
@@ -76,6 +85,20 @@ class AuthService(AuthCaptchaVerificationMixin):
         self._admin_domain = AuthAdminDomain(self)
         self._tenant_admin_domain = AuthTenantAdminDomain(self)
         self._tenant_user_domain = AuthTenantUserDomain(self)
+
+    async def _tenant_session_epoch(self, tenant_id: int) -> int:
+        """读取有效租户的当前代际 / Read the active tenant's session epoch."""
+        result = await self.db.execute(
+            select(Tenant.session_revocation_epoch).where(
+                Tenant.id == tenant_id,
+                Tenant.is_active.is_(True),
+                Tenant.is_deleted.is_(False),
+            )
+        )
+        epoch = normalize_nonnegative_integer(result.scalar_one_or_none())
+        if epoch is None:
+            raise AuthenticationException(message=_("auth.token_invalid"))
+        return epoch
 
     @staticmethod
     def _mask_identifier(identifier: str | None) -> str:
@@ -282,8 +305,13 @@ class AuthService(AuthCaptchaVerificationMixin):
     async def _cache_set(self, key: str, value: Any, ttl: int) -> None:
         await cache_set(key, value, ttl=ttl)
 
-    async def _cache_delete(self, key: str) -> None:
-        await cache_delete(key)
+    async def _cache_set_if_absent(self, key: str, value: Any, ttl: int) -> bool:
+        return await cache_set_if_absent(key, value, ttl=ttl)
+
+    async def _cache_getdel_if_matches(
+        self, key: str, *, code: str, user_id: int
+    ) -> Any:
+        return await cache_getdel_if_matches(key, code=code, user_id=user_id)
 
     async def _issue_admin_login_tokens(
         self,

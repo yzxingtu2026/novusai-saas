@@ -42,6 +42,7 @@ import {
 } from '#/composables/use-plugin-frontend-init';
 import { usePreferenceSync } from '#/composables/use-preference-sync';
 import { $t, $te } from '#/locales';
+import { syncRuntimeLocale } from '#/locales/runtime-locale';
 import { generateAccess } from '#/router/access';
 import { accessRoutes } from '#/router/routes';
 import {
@@ -431,6 +432,7 @@ async function syncLocaleDrivenState(
         refreshPluginSlots,
         router,
         routes: accessRoutes,
+        syncRuntimeLocale,
         tabbarStore,
         translate: $t,
         userRoles,

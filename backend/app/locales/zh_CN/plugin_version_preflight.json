@@ -1,0 +1,9 @@
+{
+  "plugin": {
+    "error": {
+      "version_mutation_unavailable": "插件版本变更所需的运行文件或依赖环境不可写或无法验证，当前插件保持不变。",
+      "version_archive_failed": "无法备份当前插件文件，插件仍保持当前运行状态。",
+      "image_upgrade_unavailable": "插件镜像升级尚未完成，请查看发布请求记录，确认当前阶段后继续处理。"
+    }
+  }
+}

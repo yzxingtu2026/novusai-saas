@@ -2,20 +2,24 @@
 
 Scope: toolkit executor loading, method dispatch, Valves injection, and output
 formatting.
-Mocked dependencies: local toolkit source fixtures only; no LLM response bodies
-are mocked.
+Local fixtures supply Toolkit source and the context propagation module.
+The audit tests capture the audit sink while running the real subprocess.
 """
 
 import asyncio
 from contextvars import ContextVar
 from types import ModuleType
+from unittest.mock import AsyncMock
 
 import pytest
 
+from app.ai.tools.executors import toolkit_executor
 from app.ai.tools.executors.toolkit_executor import ToolkitExecutor, clear_toolkit_cache
-from app.ai.tools.types import ToolDefinition, ToolParameter
+from app.ai.tools.types import ExecutionContext, ToolDefinition, ToolParameter
 from app.core.config import settings
 from app.middleware.trace import trace_id_var
+
+pytestmark = pytest.mark.behavioral
 
 SIMPLE_TOOLKIT = '''
 """title: Test Toolkit / 测试
@@ -78,6 +82,7 @@ def _make_definition(
             "_toolkit_content": toolkit_content,
             "_toolkit_method": method,
             "_toolkit_is_async": is_async,
+            "_toolkit_trusted": True,
             "_valves_config": valves_config or {},
         },
         timeout=10,
@@ -85,7 +90,12 @@ def _make_definition(
 
 
 @pytest.fixture(autouse=True)
-def _clear_cache():
+def _clear_cache(monkeypatch):
+    # Detail assertions exercise development settings for parent and child.
+    monkeypatch.setattr(settings, "APP_ENV", "development")
+    monkeypatch.setattr(settings, "DEBUG", True)
+    monkeypatch.setenv("APP_ENV", "development")
+    monkeypatch.setenv("DEBUG", "true")
     clear_toolkit_cache()
     yield
     clear_toolkit_cache()
@@ -210,7 +220,8 @@ async def test_method_error():
 
 
 @pytest.mark.asyncio
-async def test_method_error_hides_detail_in_production():
+async def test_method_error_hides_detail_in_production(monkeypatch):
+    monkeypatch.setenv("DEBUG", "false")
     executor = ToolkitExecutor()
     defn = _make_definition("raise_error", "raise_error")
     original_debug = settings.DEBUG
@@ -225,6 +236,76 @@ async def test_method_error_hides_detail_in_production():
     assert result.success is False
     assert "Something went wrong" not in (result.error or "")
     assert "trace-toolkit-prod" in (result.error or "")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("method", "arguments", "output", "status"),
+    [
+        ("greet", {"name": "Audit"}, "Hello, Audit!", "success"),
+        ("raise_error", {}, "", "failed"),
+    ],
+)
+async def test_production_subprocess_audits_outcome(
+    monkeypatch, method, arguments, output, status
+):
+    """用真实子进程验证结果，仅捕获审计写入 / Run a real child and capture only the audit write."""
+    monkeypatch.setattr(settings, "APP_ENV", "production")
+    monkeypatch.setattr(settings, "DEBUG", False)
+    monkeypatch.setenv("APP_ENV", "production")
+    monkeypatch.setenv("DEBUG", "false")
+    monkeypatch.setenv("SECRET_KEY", "fixture-toolkit-audit-signing-key-28dab4")
+    audit = AsyncMock()
+    monkeypatch.setattr(toolkit_executor, "write_ai_action_log", audit)
+    db = object()
+    context = ExecutionContext(
+        tenant_id=19,
+        agent_id=21,
+        user_id=23,
+        skill_id=27,
+        conversation_id=29,
+        db=db,
+    )
+    definition = _make_definition(method, method)
+    executor = ToolkitExecutor(sandbox_mode="subprocess")
+    token = trace_id_var.set("trace-toolkit-audit")
+    try:
+        result = await executor.execute(definition, "audit-call", arguments, context)
+    finally:
+        trace_id_var.reset(token)
+
+    assert result.success is (status == "success")
+    assert result.output == output
+    if status == "failed":
+        assert "trace-toolkit-audit" in result.error
+        assert "Something went wrong" not in result.error
+    else:
+        assert result.error == ""
+
+    audit.assert_awaited_once_with(
+        db,
+        tenant_id=19,
+        agent_id=21,
+        operator_id=23,
+        operator_type=context.user_role,
+        conversation_id=29,
+        tool_call_id="audit-call",
+        skill_id=27,
+        action_name=f"toolkit_{method}",
+        action_type="action",
+        action_level="dangerous",
+        request_data={
+            "tool_name": method,
+            "trace_id": "trace-toolkit-audit",
+            "method_name": method,
+            "arguments": arguments,
+            "trusted": True,
+        },
+        response_data=None,
+        status=status,
+        error_message=result.error if status == "failed" else None,
+        duration_ms=result.duration_ms,
+    )
 
 
 @pytest.mark.asyncio

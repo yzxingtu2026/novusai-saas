@@ -101,6 +101,9 @@ def run_cmd(
         host,
         "--port",
         str(port),
+        "--proxy-headers",
+        "--forwarded-allow-ips",
+        settings.TRUSTED_PROXY_IPS,
     ]
     if do_reload:
         cmd.extend(["--reload", "--reload-dir", "app"])

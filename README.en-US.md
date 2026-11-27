@@ -287,6 +287,7 @@ This repository provides framework source code and Docker Compose reference file
 
 - `docker-compose.dev.yml` is for local PostgreSQL and Redis.
 - `docker-compose.prod.yml` is a production orchestration reference. Real deployments should add private environment files, reverse proxies, HTTPS, logging, monitoring, backups, and capacity planning.
+- Before starting Compose, set `NOVUSAI_IMAGE_PREFIX` and `NOVUSAI_IMAGE_TAG` to a published set of four images from the same release. The default prefix matches this repository's image workflow.
 - `production.env.example` is the production environment example file. Copy it to `production.env` and adjust it for your deployment.
 
 Reference production Compose startup:

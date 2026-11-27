@@ -125,6 +125,7 @@
     "isSystem": "System Built-in",
     "createdAt": "Created At",
     "noPermissions": "No permissions configured",
+    "removeIneligibleGrants": "Remove {count} ineligible role grants when saving",
     "assignPermissions": "Assign Permissions",
     "stats": {
       "total": "Total Roles",

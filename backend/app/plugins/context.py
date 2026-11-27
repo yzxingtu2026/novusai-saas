@@ -20,6 +20,11 @@ from app.configs.service import PLATFORM_TENANT_ID
 from app.core.i18n import _
 from app.core.logging import get_logger
 from app.core.response import resolve_public_error_message
+from app.core.security import (
+    TOKEN_SCOPE_ADMIN,
+    TOKEN_SCOPE_TENANT_ADMIN,
+    normalize_positive_subject_id,
+)
 from app.enums.agent import (
     MemoryChannelEnum,
     MemorySceneEnum,
@@ -81,16 +86,45 @@ class PluginContext:
         """Check if plugin has the specified capability / 检查插件是否拥有指定能力"""
         return cap in self._granted_capabilities
 
+    def _get_authenticated_request_context(self) -> RequestContext | None:
+        """Allow host tasks or authenticated callers / 允许宿主任务或已认证调用方。"""
+        context = self._request_context
+        if (
+            context is not None
+            and normalize_positive_subject_id(context.user_id) is None
+        ):
+            raise PluginSecurityError(
+                message="This plugin operation requires an authenticated user."
+            )
+        return context
+
+    def _get_admin_request_context(self) -> RequestContext | None:
+        """Allow host tasks or authenticated admins / 允许宿主任务或已认证的管理员。"""
+        context = self._get_authenticated_request_context()
+        if context is not None and (
+            context.user_role not in {TOKEN_SCOPE_ADMIN, TOKEN_SCOPE_TENANT_ADMIN}
+            or (
+                context.user_role == TOKEN_SCOPE_TENANT_ADMIN
+                and normalize_positive_subject_id(context.tenant_id) is None
+            )
+        ):
+            raise PluginSecurityError(
+                message="This plugin operation requires an authenticated administrator."
+            )
+        return context
+
     # ── Config / 配置 ──
 
     async def get_config(self) -> dict:
         """
-        Get plugin global config (auto-decrypt sensitive fields)
-        / 获取插件全局配置（自动解密敏感字段）
+        Get plugin global config with config:read (auto-decrypt sensitive fields)
+        / 使用 config:read 获取插件全局配置（自动解密敏感字段）
 
         Reads from Plugin.config, auto-decrypts fields marked with x-encrypted in manifest.config_schema.
         / 从 Plugin.config 读取，根据 manifest.config_schema 中的 x-encrypted 标记自动解密。
         """
+        self._require("config:read")
+
         from sqlalchemy import select
 
         from app.models.system.plugin import Plugin
@@ -115,7 +149,18 @@ class PluginContext:
         return config
 
     async def get_tenant_config(self, tenant_id: int) -> dict:
-        """Get tenant-level config / 获取企业级配置"""
+        """Read active tenant config with config:read / 使用 config:read 读取生效的企业配置。"""
+        self._require("config:read")
+        tenant_id = normalize_positive_subject_id(tenant_id)
+        if tenant_id is None:
+            raise PluginSecurityError(message="Plugin config requires a valid tenant.")
+
+        context = self._get_admin_request_context()
+        if context is not None and context.tenant_id not in (None, tenant_id):
+            raise PluginSecurityError(
+                message="Plugin tenant config is restricted to the current tenant."
+            )
+
         from sqlalchemy import select
 
         from app.models.system.plugin import Plugin
@@ -130,6 +175,8 @@ class PluginContext:
                 ResourceTenantAssignment.resource_type == "plugin",
                 Plugin.name == self.plugin_name,
                 ResourceTenantAssignment.tenant_id == tenant_id,
+                ResourceTenantAssignment.is_active.is_(True),
+                ResourceTenantAssignment.is_deleted.is_(False),
                 Plugin.is_deleted.is_(False),
             )
         )
@@ -189,10 +236,16 @@ class PluginContext:
         / 返回宿主只读门面，需 platform:read 能力。
         """
         self._require("platform:read")
+        self._get_authenticated_request_context()
         if self._host_read is None:
             from app.plugins.host_read_facade import HostReadFacade
 
-            self._host_read = HostReadFacade(self._db)
+            self._host_read = HostReadFacade(
+                self._db,
+                request_context=self._request_context,
+                plugin_name=self.plugin_name,
+                granted_capabilities=self._granted_capabilities,
+            )
         return self._host_read
 
     @property
@@ -230,9 +283,9 @@ class PluginContext:
         Requires storage:read or storage:write capability.
         / 需要 storage:read 或 storage:write 能力。
         """
-        if not (
-            self.has_capability("storage:read") or self.has_capability("storage:write")
-        ):
+        can_read = self.has_capability("storage:read")
+        can_write = self.has_capability("storage:write")
+        if not (can_read or can_write):
             raise PluginSecurityError(
                 message=_("plugin.error.storage_capability_required").format(
                     plugin_name=self.plugin_name,
@@ -285,7 +338,9 @@ class PluginContext:
             options=options or {},
         )
         driver = storage_manager.get_driver(storage_conf)
-        return _NamespacedStorageProxy(driver, f"plugins/{self.plugin_name}")
+        return _NamespacedStorageProxy(
+            driver, self.plugin_name, can_read=can_read, can_write=can_write
+        )
 
     # ── HTTP / HTTP 请求 ──
 
@@ -675,6 +730,7 @@ class PluginContext:
     ) -> None:
         """Send notification, requires notifications:send capability / 发送通知，需 notifications:send 能力"""
         self._require("notifications:send")
+        self._get_authenticated_request_context()
         await self._ensure_notification_targets_allowed(
             tenant_id=tenant_id,
             user_ids=user_ids,
@@ -887,6 +943,11 @@ class PluginContext:
             / True = 推送成功，False = SIO 不可用（非阻塞降级）
         """
         self._require("notifications:send")
+        user_id = normalize_positive_subject_id(user_id)
+        if user_id is None:
+            raise PluginSecurityError(message="Invalid Socket.IO recipient.")
+        await self._ensure_push_target_allowed(user_id, side)
+
         full_event = f"plugin.{self.plugin_name}.{event}"
         namespace = "/admin" if side == "admin" else "/tenant"
         room = f"user:{user_id}"
@@ -913,6 +974,67 @@ class PluginContext:
                 exc,
             )
             return False
+
+    async def _ensure_push_target_allowed(self, user_id: int, side: str) -> None:
+        """Validate the recipient and tenant runtime scope / 校验推送对象和租户运行范围。"""
+        if side not in {"admin", "tenant"}:
+            raise PluginSecurityError(message="Unsupported Socket.IO target side.")
+
+        from sqlalchemy import select
+
+        from app.models import Admin, Tenant, TenantAdmin
+
+        context = self._get_admin_request_context()
+        if side == "admin":
+            if context is not None and (
+                context.user_role != TOKEN_SCOPE_ADMIN or context.tenant_id is not None
+            ):
+                raise PluginSecurityError(
+                    message="Plugin Socket.IO recipient is outside the request scope."
+                )
+            result = await self._db.execute(
+                select(Admin.id).where(
+                    Admin.id == user_id,
+                    Admin.is_active.is_(True),
+                    Admin.is_deleted.is_(False),
+                )
+            )
+            if result.scalar_one_or_none() is None:
+                raise PluginSecurityError(message="Socket.IO recipient is unavailable.")
+            return
+
+        recipient = (
+            select(TenantAdmin.tenant_id)
+            .join(Tenant, Tenant.id == TenantAdmin.tenant_id)
+            .where(
+                TenantAdmin.id == user_id,
+                TenantAdmin.is_active.is_(True),
+                TenantAdmin.is_deleted.is_(False),
+                Tenant.is_active.is_(True),
+                Tenant.is_deleted.is_(False),
+            )
+        )
+        if context is not None and context.tenant_id is not None:
+            recipient = recipient.where(TenantAdmin.tenant_id == context.tenant_id)
+
+        result = await self._db.execute(recipient)
+        target_tenant_id = result.scalar_one_or_none()
+        if target_tenant_id is None:
+            raise PluginSecurityError(message="Socket.IO recipient is unavailable.")
+
+        from app.plugins.runtime_gate import evaluate_plugin_runtime_gate
+
+        gate = await evaluate_plugin_runtime_gate(
+            self._db,
+            self.plugin_name,
+            tenant_id=target_tenant_id,
+            require_enabled=True,
+            enforce_scope=True,
+        )
+        if not gate.allowed:
+            raise PluginSecurityError(
+                message=_("plugin.error.notification_tenant_forbidden")
+            )
 
     async def is_feature_enabled(self, feature_code: str) -> bool:
         """

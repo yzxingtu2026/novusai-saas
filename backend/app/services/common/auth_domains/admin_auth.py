@@ -5,7 +5,8 @@ from __future__ import annotations
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select
+from sqlalchemy.exc import MultipleResultsFound
 
 from app.core.config import settings
 from app.core.i18n import _
@@ -13,6 +14,7 @@ from app.core.security import TOKEN_SCOPE_ADMIN, TOKEN_TYPE_REFRESH
 from app.enums import ErrorCode
 from app.exceptions import AuthenticationException, BusinessException, NotFoundException
 from app.models import Admin
+from app.services.common.auth_domains.login_security import password_login_query
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -78,12 +80,18 @@ class AuthAdminDomain:
         captcha_provider_code: str | None = None,
     ) -> dict[str, Any]:
         result = await self._service.db.execute(
-            select(Admin).where(
-                or_(Admin.username == username, Admin.email == username),
-                Admin.is_deleted.is_(False),
+            password_login_query(
+                select(Admin).where(Admin.is_deleted.is_(False)),
+                Admin,
+                username,
             )
         )
-        admin = result.scalar_one_or_none()
+        try:
+            admin = result.scalar_one_or_none()
+        except MultipleResultsFound as exc:
+            raise AuthenticationException(
+                message=_("auth.credentials_invalid")
+            ) from exc
 
         if admin is None:
             await self._service._record_admin_login_failure(username, client_ip)
@@ -202,11 +210,19 @@ class AuthAdminDomain:
 
         result = await self._service.db.execute(
             select(Admin).where(
-                or_(Admin.username == identifier, Admin.email == identifier),
+                or_(
+                    Admin.username == identifier,
+                    func.lower(Admin.email) == identifier.strip().lower(),
+                ),
                 Admin.is_deleted.is_(False),
             )
         )
-        admin = result.scalar_one_or_none()
+        try:
+            admin = result.scalar_one_or_none()
+        except MultipleResultsFound as exc:
+            raise AuthenticationException(
+                message=_("auth.credentials_invalid")
+            ) from exc
 
         if admin is None:
             self._service._log_auth_warning(

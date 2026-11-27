@@ -98,6 +98,12 @@ function getConfigLabel(cfg: ConfigItemMeta): string {
 }
 
 function getConfigDesc(cfg: ConfigItemMeta): string | undefined {
+  if (
+    cfg.is_readonly &&
+    ['domain_verification_prefix', 'tenant_domain_suffix'].includes(cfg.key)
+  ) {
+    return t('shared.config.page.runtime_readonly');
+  }
   if (cfg.description) return cfg.description;
   if (cfg.description_key) {
     const translated = t(cfg.description_key);
@@ -148,6 +154,7 @@ function collectRules(
   rules: Record<string, Rule[]>,
 ) {
   for (const cfg of configs) {
+    if (cfg.is_readonly) continue;
     rules[cfg.key] = convertRules(cfg);
     if (cfg.children && cfg.children.length > 0) {
       collectRules(cfg.children, rules);
@@ -259,6 +266,7 @@ defineExpose({
               >
                 <ConfigFormFieldSection
                   :config="child"
+                  :readonly="cfg.is_readonly"
                   :field-api="fieldApi"
                   :form-model="formModel"
                   :format-json-value="formatJsonValue"

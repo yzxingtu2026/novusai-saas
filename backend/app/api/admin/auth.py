@@ -10,7 +10,7 @@ from fastapi import APIRouter, Request
 from app.core.config import settings
 from app.core.deps import ActiveAdmin, DbSession
 from app.core.i18n import _
-from app.core.rate_limit import check_login_rate_limit
+from app.core.rate_limit import check_login_rate_limit, get_request_client_ip
 from app.core.response import success
 from app.rbac.decorators import auth_only, public
 from app.schemas.common import DevBootstrapRequest, RefreshTokenRequest, TokenResponse
@@ -39,7 +39,7 @@ async def admin_login(
     - **username**: 用户名或邮箱 / Username or email
     - **password**: 密码 / Password
     """
-    rate_limited = check_login_rate_limit(request)
+    rate_limited = await check_login_rate_limit(request)
     if rate_limited:
         return rate_limited
     auth_service = AuthService(db)
@@ -47,7 +47,7 @@ async def admin_login(
     tokens = await auth_service.authenticate_admin(
         username=login_data.username,
         password=login_data.password,
-        client_ip=request.client.host if request.client else None,
+        client_ip=get_request_client_ip(request),
         captcha_challenge_id=login_data.captcha_challenge_id,
         captcha_solution=login_data.captcha_solution,
         captcha_provider_code=login_data.captcha_provider_code,
@@ -79,7 +79,7 @@ if settings.APP_ENV.strip().lower() == "development":
         tokens = await auth_service.authenticate_admin_by_dev_bootstrap(
             bootstrap_secret=bootstrap_data.bootstrap_secret,
             request_host=request.url.hostname or request.headers.get("host"),
-            client_ip=request.client.host if request.client else None,
+            client_ip=get_request_client_ip(request),
         )
         await db.commit()
 

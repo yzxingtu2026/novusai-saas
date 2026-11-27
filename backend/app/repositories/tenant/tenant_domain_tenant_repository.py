@@ -2,14 +2,27 @@
 企业端域名仓储 / Tenant Domain (Tenant-side) Repository
 """
 
-from sqlalchemy import asc, select
+from sqlalchemy import asc, func, select
 
 from app.core.base_repository import TenantRepository
+from app.core.domains import normalize_hostname
+from app.enums.domain import DomainSslStatus
 from app.models.tenant.tenant_domain import TenantDomain
+from app.repositories.system.tenant_domain_repository import (
+    TenantDomainRepository,
+    _lock_primary_domain_target,
+)
 
 
 class TenantDomainTenantRepository(TenantRepository[TenantDomain]):
     model = TenantDomain
+
+    async def get_primary_target_for_update(
+        self, tenant_id: int, domain_id: int
+    ) -> TenantDomain | None:
+        # Caller-supplied ownership cannot override the repository's tenant.
+        _ = tenant_id
+        return await _lock_primary_domain_target(self, self.tenant_id, domain_id)
 
     _scope_fields: dict[str, set[str]] = {
         "tenant": {
@@ -25,7 +38,14 @@ class TenantDomainTenantRepository(TenantRepository[TenantDomain]):
     }
 
     async def get_by_domain(self, domain: str) -> TenantDomain | None:
-        return await self.get_one_by(domain=domain)
+        query = select(self.model).where(
+            self.model.tenant_id == self.tenant_id,
+            func.lower(func.rtrim(self.model.domain, "."))
+            == normalize_hostname(domain),
+            self.model.is_deleted.is_(False),
+        )
+        result = await self.db.execute(query)
+        return result.scalar_one_or_none()
 
     async def get_primary_domain(
         self, tenant_id: int | None = None
@@ -64,14 +84,40 @@ class TenantDomainTenantRepository(TenantRepository[TenantDomain]):
         exclude_id: int | None = None,
     ) -> bool:
         query = select(self.model.id).where(
-            self.model.domain == domain,
-            self.model.is_deleted.is_(False),
+            # Reservation is global, including deleted rows until the service
+            # explicitly releases them without restoring ownership proof.
+            func.lower(func.rtrim(self.model.domain, "."))
+            == normalize_hostname(domain),
         )
         if exclude_id:
             query = query.where(self.model.id != exclude_id)
 
         result = await self.db.execute(query)
-        return result.scalar_one_or_none() is not None
+        return result.first() is not None
+
+    async def release_deleted_domain(self, domain: str) -> None:
+        # This namespace-only operation deliberately crosses tenant scope, just
+        # like domain_exists; active rows are never modified or returned.
+        await TenantDomainRepository(self.db).release_deleted_domain(domain)
+
+    async def get_ssl_provision_candidates(
+        self, tenant_id: int | None = None
+    ) -> list[TenantDomain]:
+        _ = tenant_id
+        query = select(self.model).where(
+            self.model.tenant_id == self.tenant_id,
+            self.model.is_verified.is_(True),
+            self.model.ssl_status.in_(
+                [
+                    DomainSslStatus.NONE.value,
+                    DomainSslStatus.FAILED.value,
+                    DomainSslStatus.EXPIRED.value,
+                ]
+            ),
+            self.model.is_deleted.is_(False),
+        )
+        result = await self.db.execute(query)
+        return list(result.scalars().all())
 
     async def count_tenant_domains(self, tenant_id: int | None = None) -> int:
         """tenant_id is ignored — uses self.tenant_id from TenantRepository / tenant_id 忽略，使用 TenantRepository 的 self.tenant_id。"""

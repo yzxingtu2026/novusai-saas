@@ -451,7 +451,7 @@ async def test_runtime_v2_fast_text_round_passes_low_reasoning_override(
     assert _RuntimeQueryEngineCaptureOverridesStub.last_stream_kwargs is not None
     assert _RuntimeQueryEngineCaptureOverridesStub.last_stream_kwargs[
         "extra_kwargs"
-    ] == {"_runtime_reasoning_effort_override": "low"}
+    ] == {"_runtime_reasoning_effort_default": "low"}
 
 
 def test_agent_chat_service_context_diagnostics_infers_partial_interrupted_without_turn_record() -> (

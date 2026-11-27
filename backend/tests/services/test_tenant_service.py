@@ -4,7 +4,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -110,30 +110,25 @@ class TestTenantUpdate:
 
 class TestTenantStatus:
     @pytest.mark.asyncio
-    async def test_disable_tenant(self, mock_db):
+    @pytest.mark.parametrize("is_active", [False, True])
+    async def test_toggle_status_advances_epoch(self, mock_db, is_active):
         from app.services.system.tenant_service import TenantService
 
-        tenant = _make_tenant(is_active=True)
+        tenant = _make_tenant(is_active=not is_active, session_revocation_epoch=4)
+        updated = _make_tenant(is_active=is_active, session_revocation_epoch=5)
         service = TenantService.__new__(TenantService)
         service.db = mock_db
         service.repo = AsyncMock()
-        service.repo.get_by_id = AsyncMock(return_value=tenant)
+        service.repo.get_for_lifecycle_update.return_value = tenant
+        service.repo.update.return_value = updated
+        service._schedule_lifecycle_disconnect = Mock()
 
-        await service.toggle_status(1, is_active=False)
-        # Service sets is_active on the model and flushes
-
-    @pytest.mark.asyncio
-    async def test_enable_tenant(self, mock_db):
-        from app.services.system.tenant_service import TenantService
-
-        tenant = _make_tenant(is_active=False)
-        service = TenantService.__new__(TenantService)
-        service.db = mock_db
-        service.repo = AsyncMock()
-        service.repo.get_by_id = AsyncMock(return_value=tenant)
-
-        await service.toggle_status(1, is_active=True)
-        # Service sets is_active on the model and flushes
+        assert await service.toggle_status(1, is_active=is_active) is updated
+        service.repo.get_for_lifecycle_update.assert_awaited_once_with(1)
+        service.repo.update.assert_awaited_once_with(
+            1, {"is_active": is_active, "session_revocation_epoch": 5}
+        )
+        service._schedule_lifecycle_disconnect.assert_called_once_with(updated)
 
 
 class TestTenantNotifications:

@@ -3,8 +3,8 @@
 
 管理所有可用的通知渠道。渠道在模块加载时自动注册。
 Manages all available notification channels. Channels auto-register on module load.
-支持动态扩展：插件可通过 register_channel() 注册自定义渠道。
-Supports dynamic extension: plugins can register custom channels via register_channel().
+注册表允许扩展；持久规划器当前仅支持四个内置渠道，新适配器需要明确的 worker 契约。
+The registry accepts extensions; durable planning currently supports four built-ins and requires an explicit worker contract for new adapters.
 """
 
 from __future__ import annotations

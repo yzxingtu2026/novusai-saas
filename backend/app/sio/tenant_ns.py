@@ -7,6 +7,7 @@ Handles connection auth, room management, and online status broadcast.
 处理连接认证、房间管理、在线状态广播。
 """
 
+import contextlib
 import uuid
 
 import socketio
@@ -14,13 +15,22 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 
 from app.core.logging import LogManager
 from app.core.security import (
+    TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_TENANT_ADMIN,
     TokenExpiredError,
-    verify_token_with_scope,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
+    tenant_session_epoch_matches,
 )
 from app.middleware.trace import trace_id_var
 from app.sio.error_utils import socket_connect_refusal
-from app.sio.socket_trace import SocketTraceMixin
+from app.sio.socket_trace import (
+    SocketTraceMixin,
+    register_tenant_socket_session,
+    tenant_socket_session_is_current,
+    unregister_tenant_socket_session,
+)
+from app.sio.tenant_boundary import socket_matches_authenticated_tenant
 
 logger = LogManager.get_logger("app")
 
@@ -49,8 +59,9 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
         从 DB 查询 TenantAdmin 获取 tenant_id。
         """
         await self.bind_socket_trace(sid, auth, default_trace_id=str(uuid.uuid4()))
+        session_data = None
+        connected = False
         try:
-            _ = environ
             # Check real-time communication master switch / 检查实时通信总开关
             from app.sio.ws_config import get_ws_configs
 
@@ -66,7 +77,7 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 raise socket_connect_refusal("token_required")
 
             try:
-                user_id_str, scope = await verify_token_with_scope(
+                payload = await get_token_payload_with_scope(
                     token,
                     TOKEN_SCOPE_TENANT_ADMIN,
                     raise_on_expired=True,
@@ -74,10 +85,9 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
             except TokenExpiredError as exc:
                 raise socket_connect_refusal("token_expired") from exc
 
-            if not user_id_str:
+            user_id = normalize_positive_subject_id((payload or {}).get("sub"))
+            if payload is None or user_id is None:
                 raise socket_connect_refusal("authentication_failed")
-
-            user_id = int(user_id_str)
 
             # Connection rate limiting / 连接频率限制
             from app.sio.presence import check_connect_rate
@@ -86,35 +96,48 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 raise socket_connect_refusal("rate_limited")
 
             # Per-user max connection limit / 单用户最大连接数限制
-            from app.sio.presence import PresenceManager
-
-            max_conn = int(ws_cfg.get("ws_max_connections_per_user", 5))
-            current_conn = await PresenceManager.get_user_connection_count(
-                "tenant_admin", user_id
-            )
-            if current_conn >= max_conn:
-                raise socket_connect_refusal("max_connections_exceeded")
-
             # Query tenant admin to get tenant_id / 查询企业管理员获取 tenant_id
             from sqlalchemy import select
 
             from app.core.database import async_session_factory
-            from app.models import TenantAdmin
+            from app.models import Tenant, TenantAdmin
+            from app.sio.presence import PresenceManager
 
             async with async_session_factory() as db:
                 result = await db.execute(
-                    select(TenantAdmin).where(
+                    select(TenantAdmin, Tenant.session_revocation_epoch)
+                    .join(Tenant, Tenant.id == TenantAdmin.tenant_id)
+                    .where(
                         TenantAdmin.id == user_id,
                         TenantAdmin.is_deleted.is_(False),
                         TenantAdmin.is_active.is_(True),
+                        Tenant.is_active.is_(True),
+                        Tenant.is_deleted.is_(False),
                     )
                 )
-                tenant_admin = result.scalar_one_or_none()
-                if not tenant_admin:
+                row = result.one_or_none()
+                if row is None:
                     raise socket_connect_refusal("account_not_found")
+                tenant_admin, session_epoch = row
+                if normalize_positive_subject_id(
+                    payload.get("tenant_id")
+                ) != tenant_admin.tenant_id or not tenant_session_epoch_matches(
+                    payload, session_epoch
+                ):
+                    raise socket_connect_refusal("authentication_failed")
                 # Extract needed values within session to avoid DetachedInstanceError / 在 session 内提取所需值，避免 DetachedInstanceError
                 tenant_id = tenant_admin.tenant_id
                 username = tenant_admin.username
+
+            if not await socket_matches_authenticated_tenant(environ, tenant_id):
+                raise socket_connect_refusal("authentication_failed")
+
+            max_conn = int(ws_cfg.get("ws_max_connections_per_user", 5))
+            current_conn = await PresenceManager.get_user_connection_count(
+                "tenant_admin", user_id, tenant_id
+            )
+            if current_conn >= max_conn:
+                raise socket_connect_refusal("max_connections_exceeded")
 
             # Save session / 保存 session
             session_data = {
@@ -122,10 +145,18 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 "user_type": "tenant_admin",
                 "tenant_id": tenant_id,
                 "username": username,
+                TENANT_SESSION_EPOCH_CLAIM: session_epoch,
+                "token_jti": payload.get("jti"),
+                "token_exp": payload.get("exp"),
                 "trace_id": trace_id_var.get(),
             }
             await self.save_session(sid, session_data)
             self._sid_sessions[sid] = session_data
+            await register_tenant_socket_session(
+                tenant_id, self.namespace, sid, session_epoch
+            )
+            if not await tenant_socket_session_is_current(session_data):
+                raise socket_connect_refusal("authentication_failed")
 
             # Join rooms / 加入 rooms
             await self.enter_room(sid, f"user:{user_id}")
@@ -135,6 +166,7 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
             connections = await PresenceManager.set_online(
                 "tenant_admin", user_id, tenant_id
             )
+            session_data["presence_online"] = True
 
             # Broadcast online event on first connection / 首次连接时广播上线事件
             if connections == 1:
@@ -165,6 +197,7 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
             # Send online list to current connection / 向当前连接发送在线列表
             online_ids = await PresenceManager.get_online_ids("tenant_admin", tenant_id)
             await self.emit("presence:list", {"online_ids": online_ids}, to=sid)
+            connected = True
 
             logger.info(
                 "SIO /tenant connected: sid={} user_id={} tenant_id={} username={} connections={}",
@@ -182,6 +215,17 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
             )
             raise socket_connect_refusal("connection_failed", exc=exc) from exc
         finally:
+            if not connected and session_data is not None:
+                self._sid_sessions.pop(sid, None)
+                with contextlib.suppress(Exception):
+                    await unregister_tenant_socket_session(
+                        tenant_id, self.namespace, sid, session_epoch
+                    )
+                if session_data.pop("presence_online", False):
+                    with contextlib.suppress(Exception):
+                        await PresenceManager.set_offline(
+                            "tenant_admin", user_id, tenant_id
+                        )
             trace_id_var.set("")
 
     async def on_disconnect(self, sid: str, reason: str = "") -> None:
@@ -194,7 +238,15 @@ class TenantNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 user_id = session.get("user_id")
                 tenant_id = session.get("tenant_id")
 
-            if user_id and tenant_id:
+            if tenant_id and session is not None:
+                with contextlib.suppress(Exception):
+                    await unregister_tenant_socket_session(
+                        tenant_id,
+                        self.namespace,
+                        sid,
+                        session[TENANT_SESSION_EPOCH_CLAIM],
+                    )
+            if user_id and tenant_id and session.pop("presence_online", False):
                 try:
                     from app.sio.presence import PresenceManager
 

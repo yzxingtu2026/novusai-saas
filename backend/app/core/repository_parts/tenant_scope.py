@@ -4,7 +4,8 @@ from __future__ import annotations
 
 from typing import Any, Generic
 
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, inspect, select, update
+from sqlalchemy.orm import Mapper
 
 from app.core.base_model import utc_now
 from app.enums.common import RecycleStageEnum
@@ -39,6 +40,29 @@ class TenantScopeMixin(Generic[ModelType]):
     def _tenant_scope_column(self):
         return getattr(self.model, self._tenant_scope_field_name())
 
+    def _apply_sorting_scope(self, query: Any, scope_filters: dict[str, Any]):
+        # 中文: 排序读写均以仓储归属为准，不信任调用方传入的租户范围。
+        # EN: Sorting reads and writes use repository ownership, never caller claims.
+        scoped_filters = dict(scope_filters)
+        scoped_filters[self._tenant_scope_field_name()] = self.tenant_id
+        query = super()._apply_sorting_scope(query, scoped_filters)
+        query = query.where(self._tenant_scope_column() == self.tenant_id)
+        return self._apply_data_permission_if_needed(query)
+
+    def _prepare_tenant_create_data(self, data: dict[str, Any]) -> dict[str, Any]:
+        field_name = self._tenant_scope_field_name()
+        scoped_data = dict(data)
+        if field_name == "owner_tenant_id":
+            mapper = inspect(self.model, raiseerr=False)
+            if isinstance(mapper, Mapper):
+                tenant_alias = mapper.synonyms.get("tenant_id")
+                if tenant_alias is not None and tenant_alias.name == field_name:
+                    # 中文: 同列别名不能按输入顺序覆盖归属；独立字段保持原值。
+                    # EN: A same-column alias must not override ownership by input order.
+                    scoped_data.pop("tenant_id", None)
+        scoped_data[field_name] = self.tenant_id
+        return scoped_data
+
     async def get_list(
         self,
         skip: int = 0,
@@ -65,8 +89,12 @@ class TenantScopeMixin(Generic[ModelType]):
         return await super().count(include_deleted=include_deleted, **filters)
 
     async def create(self, data: dict[str, Any]) -> ModelType:
-        data[self._tenant_scope_field_name()] = self.tenant_id
-        return await super().create(data)
+        return await super().create(self._prepare_tenant_create_data(data))
+
+    async def create_many(self, data_list: list[dict[str, Any]]) -> list[ModelType]:
+        return await super().create_many(
+            [self._prepare_tenant_create_data(data) for data in data_list]
+        )
 
     async def get_by_id(
         self,

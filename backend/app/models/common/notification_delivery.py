@@ -7,7 +7,7 @@ Records per-channel notification delivery state as a durable outbox/audit trail.
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Index, Integer, String, Text
+from sqlalchemy import DateTime, Index, Integer, String, Text, text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.base_model import BaseModel
@@ -30,6 +30,41 @@ class NotificationDelivery(BaseModel):
         ),
         Index("idx_notification_deliveries_status", "status", "created_at"),
         Index("idx_notification_deliveries_task_id", "task_id"),
+        Index("idx_notification_deliveries_dedupe", "dedupe_key"),
+        Index(
+            "ix_notification_deliveries_outbox_due",
+            "status",
+            "available_at",
+            "id",
+            postgresql_where=text(
+                "is_deleted = false AND payload_ciphertext IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_notification_deliveries_tenant_dedupe",
+            "tenant_id",
+            "recipient_type",
+            "recipient_id",
+            "template_code",
+            "channel",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND tenant_id IS NOT NULL AND dedupe_key IS NOT NULL"
+            ),
+        ),
+        Index(
+            "uq_notification_deliveries_platform_dedupe",
+            "recipient_type",
+            "recipient_id",
+            "template_code",
+            "channel",
+            "dedupe_key",
+            unique=True,
+            postgresql_where=text(
+                "is_deleted = false AND tenant_id IS NULL AND dedupe_key IS NOT NULL"
+            ),
+        ),
     )
 
     __filterable__ = {
@@ -37,6 +72,7 @@ class NotificationDelivery(BaseModel):
         "notification_id": "notification_id",
         "template_id": "template_id",
         "template_code": "template_code",
+        "dedupe_key": "dedupe_key",
         "channel": "channel",
         "recipient_type": "recipient_type",
         "recipient_id": "recipient_id",
@@ -63,6 +99,11 @@ class NotificationDelivery(BaseModel):
         nullable=False,
         comment="通知模板编码",
     )
+    dedupe_key: Mapped[str | None] = mapped_column(
+        String(160),
+        nullable=True,
+        comment="业务去重键 / Business dedupe key",
+    )
     channel: Mapped[str] = mapped_column(
         String(20),
         nullable=False,
@@ -87,7 +128,7 @@ class NotificationDelivery(BaseModel):
         String(20),
         nullable=False,
         default="pending",
-        comment="状态: pending/queued/sent/failed/skipped",
+        comment="状态 / State: pending/claimed/submitting/sent/failed/skipped/uncertain; queued is legacy",
     )
     attempt: Mapped[int] = mapped_column(
         Integer,
@@ -109,6 +150,25 @@ class NotificationDelivery(BaseModel):
         DateTime,
         nullable=True,
         comment="投递完成时间",
+    )
+    payload_ciphertext: Mapped[str | None] = mapped_column(
+        Text, nullable=True, comment="加密投递快照 / Encrypted delivery snapshot"
+    )
+    available_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="最早投递时间 / Earliest delivery time",
+    )
+    lease_token: Mapped[str | None] = mapped_column(
+        String(36), nullable=True, comment="领取者随机凭据 / Claim owner nonce"
+    )
+    lease_expires_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True, comment="领取到期时间 / Claim expiry"
+    )
+    submission_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True),
+        nullable=True,
+        comment="外发开始时间 / Submission boundary",
     )
 
     def __repr__(self) -> str:

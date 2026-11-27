@@ -81,7 +81,10 @@ async def test_rollback_unlocked_unloads_plugin_modules_after_restore(
     target_dir.mkdir(parents=True)
     (target_dir / "stale.txt").write_text("old", encoding="utf-8")
     backup_dir.mkdir(parents=True)
-    (backup_dir / "plugin.yaml").write_text("name: demo-plugin", encoding="utf-8")
+    (backup_dir / "plugin.yaml").write_text(
+        "name: demo-plugin\nversion: 1.0.0\ndisplay_name: {en: Fixture}\nscope: admin_only\n",
+        encoding="utf-8",
+    )
 
     # 覆盖 VersionManager 使用的模块级常量。
     monkeypatch.setattr("app.plugins.version_manager.PLUGINS_DIR", plugins_root)
@@ -127,10 +130,17 @@ async def test_rollback_unlocked_unloads_plugin_modules_after_restore(
     )
 
     class _DummyManifest:
+        name = plugin_name
+        version = "1.0.0"
+
         def model_dump(self) -> dict[str, str]:
             return {"name": plugin_name, "version": "1.0.0"}
 
     class _DummyLoader:
+        def load_manifest_from_path(self, path: Path) -> _DummyManifest:
+            assert path == backup_dir
+            return _DummyManifest()
+
         def load_manifest(self, _name: str) -> _DummyManifest:
             return _DummyManifest()
 
@@ -161,7 +171,10 @@ async def test_rollback_unlocked_blocks_on_downgrade_failure_and_restores_runtim
     target_dir.mkdir(parents=True)
     (target_dir / "keep.txt").write_text("current", encoding="utf-8")
     backup_dir.mkdir(parents=True)
-    (backup_dir / "plugin.yaml").write_text("name: demo-plugin", encoding="utf-8")
+    (backup_dir / "plugin.yaml").write_text(
+        "name: demo-plugin\nversion: 1.0.0\ndisplay_name: {en: Fixture}\nscope: admin_only\n",
+        encoding="utf-8",
+    )
 
     monkeypatch.setattr("app.plugins.version_manager.PLUGINS_DIR", plugins_root)
     monkeypatch.setattr("app.plugins.version_manager.VERSIONS_DIR", versions_root)
@@ -205,7 +218,7 @@ async def test_rollback_unlocked_blocks_on_downgrade_failure_and_restores_runtim
 
     assert len(lifecycle_instances) == 1
     lifecycle = lifecycle_instances[0]
-    lifecycle._disable_impl.assert_awaited_once_with(2)
+    lifecycle._disable_impl.assert_awaited_once_with(2, preserve_plan_grants=True)
     lifecycle._enable_impl.assert_awaited_once_with(2)
     assert plugin.version == "2.0.0"
     assert (target_dir / "keep.txt").read_text(encoding="utf-8") == "current"

@@ -6,12 +6,20 @@ import secrets
 import string
 from typing import TYPE_CHECKING, Any
 
-from sqlalchemy import and_, or_, select
+from sqlalchemy import and_, func, or_, select
+from sqlalchemy.exc import MultipleResultsFound
 
 from app.core.config import settings
 from app.core.i18n import _
 from app.core.logging import LogManager
-from app.core.security import TOKEN_SCOPE_TENANT_USER, TOKEN_TYPE_REFRESH
+from app.core.security import (
+    TENANT_SESSION_EPOCH_CLAIM,
+    TOKEN_SCOPE_TENANT_USER,
+    TOKEN_TYPE_REFRESH,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
+    tenant_session_epoch_matches,
+)
 from app.enums import ErrorCode
 from app.enums.common import ApprovalStatusEnum
 from app.exceptions import (
@@ -21,6 +29,7 @@ from app.exceptions import (
     ValidationException,
 )
 from app.models import Tenant, TenantAdmin, TenantUser
+from app.services.common.auth_domains.login_security import password_login_query
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -53,14 +62,7 @@ class TenantUserLoginDomain:
             )
             raise AuthenticationException(message=_("auth.tenant_domain_required"))
 
-        query = select(TenantUser).where(
-            or_(
-                TenantUser.username == username,
-                TenantUser.email == username,
-                TenantUser.phone == username,
-            ),
-            TenantUser.is_deleted.is_(False),
-        )
+        query = select(TenantUser).where(TenantUser.is_deleted.is_(False))
         if tenant_code:
             query = query.join(Tenant, TenantUser.tenant_id == Tenant.id).where(
                 Tenant.code == tenant_code,
@@ -68,7 +70,9 @@ class TenantUserLoginDomain:
                 Tenant.is_deleted.is_(False),
             )
 
-        result = await self._service.db.execute(query)
+        result = await self._service.db.execute(
+            password_login_query(query, TenantUser, username)
+        )
         results = result.scalars().all()
 
         if len(results) > 1:
@@ -193,14 +197,20 @@ class TenantUserLoginDomain:
         client_ip: str | None,
         tenant_code: str | None = None,
         event: str = "tenant_user.login.success",
+        session_epoch: int | None = None,
     ) -> dict[str, Any]:
         user.last_login_at = self._service._utc_now_aware()
         user.last_login_ip = client_ip
 
+        if session_epoch is None:
+            session_epoch = await self._service._tenant_session_epoch(user.tenant_id)
         tokens = self._service._create_token_pair(
             user.id,
             scope=TOKEN_SCOPE_TENANT_USER,
-            extra_claims={"tenant_id": user.tenant_id},
+            extra_claims={
+                "tenant_id": user.tenant_id,
+                TENANT_SESSION_EPOCH_CLAIM: session_epoch,
+            },
         )
         await self._service._record_active_tokens(
             "tenant_user",
@@ -270,14 +280,19 @@ class TenantUserLoginDomain:
             select(TenantUser).where(
                 or_(
                     TenantUser.username == identifier,
-                    TenantUser.email == identifier,
+                    func.lower(TenantUser.email) == identifier.lower(),
                     TenantUser.phone == identifier,
                 ),
                 TenantUser.tenant_id == tenant.id,
                 TenantUser.is_deleted.is_(False),
             )
         )
-        user = result.scalar_one_or_none()
+        try:
+            user = result.scalar_one_or_none()
+        except MultipleResultsFound as exc:
+            raise AuthenticationException(
+                message=_("auth.credentials_invalid")
+            ) from exc
         if user is None:
             self._service._log_auth_warning(
                 "tenant_user.dev_bootstrap.failed",
@@ -305,6 +320,7 @@ class TenantUserLoginDomain:
             client_ip=client_ip,
             tenant_code=normalized_tenant_code,
             event="tenant_user.dev_bootstrap.success",
+            session_epoch=tenant.session_revocation_epoch,
         )
 
 
@@ -315,11 +331,10 @@ class TenantUserTokenDomain:
         self._service = service
 
     async def refresh_token(self, refresh_token: str) -> dict[str, Any]:
-        user_id, _scope = await self._service._verify_token_with_scope(
-            refresh_token,
-            TOKEN_SCOPE_TENANT_USER,
-            TOKEN_TYPE_REFRESH,
+        payload = await get_token_payload_with_scope(
+            refresh_token, TOKEN_SCOPE_TENANT_USER, TOKEN_TYPE_REFRESH
         )
+        user_id = normalize_positive_subject_id((payload or {}).get("sub"))
         if user_id is None:
             self._service._log_auth_warning(
                 "tenant_user.token.refresh.failed",
@@ -328,21 +343,26 @@ class TenantUserTokenDomain:
             raise AuthenticationException(message=_("auth.refresh_token_invalid"))
 
         result = await self._service.db.execute(
-            select(TenantUser).where(
-                TenantUser.id == int(user_id),
+            select(TenantUser, Tenant.session_revocation_epoch)
+            .join(Tenant, Tenant.id == TenantUser.tenant_id)
+            .where(
+                TenantUser.id == user_id,
                 TenantUser.is_deleted.is_(False),
+                Tenant.is_active.is_(True),
+                Tenant.is_deleted.is_(False),
             )
         )
-        user = result.scalar_one_or_none()
+        identity = result.one_or_none()
 
-        if user is None:
+        if identity is None or not tenant_session_epoch_matches(payload, identity[1]):
             self._service._log_auth_warning(
                 "tenant_user.token.refresh.failed",
                 user_id=user_id,
-                reason="user_not_found",
+                reason="tenant_session_invalid",
             )
             raise AuthenticationException(message=_("auth.refresh_token_invalid"))
 
+        user, epoch = identity
         if not user.is_active:
             self._service._log_auth_warning(
                 "tenant_user.token.refresh.failed",
@@ -356,7 +376,10 @@ class TenantUserTokenDomain:
         tokens = self._service._create_token_pair(
             user.id,
             scope=TOKEN_SCOPE_TENANT_USER,
-            extra_claims={"tenant_id": user.tenant_id},
+            extra_claims={
+                "tenant_id": user.tenant_id,
+                TENANT_SESSION_EPOCH_CLAIM: epoch,
+            },
         )
         await self._service._record_active_tokens(
             "tenant_user",
@@ -575,7 +598,12 @@ class TenantUserAccountDomain:
             tokens = self._service._create_token_pair(
                 user.id,
                 scope=TOKEN_SCOPE_TENANT_USER,
-                extra_claims={"tenant_id": tenant_id},
+                extra_claims={
+                    "tenant_id": tenant_id,
+                    TENANT_SESSION_EPOCH_CLAIM: await self._service._tenant_session_epoch(
+                        tenant_id
+                    ),
+                },
             )
             await self._service._record_active_tokens(
                 "tenant_user",
@@ -675,6 +703,7 @@ class TenantUserAccountDomain:
         email: str,
         tenant_code: str | None = None,
     ) -> dict[str, Any]:
+        email = email.strip().lower()
         tenant_id: int | None = None
         if tenant_code:
             result = await self._service.db.execute(
@@ -695,22 +724,30 @@ class TenantUserAccountDomain:
             )
 
         rate_key = f"password_reset_rate:{tenant_id}:{email}"
-        if await self._service._cache_get(rate_key):
+        if not await self._service._cache_set_if_absent(
+            rate_key, True, ttl=self._service.RESET_RATE_LIMIT_TTL
+        ):
             raise BusinessException(message=_("auth.reset_rate_limited"))
 
         result = await self._service.db.execute(
-            select(TenantUser).where(
-                and_(
-                    TenantUser.tenant_id == tenant_id,
-                    TenantUser.email == email,
-                    TenantUser.is_deleted.is_(False),
-                )
+            select(TenantUser)
+            .where(
+                TenantUser.tenant_id == tenant_id,
+                func.lower(TenantUser.email) == email,
+                TenantUser.is_deleted.is_(False),
             )
+            .limit(2)
         )
-        user = result.scalar_one_or_none()
-        if user is None:
-            logger.warning(f"Password reset requested for non-existent email: {email}")
+        users = result.scalars().all()
+        if len(users) != 1:
+            self._service._log_auth_warning(
+                "tenant_user.password_reset.request.skipped",
+                identifier=self._service._mask_identifier(email),
+                tenant_id=tenant_id,
+                reason="ambiguous_email" if users else "user_not_found",
+            )
             return {"message": _("auth.reset_code_sent")}
+        user = users[0]
 
         code = "".join(secrets.choice(string.digits) for _ in range(6))
         code_key = f"password_reset:{tenant_id}:{email}"
@@ -719,12 +756,6 @@ class TenantUserAccountDomain:
             {"code": code, "user_id": user.id},
             ttl=self._service.RESET_CODE_TTL,
         )
-        await self._service._cache_set(
-            rate_key,
-            True,
-            ttl=self._service.RESET_RATE_LIMIT_TTL,
-        )
-
         expire_minutes = self._service.RESET_CODE_TTL // 60
         try:
             from app.services.common.email_templates import (
@@ -766,6 +797,8 @@ class TenantUserAccountDomain:
         new_password: str,
         tenant_code: str | None = None,
     ) -> None:
+        original_email = email.strip()
+        email = original_email.lower()
         tenant_id: int | None = None
         if tenant_code:
             result = await self._service.db.execute(
@@ -787,22 +820,25 @@ class TenantUserAccountDomain:
 
         code_key = f"password_reset:{tenant_id}:{email}"
         stored = await self._service._cache_get(code_key)
+        if stored is None and original_email != email:
+            # 兼容已签发验证码的旧键 / Keep previously issued codes under their original keys.
+            code_key = f"password_reset:{tenant_id}:{original_email}"
+            stored = await self._service._cache_get(code_key)
         if not stored or not isinstance(stored, dict):
             raise BusinessException(message=_("auth.reset_code_invalid"))
         if stored.get("code") != code:
             raise BusinessException(message=_("auth.reset_code_invalid"))
 
-        user_id = stored.get("user_id")
-        if not user_id:
+        user_id = normalize_positive_subject_id(stored.get("user_id"))
+        if user_id is None:
             raise BusinessException(message=_("auth.reset_code_invalid"))
 
         result = await self._service.db.execute(
             select(TenantUser).where(
-                and_(
-                    TenantUser.id == int(user_id),
-                    TenantUser.tenant_id == tenant_id,
-                    TenantUser.is_deleted.is_(False),
-                )
+                TenantUser.id == user_id,
+                TenantUser.tenant_id == tenant_id,
+                func.lower(TenantUser.email) == email,
+                TenantUser.is_deleted.is_(False),
             )
         )
         user = result.scalar_one_or_none()
@@ -813,7 +849,10 @@ class TenantUserAccountDomain:
             new_password,
             tenant_id=tenant_id,
         )
+        if not await self._service._cache_getdel_if_matches(
+            code_key, code=code, user_id=user_id
+        ):
+            raise BusinessException(message=_("auth.reset_code_invalid"))
         user.password_hash = self._service._get_password_hash(new_password)
-        await self._service._cache_delete(code_key)
 
         logger.info(f"Password reset completed for user {user.id} (tenant={tenant_id})")

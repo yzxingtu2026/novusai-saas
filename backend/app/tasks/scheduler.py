@@ -13,7 +13,7 @@ import time
 
 from celery import __version__ as celery_version
 from celery.beat import PersistentScheduler
-from celery.schedules import crontab
+from celery.schedules import ParseException, crontab
 
 from app.celery_app import celery_app
 from app.core.database import sync_session_factory
@@ -72,7 +72,10 @@ def _apply_schedule_config(
     interval_seconds: int | None,
 ) -> bool:
     if schedule_type == "cron" and cron_expression:
-        entry["schedule"] = parse_cron_expression(cron_expression)
+        try:
+            entry["schedule"] = parse_cron_expression(cron_expression)
+        except (ValueError, ParseException):
+            return False
         return True
     if schedule_type == "interval" and interval_seconds:
         entry["schedule"] = float(interval_seconds)
@@ -106,8 +109,9 @@ def _build_task_definition_schedule(
             interval_seconds=definition.default_interval_seconds,
         ):
             logger.warning(
-                "Skipping task definition '{}' due to missing schedule config",
-                definition.code,
+                "Skipping task definition schedule: task_definition_id={} "
+                "reason=invalid_or_missing_schedule_config",
+                definition.id,
             )
             continue
         schedule[f"task_definition:{definition.id}:{definition.code}"] = entry
@@ -127,9 +131,11 @@ def _build_tenant_task_binding_schedule(
         }
         if not handler_supports_tenant_dispatch(definition.handler_path):
             logger.warning(
-                "Skipping tenant task binding '{}' because handler '{}' is not tenant-aware",
+                "Skipping tenant task binding schedule: task_definition_id={} "
+                "binding_id={} tenant_id={} reason=not_tenant_aware",
+                definition.id,
                 binding.id,
-                definition.handler_path,
+                binding.tenant_id,
             )
             continue
         schedule_type = (
@@ -150,8 +156,11 @@ def _build_tenant_task_binding_schedule(
             interval_seconds=interval_seconds,
         ):
             logger.warning(
-                "Skipping tenant task binding '{}' due to missing schedule config",
+                "Skipping tenant task binding schedule: task_definition_id={} "
+                "binding_id={} tenant_id={} reason=invalid_or_missing_schedule_config",
+                definition.id,
                 binding.id,
+                binding.tenant_id,
             )
             continue
         schedule[
@@ -173,9 +182,9 @@ def _build_all_tenants_task_definition_schedule(
         }
         if not handler_supports_tenant_dispatch(definition.handler_path):
             logger.warning(
-                "Skipping all-tenant task definition '{}' because handler '{}' is not tenant-aware",
-                definition.code,
-                definition.handler_path,
+                "Skipping all-tenant task definition schedule: task_definition_id={} "
+                "reason=not_tenant_aware",
+                definition.id,
             )
             continue
         if not _apply_schedule_config(
@@ -185,8 +194,9 @@ def _build_all_tenants_task_definition_schedule(
             interval_seconds=definition.default_interval_seconds,
         ):
             logger.warning(
-                "Skipping all-tenant task definition '{}' due to missing schedule config",
-                definition.code,
+                "Skipping all-tenant task definition schedule: task_definition_id={} "
+                "reason=invalid_or_missing_schedule_config",
+                definition.id,
             )
             continue
         schedule[f"all_tenants_task_definition:{definition.id}:{definition.code}"] = (
@@ -248,8 +258,11 @@ def load_task_schedules_from_db(
             **_build_all_tenants_task_definition_schedule(all_tenants_definitions),
             **_build_tenant_task_binding_schedule(tenant_bindings),
         }
-    except Exception as e:
-        logger.error(f"Failed to load periodic tasks from DB: {e}")
+    except Exception as exc:
+        logger.error(
+            "Failed to load periodic task schedules: error_type={}",
+            type(exc).__name__,
+        )
         if return_none_on_error:
             return None
         return {}
@@ -281,6 +294,30 @@ class ReloadingPersistentScheduler(PersistentScheduler):
         except Exception as exc:  # pylint: disable=broad-except  # 损坏调度文件容错 / tolerate corrupt schedule
             return self._destroy_open_corrupted_schedule(exc)
 
+    def _destroy_open_corrupted_schedule(self, exc):
+        """中文: 关闭调度存储句柄，使 Windows 能删除损坏的文件。
+
+        EN: Close the active shelf so Windows can remove the corrupted files.
+        """
+        store = getattr(self, "_store", None)
+        close = getattr(store, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception as close_error:  # pragma: no cover - defensive cleanup
+                logger.debug(
+                    "Failed to close corrupted beat schedule store: error_type={}",
+                    type(close_error).__name__,
+                )
+        # 中文: 复用 Celery 的文件操作，并将诊断限制为异常类型。
+        # EN: Reuse Celery's file operations and log only the exception type.
+        logger.error(
+            "Rebuilding corrupted beat schedule store: error_type={}",
+            type(exc).__name__,
+        )
+        self._remove_db()
+        return self._open_schedule()
+
     def _initialize_schedule_store(self) -> None:
         self._create_schedule()
         tz = self.app.conf.timezone
@@ -310,9 +347,8 @@ class ReloadingPersistentScheduler(PersistentScheduler):
             self._initialize_schedule_store()
         except Exception as exc:  # pylint: disable=broad-except  # 启动阶段损坏文件容错 / tolerate corrupt schedule during initialization
             logger.warning(
-                "Beat schedule store init failed, rebuilding persistent store: type={} error={}",
+                "Beat schedule store init failed, rebuilding persistent store: error_type={}",
                 type(exc).__name__,
-                str(exc),
             )
             self._store = self._destroy_open_corrupted_schedule(exc)
             self._initialize_schedule_store()

@@ -1711,6 +1711,7 @@
         "has_users": "该角色下还有关联用户，无法删除"
     },
     "enum": {
+        "task_status": {"unknown": "结果待确认"},
         "status": {"active": "启用", "inactive": "禁用"},
         "bool": {"yes": "是", "no": "否"},
         "gender": {"unknown": "未知", "male": "男", "female": "女"},
@@ -3217,7 +3218,13 @@
             "handler_kwargs_invalid": "任务处理器 '{handler}' 不接受参数：{fields}"
         }
     },
-    "task_log": {"error": {"not_found": "任务日志不存在"}},
+    "task_log": {
+        "error": {
+            "not_found": "任务日志不存在",
+            "retry_failed_only": "仅可重试失败的任务。",
+            "retry_outcome_unknown": "任务执行结果待确认，请先核实原任务结果再决定后续处理。"
+        }
+    },
     "quota": {
         "no_limit": "无限制",
         "storage_exceeded": "存储空间不足，当前已使用 {current}GB，限制 {limit}GB",

@@ -31,6 +31,18 @@ const maintenanceRoute: RouteRecordRaw = {
 
 /** Core routes, these routes must always exist / 基本路由，这些路由是必须存在的 */
 const coreRoutes: RouteRecordRaw[] = [
+  {
+    path: '/domain-unavailable',
+    name: 'DomainUnavailable',
+    component: () => import('#/views/_core/fallback/domain-unavailable.vue'),
+    meta: {
+      hideInBreadcrumb: true,
+      hideInMenu: true,
+      hideInTab: true,
+      ignoreAccess: true,
+      title: 'shared.domain.unavailable',
+    },
+  },
   maintenanceRoute,
   {
     component: AuthPageLayout,

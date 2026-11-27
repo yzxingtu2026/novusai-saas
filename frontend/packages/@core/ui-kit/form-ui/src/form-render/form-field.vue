@@ -42,6 +42,7 @@ const {
   fieldName,
   formFieldProps,
   hide,
+  hideLabel,
   label,
   labelClass,
   labelWidth,
@@ -246,6 +247,14 @@ function fieldBindEvent(slotProps: Record<string, any>) {
 function createComponentProps(slotProps: Record<string, any>) {
   const bindEvents = fieldBindEvent(slotProps);
 
+  // 中文: 隐藏视觉标签时仍把本地化字段名暴露给辅助技术。
+  // EN: Preserve the localized field name for assistive technology when the visual label is hidden.
+  const explicitAriaLabel =
+    computedProps.value?.['aria-label'] ?? computedProps.value?.ariaLabel;
+  const ariaLabel =
+    explicitAriaLabel ??
+    (hideLabel && isString(label) && label.trim() ? label : undefined);
+
   const binds = {
     ...slotProps.componentField,
     ...computedProps.value,
@@ -256,6 +265,7 @@ function createComponentProps(slotProps: Record<string, any>) {
     ...(Reflect.has(computedProps.value, 'onInput')
       ? { onInput: computedProps.value.onInput }
       : {}),
+    ...(ariaLabel ? { 'aria-label': ariaLabel } : {}),
   };
 
   return binds;

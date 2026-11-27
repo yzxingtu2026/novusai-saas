@@ -8,9 +8,11 @@ Defines tenant API request and response data structures.
 from datetime import datetime
 from typing import Any
 
-from pydantic import Field, model_validator
+from pydantic import Field, field_validator, model_validator
 
 from app.core.base_schema import BaseSchema
+from app.core.config import settings
+from app.core.i18n import _
 from app.schemas.tenant.domain import TenantDomainSimpleResponse
 
 _RETIRED_TENANT_INPUT_FIELDS = frozenset({"plan", "settings"})
@@ -158,6 +160,14 @@ class TenantCreateRequest(BaseSchema):
         ..., min_length=6, max_length=100, description="管理员密码"
     )
 
+    @field_validator("expires_at")
+    @classmethod
+    def qualify_expiry_timezone(cls, value: datetime | None) -> datetime | None:
+        """无偏移的控件日期使用平台时区 / Interpret expiry without an offset in the platform timezone."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=settings.tz)
+        return value
+
     @model_validator(mode="before")
     @classmethod
     def reject_retired_fields(cls, data: Any) -> Any:
@@ -178,6 +188,22 @@ class TenantUpdateRequest(BaseSchema):
     )
     expires_at: datetime | None = Field(None, description="到期时间")
     remark: str | None = Field(None, max_length=500, description="备注")
+
+    @field_validator("name")
+    @classmethod
+    def reject_null_name(cls, value: str | None) -> str:
+        """省略时保留名称，显式空值无效 / Omit the name to retain it. Explicit null is invalid."""
+        if value is None:
+            raise ValueError(_("common.validation_error"))
+        return value
+
+    @field_validator("expires_at")
+    @classmethod
+    def qualify_expiry_timezone(cls, value: datetime | None) -> datetime | None:
+        """无偏移的控件日期使用平台时区 / Interpret expiry without an offset in the platform timezone."""
+        if value is not None and value.tzinfo is None:
+            return value.replace(tzinfo=settings.tz)
+        return value
 
     @model_validator(mode="before")
     @classmethod

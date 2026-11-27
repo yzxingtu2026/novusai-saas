@@ -12,16 +12,19 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 import pytest
+from starlette.requests import Request
 
+from app.core.security import TENANT_SESSION_EPOCH_CLAIM
 from app.middleware import permission as permission_module
+from app.middleware.tenant import TenantContext
 
 
 class _Result:
     def __init__(self, value):
         self._value = value
 
-    def scalar_one_or_none(self):
-        return self._value
+    def one_or_none(self):
+        return self._value, 0
 
 
 class _SessionContext:
@@ -96,12 +99,14 @@ async def test_tenant_admin_permissions_are_loaded_from_plan_aware_service(
         _OrgAuthorityResolver,
     )
 
-    request = SimpleNamespace(
-        state=SimpleNamespace(user_permissions=set(), user=None, data_permission={})
-    )
+    request = Request({"type": "http", "headers": [(b"host", b"tenant.fixture.test")]})
+    request.state.tenant_ctx = TenantContext(tenant_id=5, tenant=SimpleNamespace(id=5))
+    request.state.user_permissions = set()
     middleware = permission_module.PermissionMiddleware(app=lambda *_args: None)
 
-    await middleware._load_tenant_admin_permissions(request, tenant_admin.id)
+    await middleware._load_tenant_admin_permissions(
+        request, tenant_admin.id, {TENANT_SESSION_EPOCH_CLAIM: 0}
+    )
 
     assert permission_calls == [tenant_admin]
     assert request.state.user is tenant_admin

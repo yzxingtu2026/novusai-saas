@@ -16,6 +16,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.configs.meta import ConfigMeta
 from app.configs.registry import ConfigRegistry, config_registry
+from app.core.config import settings
+from app.core.domains import normalize_tenant_suffix
 from app.core.i18n import _
 from app.core.logging import LogManager
 from app.enums.config import ConfigScope, ConfigValueType
@@ -97,6 +99,8 @@ class ConfigService:
         Returns:
             Config value (deserialized) / 配置值（已反序列化）
         """
+        if key == "tenant_domain_suffix":
+            return settings.TENANT_DOMAIN_SUFFIX
         return await self._get_config_value(
             key=key,
             tenant_id=PLATFORM_TENANT_ID,
@@ -115,6 +119,18 @@ class ConfigService:
             key: Config key / 配置键名
             value: Config value / 配置值
         """
+        if key == "tenant_domain_suffix":
+            try:
+                normalized = normalize_tenant_suffix(value) if value.strip() else ""
+            except (ValueError, AttributeError, TypeError):
+                self._raise_config_validation_failed()
+            if normalized != settings.TENANT_DOMAIN_SUFFIX:
+                raise BusinessException(
+                    message=_("error.config.domain_suffix_deployment_managed"),
+                    code=ErrorCode.CONFIG_VALIDATION_FAILED,
+                )
+            # Saving an unchanged legacy form must not overwrite deployment config.
+            return
         await self._set_config_value(
             key=key,
             tenant_id=PLATFORM_TENANT_ID,
@@ -458,7 +474,11 @@ class ConfigService:
         scope: ConfigScope,
         parent_value: Any | None = None,
     ) -> dict[str, Any]:
-        value = parent_value
+        deployment_managed = (
+            actual_tenant_id == PLATFORM_TENANT_ID
+            and config_meta.key == "tenant_domain_suffix"
+        )
+        value = settings.TENANT_DOMAIN_SUFFIX if deployment_managed else parent_value
         if value is None:
             value = await self._get_config_value(
                 key=config_meta.key,
@@ -481,6 +501,7 @@ class ConfigService:
             ],
             "is_required": config_meta.is_required,
             "is_encrypted": config_meta.is_encrypted,
+            "is_readonly": deployment_managed,
             "group_code": config_meta.group_code,
             "sort_order": config_meta.sort_order,
             "display_rules": [rule.to_dict() for rule in config_meta.display_rules],
@@ -488,6 +509,10 @@ class ConfigService:
             "tag_separator": config_meta.tag_separator,
             "file_accept": config_meta.file_accept,
         }
+
+        if payload["is_readonly"]:
+            payload["value"] = settings.TENANT_DOMAIN_SUFFIX
+            payload["default_value"] = settings.TENANT_DOMAIN_SUFFIX
 
         if config_meta.children:
             children_payloads = []
@@ -777,6 +802,12 @@ class ConfigService:
 
         result = {}
         for config_meta in group.configs:
+            if (
+                tenant_id == PLATFORM_TENANT_ID
+                and config_meta.key == "tenant_domain_suffix"
+            ):
+                result[config_meta.key] = settings.TENANT_DOMAIN_SUFFIX
+                continue
             value = await self._get_config_value(
                 key=config_meta.key,
                 tenant_id=tenant_id,

@@ -15,6 +15,7 @@ from app.plugins.lifecycle_support import (
 )
 from app.plugins.loader import PLUGINS_DIR, PluginLoader
 from app.plugins.migration_paths import build_migration_version_locations
+from app.plugins.migration_target import resolve_plugin_upgrade_target
 
 if TYPE_CHECKING:
     pass
@@ -107,11 +108,14 @@ class LifecycleMigrationMixin:
         / 重要：必须把所有已安装插件的迁移路径都加入 version_locations。
         """
 
-        branch_label = f"plugin_{plugin_name.replace('-', '_')}"
-
         version_locations = build_migration_version_locations(
             backend_dir=PLUGINS_DIR.parent,
             include_plugin_names=[plugin_name],
+        )
+        target = resolve_plugin_upgrade_target(
+            plugin_name,
+            plugins_dir=PLUGINS_DIR,
+            version_locations=version_locations,
         )
 
         # Run via sys.executable -c to use Alembic Python API in a subprocess,
@@ -124,7 +128,7 @@ import os
 
 cfg = Config('alembic.ini')
 version_locations = {version_locations!r}
-target = {f"{branch_label}@head"!r}
+target = {target!r}
 
 cfg.set_main_option('version_locations', '\\n'.join(version_locations))
 command.upgrade(cfg, target)

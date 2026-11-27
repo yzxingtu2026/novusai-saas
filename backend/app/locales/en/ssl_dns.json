@@ -1,0 +1,50 @@
+{
+  "config": {
+    "platform": {
+      "dns_provider": {
+        "desc": "Automated DNS-01 supports Cloudflare and AliDNS. Configuration readiness does not prove provider permissions or certificate issuance.",
+        "aliyun": "AliDNS (Alibaba Cloud DNS)"
+      },
+      "dns_aliyun_access_key_id": {
+        "name": "AliDNS AccessKey ID",
+        "desc": "Prefer private worker environment DNS_ALIYUN_ACCESS_KEY_ID. Nonempty DB values override it. Current platform config storage does not encrypt values at rest."
+      },
+      "dns_aliyun_access_key_secret": {
+        "name": "AliDNS AccessKey Secret",
+        "desc": "Prefer private worker environment DNS_ALIYUN_ACCESS_KEY_SECRET. Nonempty DB values override it. Current platform config storage does not encrypt values at rest. Requires DNS record read/create/delete permissions."
+      },
+      "dns_aliyun_zone": {
+        "name": "AliDNS DNS Zone",
+        "desc": "Registered DNS zone, e.g. example.com. Blank falls back to DNS_ALIYUN_ZONE_NAME. Challenge domains must belong to this exact zone or its children."
+      },
+      "ssl_auto_renew_days": {
+        "desc": "Renewal lead time in whole days (1–60), default 30."
+      }
+    }
+  },
+  "ssl_certificate": {
+    "dns_provider_configured": "{provider} configuration is present and syntactically valid; provider access has not been checked.",
+    "dns_provider_read_checked": "{provider} zone read access was checked. DNS edit permission, delegation, CA issuance and deployed HTTPS remain unverified.",
+    "dns_provider_check_failed": "DNS provider zone read check failed. Check credentials, permissions and zone configuration.",
+    "cloudflare_dns_not_configured": "Cloudflare API token and zone ID are required for automated DNS-01.",
+    "aliyun_dns_not_configured": "AliDNS AccessKey ID, secret and DNS zone are required; private worker environment values may supply them.",
+    "manual_dns_not_supported": "Manual DNS does not support unattended certificate issuance.",
+    "dns_provider_legacy_unsupported": "DNS provider {provider} has no supported automation adapter.",
+    "dns_provider_invalid": "Unsupported DNS provider: {provider}.",
+    "dns_provider_not_supported": "Select a supported automated DNS provider. Manual mode is for development only.",
+    "dns_configuration_invalid": "DNS provider credentials or zone configuration are invalid.",
+    "dns_credentials_invalid": "DNS provider credentials are invalid.",
+    "dns_zone_invalid": "Enter a canonical DNS zone hostname without IP, URL, wildcard or port.",
+    "dns_record_invalid": "Enter a valid DNS-01 challenge record and TXT value.",
+    "dns_zone_mismatch": "The challenge hostname is outside the configured DNS zone.",
+    "dns_request_failed": "DNS provider request failed. Check credentials and permissions.",
+    "dns_response_too_large": "DNS provider response too large.",
+    "dns_response_invalid": "DNS provider returned an invalid response.",
+    "dns_pagination_limit": "DNS provider result exceeds the pagination limit.",
+    "dns_record_already_owned": "A challenge record is already pending for this operation. Clean it up before reusing the same token.",
+    "dns_record_changed": "The owned challenge record was changed externally; cleanup stopped.",
+    "dns_provider_unsupported": "DNS provider does not support an automated access check.",
+    "dns_acme_mode_invalid": "Use the production Let's Encrypt directory for the production URL and the staging directory for the staging URL.",
+    "dns_renewal_days_invalid": "SSL renewal lead time must be a whole number from 1 to 60 days."
+  }
+}

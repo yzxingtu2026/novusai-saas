@@ -8,16 +8,19 @@ Provides version backup, upgrade, rollback, and history query functionality.
 from __future__ import annotations
 
 import contextlib
+import re
 import shutil
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 from app.core.base_model import utc_now
+from app.core.i18n import _
 from app.core.logging import get_logger
 from app.core.response import resolve_public_error_message, serialize_datetime_for_api
 from app.enums.plugin import PluginStatusEnum, PluginVersionStatusEnum
 from app.plugins.exceptions import PluginError, PluginNotFoundError
 from app.plugins.loader import PLUGINS_DIR
+from app.plugins.version_mutation_preflight import require_version_mutation_writable
 
 if TYPE_CHECKING:
     from sqlalchemy.ext.asyncio import AsyncSession
@@ -25,6 +28,19 @@ if TYPE_CHECKING:
 logger = get_logger(__name__)
 
 VERSIONS_DIR = PLUGINS_DIR / ".versions"
+_SAFE_VERSION_COMPONENT_RE = re.compile(
+    r"^[0-9]+\.[0-9]+\.[0-9]+"
+    r"(?:-[A-Za-z0-9][A-Za-z0-9.-]*)?"
+    r"(?:\+[A-Za-z0-9][A-Za-z0-9.-]*)?$"
+)
+
+
+def _validate_version_component(version: str) -> str:
+    """Return a safe semantic-version directory component."""
+    normalized = str(version or "").strip()
+    if not _SAFE_VERSION_COMPONENT_RE.fullmatch(normalized) or ".." in normalized:
+        raise PluginError(message="Invalid plugin version path component")
+    return normalized
 
 
 class VersionManager:
@@ -32,6 +48,15 @@ class VersionManager:
 
     def __init__(self, db: AsyncSession) -> None:
         self._db = db
+
+    def _archive_before_mutation(self, plugin_name: str, version: str) -> None:
+        try:
+            self.archive_version(plugin_name, version)
+        except OSError as error:
+            raise PluginError(
+                message=_("plugin.error.version_archive_failed"),
+                extra={"reason": "plugin_version_archive_failed"},
+            ) from error
 
     def archive_version(self, plugin_name: str, version: str) -> Path:
         """
@@ -41,13 +66,17 @@ class VersionManager:
         Returns:
             Backup directory path / 备份目录路径
         """
+        from app.plugins.table_ownership import get_plugin_owned_table_prefix
+
+        get_plugin_owned_table_prefix(plugin_name)
+        safe_version = _validate_version_component(version)
         source = PLUGINS_DIR / plugin_name
         if not source.is_dir():
             raise PluginNotFoundError(
                 message=f"Plugin directory not found: {source}",
             )
 
-        target = VERSIONS_DIR / plugin_name / version
+        target = VERSIONS_DIR / plugin_name / safe_version
         if target.exists():
             shutil.rmtree(target)
         target.parent.mkdir(parents=True, exist_ok=True)
@@ -73,8 +102,8 @@ class VersionManager:
         new_source: Path,
     ) -> None:
         """
-        Upgrade plugin: disable old → backup → replace → migrate → enable new.
-        / 升级插件：禁用旧版 → 备份 → 替换 → 迁移 → 启用新版
+        Upgrade plugin: preflight → backup → disable old → replace → migrate → enable new.
+        / 升级插件：预检 → 备份 → 禁用旧版 → 替换 → 迁移 → 启用新版
 
         Auto-rollback to old version on failure.
         / 失败时自动回滚。
@@ -128,19 +157,24 @@ class VersionManager:
                 message=f"New version ({new_version}) is the same as current ({old_version})",
             )
 
-        # 1. Disable old version (call _disable_impl since outer upgrade() already holds lock)
-        # / 禁用旧版
+        # 中文: 确定不可写或实际备份失败时，不能先禁用当前运行时或触发其钩子。
+        # EN: Known write denial or an actual archive failure must precede disable and its hooks.
+        target_dir = PLUGINS_DIR / plugin_name
+        old_backup = (
+            VERSIONS_DIR / plugin_name / _validate_version_component(old_version)
+        )
+        require_version_mutation_writable(
+            target_dir, old_backup, python_requirements=new_manifest.dependencies.python
+        )
+        self._archive_before_mutation(plugin_name, old_version)
+
+        # 中文: 外层 upgrade 已持有同插件锁，继续使用原禁用实现。
+        # EN: The outer upgrade holds the plugin lock, so use the existing disable implementation.
         was_enabled = plugin.status == PluginStatusEnum.ENABLED.value
         if was_enabled:
-            await lifecycle._disable_impl(plugin_id)
-
-        # 2. Backup old version / 备份旧版
-        self.archive_version(plugin_name, old_version)
+            await lifecycle._disable_impl(plugin_id, preserve_plan_grants=True)
 
         # 3. Replace files / 替换文件
-        target_dir = PLUGINS_DIR / plugin_name
-        old_backup = VERSIONS_DIR / plugin_name / old_version
-
         try:
             shutil.rmtree(target_dir)
             shutil.copytree(new_source, target_dir)
@@ -265,22 +299,54 @@ class VersionManager:
             raise PluginNotFoundError(message=f"Plugin ID {plugin_id} not found")
 
         plugin_name = plugin.name
-        backup_dir = VERSIONS_DIR / plugin_name / target_version
-        if not backup_dir.is_dir():
+        safe_target_version = _validate_version_component(target_version)
+        versions_root = (VERSIONS_DIR / plugin_name).resolve()
+        backup_path = versions_root / safe_target_version
+        backup_dir = backup_path.resolve()
+        if (
+            not backup_dir.is_relative_to(versions_root)
+            or backup_dir == versions_root
+            or backup_path.is_symlink()
+            or not backup_dir.is_dir()
+        ):
             raise PluginNotFoundError(
                 message=f"Version {target_version} backup not found for '{plugin_name}'",
             )
 
+        # 中文: 先验证目标归档，再禁用运行时、备份或执行独立事务的迁移回退。
+        # EN: Validate the target before runtime disable, backup or independently
+        # committed migration downgrade can change the current installation.
+        from app.plugins.loader import PluginLoader
+
+        loader = PluginLoader()
+        archived_manifest = loader.load_manifest_from_path(backup_dir)
+        if (
+            archived_manifest.name != plugin_name
+            or archived_manifest.version != safe_target_version
+        ):
+            raise PluginError(
+                message=(
+                    "Rollback archive identity mismatch: expected "
+                    f"'{plugin_name}' v{safe_target_version}"
+                ),
+            )
+
         lifecycle = PluginLifecycle(self._db)
+
+        # 中文: 回退同样先验证可写性并完成当前源码备份，避免失败前改变运行状态。
+        # EN: Rollback also checks writes and archives current code before runtime state changes.
+        target_dir = PLUGINS_DIR / plugin_name
+        current_archive = (
+            VERSIONS_DIR / plugin_name / _validate_version_component(plugin.version)
+        )
+        require_version_mutation_writable(target_dir, current_archive)
+        self._archive_before_mutation(plugin_name, plugin.version)
 
         # Disable current (call _disable_impl since outer rollback() already holds lock)
         # / 禁用当前
         was_enabled = plugin.status == PluginStatusEnum.ENABLED.value
         if was_enabled:
-            await lifecycle._disable_impl(plugin_id)
-
-        # Backup current version / 备份当前版本
-        self.archive_version(plugin_name, plugin.version)
+            await lifecycle._disable_impl(plugin_id, preserve_plan_grants=True)
 
         # 中文: 在替换文件前回滚 alembic 迁移，确保 Alembic 仍能读取当前版本迁移脚本。
         # EN: Downgrade before file replacement so Alembic can still read the
@@ -302,19 +368,28 @@ class VersionManager:
                 ),
             ) from exc
 
-        # Restore target version / 恢复目标版本
-        target_dir = PLUGINS_DIR / plugin_name
+        # 中文: 迁移仍读取当前文件，成功后才恢复已验证的目标版本。
+        # EN: Keep current migration files until downgrade succeeds, then restore
+        # the validated target version.
         shutil.rmtree(target_dir)
         shutil.copytree(backup_dir, target_dir)
         unload_plugin_modules(plugin_name)
 
         # Update DB / 更新 DB
-        from app.plugins.loader import PluginLoader
-
-        loader = PluginLoader()
         restored_manifest = loader.load_manifest(plugin_name)
 
-        plugin.version = target_version
+        if (
+            restored_manifest.name != plugin_name
+            or restored_manifest.version != safe_target_version
+        ):
+            raise PluginError(
+                message=(
+                    "Rollback archive identity mismatch: expected "
+                    f"'{plugin_name}' v{safe_target_version}"
+                )
+            )
+
+        plugin.version = safe_target_version
         plugin.manifest = restored_manifest.model_dump()
         restored_py_deps = (
             getattr(getattr(restored_manifest, "dependencies", None), "python", None)
@@ -337,7 +412,7 @@ class VersionManager:
         version_row = await self._db.execute(
             select(PluginVersion).where(
                 PluginVersion.plugin_id == plugin_id,
-                PluginVersion.version == target_version,
+                PluginVersion.version == safe_target_version,
                 PluginVersion.is_deleted.is_(False),
             )
         )
@@ -350,7 +425,7 @@ class VersionManager:
             self._db.add(
                 PluginVersion(
                     plugin_id=plugin_id,
-                    version=target_version,
+                    version=safe_target_version,
                     manifest=restored_manifest.model_dump(),
                     status=PluginVersionStatusEnum.ACTIVE.value,
                     installed_at=utc_now(),

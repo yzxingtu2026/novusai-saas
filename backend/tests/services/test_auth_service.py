@@ -55,7 +55,7 @@ def _make_tenant_admin(**overrides):
 
 
 def _make_tenant(**overrides):
-    defaults = {"id": 1, "is_active": True}
+    defaults = {"id": 1, "is_active": True, "session_revocation_epoch": 0}
     defaults.update(overrides)
     return make_mock_model(**defaults)
 
@@ -610,12 +610,18 @@ class TestTenantAdminLogin:
             subject=tenant_admin.id,
             scope="tenant_admin",
             expires_delta=timedelta(minutes=45),
-            extra_claims={"tenant_id": tenant_admin.tenant_id},
+            extra_claims={
+                "tenant_id": tenant_admin.tenant_id,
+                "tenant_session_epoch": tenant.session_revocation_epoch,
+            },
         )
         mock_create_refresh_token.assert_called_once_with(
             subject=tenant_admin.id,
             scope="tenant_admin",
-            extra_claims={"tenant_id": tenant_admin.tenant_id},
+            extra_claims={
+                "tenant_id": tenant_admin.tenant_id,
+                "tenant_session_epoch": tenant.session_revocation_epoch,
+            },
         )
 
 
@@ -684,6 +690,7 @@ class TestTenantAdminImpersonation:
             extra_claims={
                 "tenant_id": tenant.id,
                 "impersonated_by": platform_admin.id,
+                "tenant_session_epoch": tenant.session_revocation_epoch,
                 "impersonate_role_id": 9,
             },
         )
@@ -816,6 +823,46 @@ class TestChangePassword:
             await service.change_admin_password(admin, "old_pass", "new_pass123!")
 
         assert admin.password_hash == "new_hash"
+
+    @pytest.mark.asyncio
+    async def test_user_password_route_rejects_wrong_current_password(
+        self, mock_db
+    ) -> None:
+        """密码错误时不写入 / The route rejects a wrong password before writing.
+
+        Test type: behavioral.
+        """
+        from app.api.user.auth import change_password
+        from app.core.i18n import _
+        from app.core.security import get_password_hash
+        from app.enums import ErrorCode
+        from app.exceptions import BusinessException
+        from app.schemas.tenant import TenantUserChangePasswordRequest
+        from app.services.common.auth_service import AuthService
+
+        original_hash = get_password_hash("FictionalOriginal42!")
+        user = _make_tenant_user(password_hash=original_hash)
+        payload = TenantUserChangePasswordRequest(
+            old_password="FictionalWrong42!",
+            new_password="FictionalNew42!",
+        )
+
+        with (
+            patch.object(AuthService, "force_logout", new_callable=AsyncMock) as revoke,
+            pytest.raises(BusinessException) as captured,
+        ):
+            await change_password(mock_db, user, payload)
+
+        failure = captured.value
+        assert (failure.status_code, failure.code) == (
+            422,
+            ErrorCode.OLD_PASSWORD_INCORRECT,
+        )
+        assert failure.message == _("auth.password_mismatch")
+        assert user.password_hash == original_hash
+        mock_db.flush.assert_not_awaited()
+        mock_db.commit.assert_not_awaited()
+        revoke.assert_not_awaited()
 
 
 class TestTenantUserLogin:
@@ -981,15 +1028,15 @@ class TestTenantUserCodeLogin:
         )
         mock_db.execute.side_effect = [
             make_scalar_result(_make_tenant()),
-            make_scalar_result(None),
+            make_scalars_result([]),
         ]
 
         with (
             patch(
-                "app.services.common.auth_service.cache_get",
+                "app.services.common.auth_service.cache_set_if_absent",
                 new_callable=AsyncMock,
-                return_value=None,
-            ),
+                return_value=True,
+            ) as claim_send,
             patch(
                 "app.services.common.auth_service.cache_set",
                 new_callable=AsyncMock,
@@ -1003,7 +1050,8 @@ class TestTenantUserCodeLogin:
             )
 
         assert result["message"]
-        assert mock_cache_set.await_count == 1
+        claim_send.assert_awaited_once()
+        mock_cache_set.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_login_code_success_queues_email(self, mock_db):
@@ -1019,15 +1067,15 @@ class TestTenantUserCodeLogin:
         )
         mock_db.execute.side_effect = [
             make_scalar_result(_make_tenant(id=user.tenant_id)),
-            make_scalar_result(user),
+            make_scalars_result([user]),
         ]
 
         with (
             patch(
-                "app.services.common.auth_service.cache_get",
+                "app.services.common.auth_service.cache_set_if_absent",
                 new_callable=AsyncMock,
-                return_value=None,
-            ),
+                return_value=True,
+            ) as claim_send,
             patch(
                 "app.services.common.auth_service.cache_set",
                 new_callable=AsyncMock,
@@ -1048,10 +1096,11 @@ class TestTenantUserCodeLogin:
             )
 
         assert result["message"]
-        assert mock_cache_set.await_count == 2
+        claim_send.assert_awaited_once()
+        mock_cache_set.assert_awaited_once()
         mock_render_email.assert_called_once_with(
             user_name=user.nickname,
-            code=mock_cache_set.await_args_list[1].args[1]["code"],
+            code=mock_cache_set.await_args.args[1]["code"],
             expire_minutes=service.LOGIN_CODE_TTL // 60,
         )
         mock_delay.assert_called_once_with(
@@ -1086,9 +1135,10 @@ class TestTenantUserCodeLogin:
                 return_value={"code": "123456", "user_id": user.id},
             ),
             patch(
-                "app.services.common.auth_service.cache_delete",
+                "app.services.common.auth_service.cache_getdel_if_matches",
                 new_callable=AsyncMock,
-            ) as mock_cache_delete,
+                return_value={"code": "123456", "user_id": user.id},
+            ) as consume_code,
             patch.object(
                 service,
                 "_is_account_locked",
@@ -1116,7 +1166,11 @@ class TestTenantUserCodeLogin:
             )
 
         assert result == {"access_token": "token"}
-        mock_cache_delete.assert_awaited_once()
+        consume_code.assert_awaited_once_with(
+            f"tenant_user_login_code:email:{user.tenant_id}:user@example.com",
+            code="123456",
+            user_id=user.id,
+        )
         mock_issue_tokens.assert_awaited_once()
 
     @pytest.mark.asyncio

@@ -208,23 +208,41 @@ class _NamespacedStorageProxy:
     / 方法签名与 StorageDriver 基类对齐，但路径自动加 plugins/{name}/ 前缀。
     """
 
-    def __init__(self, driver: Any, namespace: str) -> None:
+    def __init__(
+        self, driver: Any, plugin_name: str, *, can_read: bool, can_write: bool
+    ) -> None:
         self._driver = driver
-        self._namespace = namespace
+        self._plugin_name = plugin_name
+        self._namespace = f"plugins/{plugin_name}"
+        self._can_read = can_read
+        self._can_write = can_write
+
+    def _require_access(self, capability: str, *, allowed: bool) -> None:
+        if not allowed:
+            raise PluginSecurityError(
+                message=_("plugin.error.capability_required").format(
+                    plugin_name=self._plugin_name,
+                    capability=capability,
+                ),
+            )
 
     def _ns_path(self, path: str) -> str:
         """Normalize path and ensure it doesn't escape namespace (prevent ../ path traversal) / 规范化路径并确保不逃逸命名空间（防止 ../ 路径遍历）"""
         import posixpath
+        from pathlib import PureWindowsPath
 
-        stripped = path.lstrip("/")
-        if not stripped:
-            return self._namespace
-        normalized = posixpath.normpath(stripped)
-        if normalized.startswith("..") or normalized == ".":
-            raise PluginSecurityError(
-                message=_("plugin.error.path_traversal_detected").format(path=path),
-            )
-        return f"{self._namespace}/{normalized}"
+        if isinstance(path, str) and not PureWindowsPath(path).anchor:
+            if not path:
+                return self._namespace
+            normalized = posixpath.normpath(path.replace("\\", "/"))
+            if normalized not in {".", ".."} and not normalized.startswith(
+                ("../", "/")
+            ):
+                return f"{self._namespace}/{normalized}"
+
+        raise PluginSecurityError(
+            message=_("plugin.error.path_traversal_detected").format(path=path),
+        )
 
     async def put(
         self,
@@ -233,25 +251,31 @@ class _NamespacedStorageProxy:
         mime_type: str | None = None,
         **kwargs: Any,
     ) -> Any:
+        self._require_access("storage:write", allowed=self._can_write)
         return await self._driver.put(
             self._ns_path(path), content, mime_type=mime_type, **kwargs
         )
 
     async def get(self, path: str) -> Any:
+        self._require_access("storage:read", allowed=self._can_read)
         return await self._driver.get(self._ns_path(path))
 
     async def delete(self, path: str) -> bool:
+        self._require_access("storage:write", allowed=self._can_write)
         return await self._driver.delete(self._ns_path(path))
 
     async def exists(self, path: str) -> bool:
+        self._require_access("storage:read", allowed=self._can_read)
         return await self._driver.exists(self._ns_path(path))
 
     async def get_url(self, path: str, expires: int = 3600, **kwargs: Any) -> str:
+        self._require_access("storage:read", allowed=self._can_read)
         return await self._driver.get_url(
             self._ns_path(path), expires=expires, **kwargs
         )
 
     async def get_info(self, path: str) -> Any:
+        self._require_access("storage:read", allowed=self._can_read)
         return await self._driver.get_info(self._ns_path(path))
 
 

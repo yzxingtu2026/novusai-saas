@@ -306,6 +306,7 @@ class PluginLifecycle(
         force: bool = False,
         operator_id: int | None = None,
         skip_lifecycle_guards: bool = False,
+        preserve_plan_grants: bool = False,
     ) -> None:
         """Disable plugin implementation (caller must hold lock) / 禁用插件实现（调用方须持锁）"""
         await self.orchestrator.disable_impl(
@@ -313,6 +314,7 @@ class PluginLifecycle(
             force=force,
             operator_id=operator_id,
             skip_lifecycle_guards=skip_lifecycle_guards,
+            preserve_plan_grants=preserve_plan_grants,
         )
 
     async def _refresh_schedules_impl(self, plugin_id: int) -> dict[str, Any]:

@@ -44,12 +44,24 @@ export function useTabbar() {
     toggleTabPin,
   } = useTabs();
 
-  /**
-   * 当前路径对应的tab的key
-   */
-  const currentActive = computed(() => {
-    return getTabKey(route);
+  const currentRouteTab = computed(() => {
+    const meta = route.matched?.[route.matched.length - 1]?.meta;
+    const tabMeta = {
+      ...(meta || route.meta),
+    };
+
+    // 中文: 激活和存储使用同一 key 策略，默认忽略 query，避免标签与缓存膨胀。
+    // EN: Share the active/stored key policy; ignore query by default to bound tabs and caches.
+    if (tabMeta.fullPathKey === undefined) {
+      tabMeta.fullPathKey = false;
+    }
+
+    return {
+      ...route,
+      meta: tabMeta,
+    };
   });
+  const currentActive = computed(() => getTabKey(currentRouteTab.value));
 
   const { locale } = useI18n();
   const currentTabs = ref<RouteLocationNormalizedGeneric[]>();
@@ -132,20 +144,7 @@ export function useTabbar() {
   watch(
     () => route.fullPath,
     () => {
-      const meta = route.matched?.[route.matched.length - 1]?.meta;
-      const tabMeta = {
-        ...(meta || route.meta),
-      };
-
-      // 默认按 path 作为 tab key，避免 query 抖动导致 tab 与 KeepAlive 实例膨胀
-      if (tabMeta.fullPathKey === undefined) {
-        tabMeta.fullPathKey = false;
-      }
-
-      tabbarStore.addTab({
-        ...route,
-        meta: tabMeta,
-      });
+      tabbarStore.addTab(currentRouteTab.value);
     },
     { immediate: true },
   );

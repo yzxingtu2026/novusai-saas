@@ -13,6 +13,7 @@ import { Download, IconifyIcon, Plus } from '@vben/icons';
 import { Badge, Button, Input, Select, Tooltip } from 'ant-design-vue';
 
 import { $t } from '#/locales';
+import { useAccess } from '#/utils/access';
 
 defineOptions({
   name: 'CrudGrid',
@@ -73,6 +74,15 @@ interface Props {
 const attrs = useAttrs();
 
 const slots = useSlots();
+
+const { hasAccessByCodes } = useAccess();
+
+const createButtonDisabled = computed(() => {
+  return (
+    Boolean(props.createPermission) &&
+    !hasAccessByCodes([props.createPermission])
+  );
+});
 
 // Filter out toolbar-tools / toolbar-actions slots, handle separately / 过滤掉 toolbar-tools / toolbar-actions 插槽，单独处理
 const filteredSlots = computed(() => {
@@ -141,6 +151,7 @@ function handleRefresh() {
         <Button
           v-if="props.onCreate && props.createPermission"
           v-access:code="[props.createPermission]"
+          :disabled="createButtonDisabled"
           type="primary"
           class="!rounded-lg !shadow-sm !shadow-primary/20"
           @click="props.onCreate"

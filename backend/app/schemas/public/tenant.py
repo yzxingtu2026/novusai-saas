@@ -105,8 +105,8 @@ class DomainVerificationInfo(BaseSchema):
     domain: str = Field(..., description="待验证域名")
 
     # CNAME 配置
-    cname_target: str = Field(..., description="CNAME 解析目标")
-    cname_name: str = Field(
+    cname_target: str | None = Field(None, description="CNAME 解析目标")
+    cname_name: str | None = Field(
         "@",
         description="CNAME 记录名称（通常为 @ 或子域名）",
     )

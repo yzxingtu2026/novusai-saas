@@ -1,5 +1,6 @@
 {
   "page": {
+    "runtime_readonly": "Effective deployment value. Change the deployment configuration and restart the service to update it.",
     "title": "System Configs",
     "unsaved_title": "Unsaved Changes",
     "unsaved_content": "You have unsaved changes. Are you sure to leave?",

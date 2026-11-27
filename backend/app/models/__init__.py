@@ -83,6 +83,7 @@ from app.models.system import (
     CodegenConfigVersion,
     OperationLog,
     Plugin,
+    PluginImageOperation,
     PluginLicense,
     PluginVersion,
     ResourceTenantAssignment,
@@ -201,6 +202,7 @@ __all__ = [
     "EmailLog",
     # 插件 / Plugins
     "Plugin",
+    "PluginImageOperation",
     "PluginVersion",
     "PluginLicense",
     "ResourceTenantAssignment",

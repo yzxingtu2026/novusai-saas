@@ -41,6 +41,108 @@ export interface VerificationInfo {
   value?: string;
 }
 
+/** Deployment certificate evidence; independent of domain DB SSL status. */
+export interface ManagedHttpsInfoRaw {
+  configured: boolean;
+  covered: boolean;
+  status: 'active' | 'expired' | 'expiring' | 'unconfigured';
+  expires_at: null | string;
+  auto_renew: boolean;
+}
+
+export interface ManagedHttpsInfo {
+  configured: boolean;
+  covered: boolean;
+  status: ManagedHttpsInfoRaw['status'];
+  expiresAt: null | string;
+  autoRenew: boolean;
+}
+
+export interface TenantDomainInfoRaw {
+  id: number;
+  tenant_id: number;
+  domain: string;
+  domain_type: DomainType;
+  is_verified: boolean;
+  is_primary: boolean;
+  ssl_status: SslStatus;
+  managed_https?: ManagedHttpsInfoRaw | null;
+  cname_target?: null | string;
+  txt_record?: null | string;
+  verification_token?: null | string;
+  verification_info?: null | VerificationInfo;
+  verified_at?: null | string;
+  ssl_expires_at?: null | string;
+  remark?: null | string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface TenantDomainInfo {
+  id: number;
+  tenantId: number;
+  domain: string;
+  domainType: DomainType;
+  isPrimary: boolean;
+  isVerified: boolean;
+  verificationStatus: VerificationStatus;
+  sslStatus: SslStatus;
+  managedHttps?: ManagedHttpsInfo | null;
+  cnameTarget?: string;
+  txtRecord?: string;
+  verificationToken?: null | string;
+  verificationInfo?: null | VerificationInfo;
+  verifiedAt?: string;
+  sslExpiresAt?: string;
+  remark?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+// 中文: 两端使用相同 DNS 字段转换，保留原始字段兼容现有消费者。
+// EN: Both surfaces normalize DNS fields together while retaining raw fields for compatibility.
+export function transformDomainInfo(
+  raw: TenantDomainInfoRaw,
+): TenantDomainInfo {
+  const info = raw.verification_info;
+  return {
+    id: raw.id,
+    tenantId: raw.tenant_id,
+    domain: raw.domain,
+    domainType: raw.domain_type || 'custom',
+    isPrimary: raw.is_primary,
+    isVerified: raw.is_verified,
+    verificationStatus: raw.is_verified ? 'verified' : 'pending',
+    sslStatus: raw.ssl_status || 'none',
+    managedHttps:
+      raw.domain_type === 'default' && raw.managed_https
+        ? {
+            configured: raw.managed_https.configured,
+            covered: raw.managed_https.covered,
+            status: raw.managed_https.status,
+            expiresAt: raw.managed_https.expires_at,
+            autoRenew: raw.managed_https.auto_renew,
+          }
+        : null,
+    cnameTarget: raw.cname_target ?? undefined,
+    txtRecord: raw.txt_record ?? undefined,
+    verificationToken: raw.verification_token,
+    verificationInfo: info
+      ? {
+          ...info,
+          host: info.dns_name ?? info.host,
+          type: info.dns_type ?? info.type,
+          value: info.dns_value ?? info.value,
+        }
+      : null,
+    verifiedAt: raw.verified_at ?? undefined,
+    sslExpiresAt: raw.ssl_expires_at ?? undefined,
+    remark: raw.remark ?? undefined,
+    createdAt: raw.created_at,
+    updatedAt: raw.updated_at,
+  };
+}
+
 /** SSL certificate details (frontend camelCase format) / SSL 证书详情（前端 camelCase 格式） */
 export interface SslCertificateInfo {
   id: number;

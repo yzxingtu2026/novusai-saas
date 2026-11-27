@@ -13,6 +13,7 @@ from app.core.config import settings
 from app.core.cors import is_origin_allowed_sync
 from app.core.logging import LogManager
 from app.core.socketio_redis import get_socketio_redis_listener_options
+from app.sio.session_manager import SessionValidatedRedisManager
 
 logger = LogManager.get_logger("app")
 
@@ -20,7 +21,7 @@ logger = LogManager.get_logger("app")
 # Redis Manager（多 Worker 消息同步 / Multi-worker message sync）
 # ========================================
 
-_redis_manager = socketio.AsyncRedisManager(
+_redis_manager = SessionValidatedRedisManager(
     settings.REDIS_URL,
     write_only=False,
     redis_options=get_socketio_redis_listener_options(),

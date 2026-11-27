@@ -3,11 +3,12 @@
 from __future__ import annotations
 
 import json
-from contextlib import suppress
+from datetime import timezone
 from io import BytesIO
+from types import SimpleNamespace
 from typing import Any
 
-from sqlalchemy import select, text, update
+from sqlalchemy import text, update
 
 from app.services.common.storage_config_resolver import (
     infer_attachment_storage_scope,
@@ -15,6 +16,9 @@ from app.services.common.storage_config_resolver import (
     strip_internal_attachment_meta,
 )
 from app.storage.base import StorageConfig, StorageVisibility
+
+from . import migration_forward_attempt as forward
+from .migration_local_receipts import new_receipt
 
 
 def normalize_scope(scope: str) -> str:
@@ -74,21 +78,51 @@ async def execute_single_file_migration(
     logger: Any,
 ) -> bool:
     """Migrate one attachment and persist migration log updates."""
-    target_written = False
+    upload_started = False
+    attempt = None
+    phase = "prepared"
 
     try:
-        attachment_meta_q = select(
-            attachment_model.visibility,
-            attachment_model.mime_type,
-            attachment_model.meta,
-            attachment_model.tenant_id,
-        ).where(attachment_model.id == attachment_id)
-        attachment_meta_result = await db.execute(attachment_meta_q)
-        attachment_meta = attachment_meta_result.one_or_none()
-        if attachment_meta is None:
-            raise RuntimeError(
-                f"Attachment {attachment_id} not found during storage migration"
+        # A committed attempt must fence this log before any object I/O.
+        # The runner owns independent readback of an unacknowledged COMMIT.
+        if log_table != forward.LOG:
+            raise RuntimeError("storage_forward_admission_failed")
+        attempt = await forward.prepare_forward_attempt(
+            db, log_id, attachment_id, file_path
+        )
+        # Driver instances were resolved before file admission. A concurrent
+        # task-config change cannot redirect an old runner's physical I/O.
+        expected_target = attempt.snapshot["task"]["target_config_snapshot"]
+        version = attempt.snapshot["version"]
+        actual_target = forward.config_identity(target_storage_config, version)
+        actual_source_config = getattr(source_driver, "config", None)
+        if (
+            not forward._equal(expected_target, actual_target)
+            or actual_source_config is None
+            or not forward._equal(
+                attempt.snapshot["task"]["source_config_snapshot"],
+                forward.config_identity(actual_source_config, version),
             )
+            or target_driver_name != actual_target["driver"]
+            or target_base_url != target_driver.get_base_url()
+        ):
+            raise RuntimeError("storage_migration_configuration_changed")
+
+        # Use only the source identity frozen by durable admission. A later
+        # live read must not silently substitute another tenant's metadata.
+        attachment_meta = SimpleNamespace(**attempt.snapshot["source"])
+        source_snapshot = (
+            attachment_meta.meta.get("_storage_snapshot")
+            if isinstance(attachment_meta.meta, dict)
+            else None
+        )
+        if source_snapshot is not None and (
+            type(source_snapshot) is not dict
+            or source_snapshot.get("driver") != attachment_meta.driver
+            or source_snapshot.get("root_path") != actual_source_config.root_path
+            or source_snapshot.get("base_url") != actual_source_config.base_url
+        ):
+            raise RuntimeError("storage_migration_source_location_changed")
 
         visibility = StorageVisibility(
             attachment_meta.visibility or StorageVisibility.PRIVATE.value
@@ -105,34 +139,84 @@ async def execute_single_file_migration(
             )
             or "platform"
         )
-        updated_meta = merge_attachment_storage_snapshot(
-            metadata,
-            target_storage_config,
-            storage_scope,
-        )
-
         content = await source_driver.get(file_path)  # type: ignore[union-attr]
         file_data = (
             BytesIO(content) if isinstance(content, (bytes, bytearray)) else content
         )
 
-        await target_driver.put(  # type: ignore[union-attr]
-            path=file_path,
-            content=file_data,
-            mime_type=attachment_meta.mime_type,
-            visibility=visibility,
-            metadata=object_metadata,
+        try:
+            if await target_driver.exists(file_path) is not False:
+                raise RuntimeError("storage_migration_target_already_exists")
+            upload_started = True
+            phase = "upload"
+            receipt = new_receipt(target_driver)
+            put = target_driver.put_owned if receipt is not None else target_driver.put
+            upload_result = await put(
+                path=file_path,
+                content=file_data,
+                mime_type=attachment_meta.mime_type,
+                visibility=visibility,
+                metadata=object_metadata,
+                **({"receipt": receipt} if receipt is not None else {}),
+            )
+            if (
+                upload_result.size != attachment_meta.size
+                or upload_result.path != file_path
+                or (
+                    attachment_meta.hash
+                    and upload_result.hash != attachment_meta.hash.lower()
+                )
+            ):
+                raise RuntimeError("storage_migration_target_content_changed")
+        finally:
+            # get() gave ownership of this stream to the helper. Release it on
+            # success, write failure and cancellation without deleting bytes.
+            file_data.close()
+        local_identity = (
+            receipt.snapshot(target_driver._get_cache_root())
+            if receipt is not None and len(receipt.files) == 2
+            else None
         )
-        target_written = True
+        updated_meta = merge_attachment_storage_snapshot(
+            metadata,
+            target_storage_config,
+            storage_scope,
+        )
+        migrated_at = now_factory()
+        migrated_at = (
+            migrated_at.replace(tzinfo=timezone.utc)
+            if migrated_at.tzinfo is None
+            else migrated_at.astimezone(timezone.utc)
+        )
 
+        phase = "uploaded"
+        await forward.record_uploaded(
+            db,
+            attempt,
+            updated_meta=updated_meta,
+            target_driver_name=target_driver_name,
+            target_base_url=target_base_url,
+            migrated_at=migrated_at,
+            target_path=upload_result.path,
+            local_identity=local_identity,
+        )
+        phase = "business"
+        # Keep task/log/attachment ownership through the actual write and
+        # COMMIT. A frozen receipt is evidence, never a lock substitute.
+        await forward.lock_forward_attempt(db, attempt)
+
+        values = {
+            "path": upload_result.path,
+            "driver": target_driver_name,
+            "base_url": target_base_url,
+            "meta": updated_meta,
+        }
+        if hasattr(attachment_model, "local_object_identity"):
+            values["local_object_identity"] = local_identity
         await db.execute(
             update(attachment_model)
             .where(attachment_model.id == attachment_id)
-            .values(
-                driver=target_driver_name,
-                base_url=target_base_url,
-                meta=updated_meta,
-            )
+            .values(**values)
         )
 
         await db.execute(
@@ -143,6 +227,8 @@ async def execute_single_file_migration(
                     new_driver = :driver,
                     new_base_url = :base_url,
                     migrated_at = :now,
+                    rollback_state = 'none',
+                    rollback_snapshot = NULL,
                     error_message = NULL
                 WHERE id = :id
                 """
@@ -151,44 +237,36 @@ async def execute_single_file_migration(
                 "id": log_id,
                 "driver": target_driver_name,
                 "base_url": target_base_url,
-                "now": now_factory(),
+                "now": migrated_at,
             },
         )
+        await forward.mark_forward_succeeded(db, attempt)
         await db.commit()
         return True
     except Exception as exc:
-        logger.warning("Failed to migrate file {} (log={}): {}", file_path, log_id, exc)
-
-        with suppress(Exception):
-            await db.rollback()
-
-        if target_written:
-            try:
-                await target_driver.delete(file_path)  # type: ignore[union-attr]
-            except Exception as cleanup_exc:
-                logger.warning(
-                    "Failed to cleanup partially written target file {}: {}",
-                    file_path,
-                    cleanup_exc,
-                )
-
-        try:
-            await db.execute(
-                text(
-                    f"""
-                    UPDATE {log_table}
-                    SET status = 'failed',
-                        error_message = :error
-                    WHERE id = :id
-                    """
-                ),
-                {"id": log_id, "error": str(exc)[:500]},
-            )
-            await db.commit()
-        except Exception as status_exc:
+        if isinstance(exc, forward.ForwardCommitUncertain):
+            raise
+        if attempt is None:
+            # Admission produced no acknowledged attempt. Do not expose a
+            # database/configuration exception or start storage work.
+            raise RuntimeError("storage_forward_admission_failed") from None
+        if upload_started:
+            # Even a failed PUT may have written bytes. Neither a business
+            # rollback nor a lost ACK grants compensation DELETE authority.
             logger.warning(
-                "Failed to persist migration failure status for log {}: {}",
+                "Migration attempt requires readback log={} reason={}",
                 log_id,
-                status_exc,
+                "storage_forward_outcome_unknown",
             )
+            raise forward.ForwardCommitUncertain(attempt, phase) from None
+        try:
+            await db.rollback()
+            await forward.fail_forward_attempt(db, attempt)
+        except Exception:
+            raise forward.ForwardCommitUncertain(attempt, "prepared") from None
+        logger.warning(
+            "Migration attempt failed before upload log={} reason={}",
+            log_id,
+            "storage_forward_source_unavailable",
+        )
         return False

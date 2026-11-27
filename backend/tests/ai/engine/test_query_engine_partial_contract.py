@@ -364,7 +364,7 @@ async def test_runtime_query_engine_does_not_retry_sync_rescue_after_retryable_f
         )
 
     assert adapter.chat_calls == 1
-    assert adapter.chat_kwargs[0]["_runtime_reasoning_effort_override"] == "low"
+    assert adapter.chat_kwargs[0]["_runtime_reasoning_effort_default"] == "low"
     assert query_engine.turn_record.turn_outcome == "failed"
     assert query_engine.turn_record.metadata["sync_rescue_attempt_count"] == 1
     assert query_engine.turn_record.metadata["sync_rescue_retry_count"] == 0

@@ -23,6 +23,9 @@ from app.api.admin.plugin_admin_contracts import (
     register_plugin_admin_read_routes,
 )
 from app.api.admin.plugin_dependency_routes import register_plugin_dependency_routes
+from app.api.admin.plugin_image_operation_routes import (
+    register_plugin_image_operation_routes,
+)
 from app.core.base_controller import GlobalController
 from app.core.deps import ActiveAdmin, DbSession
 from app.core.i18n import _ as translate
@@ -96,6 +99,7 @@ class AdminPluginController(GlobalController):
 
     def _register_routes(self):
         register_plugin_admin_read_routes(self)
+        register_plugin_image_operation_routes(self)
         register_plugin_install_preview_routes(self)
         register_plugin_dependency_routes(
             self,

@@ -1,0 +1,5 @@
+{
+  "user_role_permission_admission": {
+    "invalid_selection": "部分所选权限已失效或不适用于用户端，请刷新权限列表后重新选择。"
+  }
+}

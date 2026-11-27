@@ -203,6 +203,7 @@ class BatchRunStatusEnum(LabeledStrEnum):
     PARTIAL_FAILED = ("partial_failed", "enum.agent.batch_run_status.partial_failed")
     FAILED = ("failed", "enum.agent.batch_run_status.failed")
     CANCELLED = ("cancelled", "enum.agent.batch_run_status.cancelled")
+    UNKNOWN = ("unknown", "enum.agent.batch_run_status.unknown")
 
 
 def get_all_skill_types() -> set[str]:

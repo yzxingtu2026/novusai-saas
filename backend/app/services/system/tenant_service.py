@@ -515,7 +515,11 @@ class TenantService(GlobalService[Tenant, TenantRepository]):
             NotFoundException: 企业不存在
             BusinessException: 编码已存在
         """
-        tenant = await self.get_by_id(tenant_id)
+        tenant = (
+            await self.repo.get_for_lifecycle_update(tenant_id)
+            if "is_active" in data
+            else await self.get_by_id(tenant_id)
+        )
         if not tenant:
             raise NotFoundException(
                 message=_("tenant.not_found"),
@@ -555,9 +559,18 @@ class TenantService(GlobalService[Tenant, TenantRepository]):
                 },
             )
 
-        result = await self.update(tenant_id, data)
+        changes = dict(data)
+        changes.pop("session_revocation_epoch", None)
+        status_changed = (
+            "is_active" in changes and changes["is_active"] != tenant.is_active
+        )
+        if status_changed:
+            changes["session_revocation_epoch"] = tenant.session_revocation_epoch + 1
+        result = await self.update(tenant_id, changes)
         if not result:
             raise NotFoundException(message=_("tenant.not_found"))
+        if status_changed:
+            self._schedule_lifecycle_disconnect(result)
         return result
 
     async def enable_tenant(self, tenant_id: int) -> Tenant:
@@ -573,16 +586,7 @@ class TenantService(GlobalService[Tenant, TenantRepository]):
         Raises:
             NotFoundException: 企业不存在
         """
-        tenant = await self.get_by_id(tenant_id)
-        if not tenant:
-            raise NotFoundException(
-                message=_("tenant.not_found"),
-            )
-
-        result = await self.update(tenant_id, {"is_active": True})
-        if not result:
-            raise NotFoundException(message=_("tenant.not_found"))
-        return result
+        return await self.update_tenant(tenant_id, {"is_active": True})
 
     async def disable_tenant(self, tenant_id: int) -> Tenant:
         """
@@ -597,16 +601,7 @@ class TenantService(GlobalService[Tenant, TenantRepository]):
         Raises:
             NotFoundException: 企业不存在
         """
-        tenant = await self.get_by_id(tenant_id)
-        if not tenant:
-            raise NotFoundException(
-                message=_("tenant.not_found"),
-            )
-
-        result = await self.update(tenant_id, {"is_active": False})
-        if not result:
-            raise NotFoundException(message=_("tenant.not_found"))
-        return result
+        return await self.update_tenant(tenant_id, {"is_active": False})
 
     async def toggle_status(self, tenant_id: int, is_active: bool) -> Tenant:
         """
@@ -626,6 +621,28 @@ class TenantService(GlobalService[Tenant, TenantRepository]):
             return await self.enable_tenant(tenant_id)
         else:
             return await self.disable_tenant(tenant_id)
+
+    def _schedule_lifecycle_disconnect(self, tenant: Tenant) -> None:
+        from app.sio.tenant_revocation import schedule_tenant_socket_revocation
+
+        schedule_tenant_socket_revocation(
+            self.db, tenant.id, tenant.session_revocation_epoch
+        )
+
+    async def _before_delete(self, id: int) -> None:
+        tenant = await self.repo.get_for_lifecycle_update(id)
+        if tenant is None:
+            raise NotFoundException(message=_("tenant.not_found"))
+        tenant.session_revocation_epoch += 1
+        self._schedule_lifecycle_disconnect(tenant)
+
+    async def _before_restore(self, id: int) -> None:
+        await self.repo.get_for_lifecycle_update(id, include_deleted=True)
+
+    async def _after_restore(self, tenant: Tenant) -> None:
+        tenant.session_revocation_epoch += 1
+        await self.db.flush()
+        self._schedule_lifecycle_disconnect(tenant)
 
     async def validate_impersonation_role(self, tenant_id: int, role_id: int) -> None:
         """Ensure a tenant-admin role belongs to the impersonation target tenant."""

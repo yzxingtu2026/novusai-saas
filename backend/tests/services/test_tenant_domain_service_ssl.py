@@ -12,6 +12,8 @@ from app.enums.error_code import ErrorCode
 from app.exceptions import BusinessException
 from tests.services.conftest import make_mock_model
 
+pytestmark = pytest.mark.behavioral
+
 
 @pytest.mark.asyncio
 async def test_start_ssl_provision_rejects_when_already_provisioning(mock_db) -> None:
@@ -24,6 +26,7 @@ async def test_start_ssl_provision_rejects_when_already_provisioning(mock_db) ->
     service.get_by_id = AsyncMock(
         return_value=make_mock_model(
             id=1,
+            domain="shop.example.com",
             is_verified=True,
             ssl_status=DomainSslStatus.PROVISIONING.value,
         )
@@ -53,14 +56,17 @@ async def test_start_ssl_provision_updates_status_and_enqueues_with_delay(
         return_value=make_mock_model(
             id=1,
             tenant_id=5,
+            domain="shop.example.com",
             is_verified=True,
             ssl_status=DomainSslStatus.NONE.value,
         )
     )
     service.ensure_custom_domain_entitled = AsyncMock()
+    service._get_current_ssl_certificate = AsyncMock(return_value=None)
     updated = make_mock_model(
         id=1,
         tenant_id=5,
+        domain="shop.example.com",
         is_verified=True,
         ssl_status=DomainSslStatus.PROVISIONING.value,
     )
@@ -80,6 +86,10 @@ async def test_start_ssl_provision_updates_status_and_enqueues_with_delay(
         1,
         {"ssl_status": DomainSslStatus.PROVISIONING.value},
     )
+    mock_celery.send_task.assert_not_called()
+    service.get_by_id.return_value = updated
+    service._is_default_domain = AsyncMock(return_value=False)
+    await service.dispatch_ssl_provision(1)
     mock_celery.send_task.assert_called_once_with(
         "app.tasks.ssl_tasks.task_provision_ssl",
         args=[1],
@@ -132,7 +142,10 @@ async def test_batch_provision_ssl_rejects_custom_domain_when_plan_inactive(
     service.update = AsyncMock()
     service._send_ssl_provision_task = MagicMock()
     service._get_domain_suffix = AsyncMock(return_value=".tenant.example")
-    mock_db.execute = AsyncMock(side_effect=[_DomainResult(), _TenantResult()])
+    service.repo.get_ssl_provision_candidates.return_value = (
+        _DomainResult().scalars().all()
+    )
+    mock_db.execute = AsyncMock(return_value=_TenantResult())
 
     monkeypatch.setattr(
         "app.services.system.dns_provider.ensure_dns_provider_ready",

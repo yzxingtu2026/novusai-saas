@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import type { ConfigFormExpose } from '#/components/business/config-form/types';
+import type { ConfigGroupRequest } from '#/composables/use-config-group-request-owner';
 import type { ConfigGroupListItemMeta, ConfigItemMeta } from '#/types/config';
 
 import {
@@ -26,6 +27,7 @@ import {
 import { ConfigForm } from '#/components';
 import ConfigGroupSidebar from '#/components/business/config-group-sidebar/index.vue';
 import PluginSettingsTabs from '#/components/business/plugin-slots/PluginSettingsTabs.vue';
+import { useConfigGroupRequestOwner } from '#/composables/use-config-group-request-owner';
 import { $t as t } from '#/locales';
 
 // Storage config dedicated page (lazy-loaded) / 存储配置专用页面
@@ -41,10 +43,16 @@ const router = useRouter();
 const groups = ref<ConfigGroupListItemMeta[]>([]);
 const activeGroup = ref<string>('');
 const configs = ref<ConfigItemMeta[]>([]);
-const loading = ref(false);
 const groupLoading = ref(false);
-const saving = ref(false);
 const formRef = ref<ConfigFormExpose>();
+const requestOwner = useConfigGroupRequestOwner({
+  activeGroup: () => activeGroup.value,
+  onInvalidate: () => {
+    configs.value = [];
+    groupLoading.value = false;
+  },
+});
+const { loading, saving, ready: formReady } = requestOwner;
 
 // Currently selected group data / 当前选中的分组数据
 const activeGroupData = computed(() =>
@@ -94,27 +102,40 @@ async function syncRouteSelection(groupCode: string, configKey?: string) {
   await router.replace({ hash: route.hash, path: route.path, query });
 }
 
-async function scrollToConfigItem(configKey: string) {
+async function scrollToConfigItem(
+  configKey: string,
+  request: ConfigGroupRequest,
+) {
   await nextTick();
+  if (
+    !requestOwner.isCurrent(request) ||
+    !formReady.value ||
+    request.group !== getRequestedGroupCode() ||
+    configKey !== getRequestedConfigKey()
+  )
+    return;
   const target = document.querySelector<HTMLElement>(
     `#config-item-${CSS.escape(configKey)}`,
   );
   target?.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
 
-async function focusRequestedConfig(groupCode: string) {
+async function focusRequestedConfig(request: ConfigGroupRequest) {
   const requestedConfigKey = getRequestedConfigKey();
   if (
+    !requestOwner.isCurrent(request) ||
+    !formReady.value ||
     !requestedConfigKey ||
-    groupCode !== getRequestedGroupCode() ||
+    request.group !== getRequestedGroupCode() ||
     !configs.value.some((cfg) => cfg.key === requestedConfigKey)
   ) {
     return;
   }
-  await scrollToConfigItem(requestedConfigKey);
+  await scrollToConfigItem(requestedConfigKey, request);
 }
 
 async function applyRouteSelection() {
+  if (!requestOwner.capturePage()) return;
   const requestedGroupCode = getResolvedRequestedGroupCode();
   if (!requestedGroupCode) return;
   const requestedConfigKey = getRequestedConfigKey() || undefined;
@@ -126,7 +147,8 @@ async function applyRouteSelection() {
     return;
   }
   if (requestedConfigKey) {
-    await focusRequestedConfig(requestedGroupCode);
+    const request = requestOwner.current();
+    if (request) await focusRequestedConfig(request);
   }
 }
 
@@ -173,21 +195,28 @@ async function activateGroup(
   code: string,
   options?: { configKey?: string; syncRoute?: boolean },
 ) {
+  const request = requestOwner.select(code, code !== 'tenant_storage');
+  if (!request) return;
   activeGroup.value = code;
+  configs.value = [];
   if (options?.syncRoute !== false) {
     await syncRouteSelection(code, options?.configKey);
   }
+  if (!requestOwner.isCurrent(request)) return;
   if (code === 'tenant_storage') {
-    configs.value = [];
     return;
   }
-  await loadGroupDetail(code);
+  await loadGroupDetail(request);
 }
 
 async function loadGroups() {
+  const owner = requestOwner.capturePage();
+  if (!owner) return;
   groupLoading.value = true;
   try {
-    groups.value = await getTenantConfigGroupsApi();
+    const result = await getTenantConfigGroupsApi();
+    if (!requestOwner.isPageCurrent(owner)) return;
+    groups.value = result;
     if (groups.value.length > 0) {
       // Pick first group by sort_order / 按 sort_order 取第一个组
       const sorted = groups.value.toSorted(
@@ -205,33 +234,40 @@ async function loadGroups() {
       });
     }
   } finally {
-    groupLoading.value = false;
+    if (requestOwner.isPageCurrent(owner)) groupLoading.value = false;
   }
 }
 
-async function loadGroupDetail(code: string) {
-  loading.value = true;
+async function loadGroupDetail(request: ConfigGroupRequest) {
+  if (!requestOwner.startLoad(request)) return;
+  configs.value = [];
   try {
-    const detail = await getTenantConfigGroupDetailApi(code);
+    const detail = await getTenantConfigGroupDetailApi(request.group);
+    if (!requestOwner.isCurrent(request)) return;
     configs.value = (detail.configs || []).toSorted(
       (a, b) => (a.sort_order || 0) - (b.sort_order || 0),
     );
-    await focusRequestedConfig(code);
+    requestOwner.acceptLoad(request);
+    await focusRequestedConfig(request);
   } finally {
-    loading.value = false;
+    requestOwner.finishLoad(request);
   }
 }
 
 async function onSelectGroup(code: string) {
+  const request = requestOwner.current();
+  if (!request) return;
   if (code === activeGroup.value) return;
+  const form = formRef.value;
   // Check if form has modifications / 检查表单是否有修改
-  if (formRef.value?.isDirty?.()) {
+  if (form?.isDirty?.()) {
     Modal.confirm({
       title: t('shared.config.page.unsaved_title'),
       content: t('shared.config.page.unsaved_content'),
       okText: t('shared.common.confirm'),
       cancelText: t('shared.common.cancel'),
       onOk: async () => {
+        if (!requestOwner.isCurrent(request) || formRef.value !== form) return;
         await activateGroup(code);
       },
     });
@@ -241,25 +277,23 @@ async function onSelectGroup(code: string) {
 }
 
 async function onSave() {
-  if (!activeGroup.value) return;
+  const form = formRef.value;
+  if (!form) return;
+  const owner = requestOwner.beginSave();
+  if (!owner) return;
   try {
-    await formRef.value?.validate();
-  } catch {
-    // Form validation failed, do not submit / 表单验证失败
-    return;
-  }
-  const payload = formRef.value?.prepareSubmitData();
-  if (!payload) return;
-  saving.value = true;
-  try {
-    await updateTenantConfigGroupApi(activeGroup.value, payload, {
+    await form.validate();
+    if (!requestOwner.ownsSave(owner) || formRef.value !== form) return;
+    const payload = form.prepareSubmitData();
+    await updateTenantConfigGroupApi(owner.request.group, payload, {
       showSuccessMessage: true,
     });
-    await loadGroupDetail(activeGroup.value);
+    if (!requestOwner.ownsSave(owner) || formRef.value !== form) return;
+    await loadGroupDetail(owner.request);
   } catch {
     // Error already handled by request interceptor / 错误已由拦截器处理
   } finally {
-    saving.value = false;
+    requestOwner.finishSave(owner);
   }
 }
 
@@ -279,6 +313,10 @@ onActivated(() => {
     isInitialMount = false;
     return;
   }
+  if (groups.value.length === 0) {
+    void loadGroups();
+    return;
+  }
   const requestedGroupCode = getResolvedRequestedGroupCode();
   if (requestedGroupCode) {
     activateGroup(requestedGroupCode, {
@@ -287,8 +325,8 @@ onActivated(() => {
     });
     return;
   }
-  if (activeGroup.value && activeGroup.value !== 'tenant_storage') {
-    loadGroupDetail(activeGroup.value);
+  if (activeGroup.value) {
+    void activateGroup(activeGroup.value, { syncRoute: false });
   }
 });
 watch(
@@ -336,7 +374,7 @@ onBeforeUnmount(() => {
             type="primary"
             v-access:code="['tenant_config:update']"
             :loading="saving"
-            :disabled="!activeGroup"
+            :disabled="!formReady || loading || saving"
             @click="onSave"
           >
             <template #icon>
@@ -349,12 +387,12 @@ onBeforeUnmount(() => {
         <Spin :spinning="loading">
           <!-- tenant_storage group uses dedicated storage config component / 专用存储配置组件 -->
           <TenantStoragePanel v-if="activeGroup === 'tenant_storage'" />
-          <div v-else-if="activeGroup" class="max-w-[800px]">
+          <div v-else-if="activeGroup && formReady" class="max-w-[800px]">
             <ConfigForm ref="formRef" :configs="configs" />
             <PluginSettingsTabs />
           </div>
           <Empty
-            v-else
+            v-else-if="!activeGroup"
             :description="t('shared.config.page.select_group')"
             class="py-16"
           />

@@ -9,7 +9,10 @@ from typing import Any
 from uuid import uuid4
 
 from app.celery_app import celery_app
+from app.core.i18n import _
 from app.core.logging import LogManager
+from app.enums.task import TaskStatusEnum
+from app.exceptions import BusinessException
 from app.tasks.base import build_task_run_key
 
 logger = LogManager.get_logger("queue")
@@ -70,6 +73,11 @@ class TaskManagerService:
         queue: str | None = None,
         original_run: Any | None = None,
     ) -> dict[str, Any]:
+        status = getattr(original_run, "status", None)
+        if status == TaskStatusEnum.UNKNOWN.value:
+            raise BusinessException(message=_("task_log.error.retry_outcome_unknown"))
+        if status != TaskStatusEnum.FAILED.value:
+            raise BusinessException(message=_("task_log.error.retry_failed_only"))
         headers = TaskManagerService._build_retry_headers(original_run)
         dispatch_queue = queue or getattr(original_run, "queue", None) or "default"
         dispatch_priority = getattr(original_run, "priority", None)

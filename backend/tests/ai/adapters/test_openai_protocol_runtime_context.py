@@ -10,6 +10,7 @@ from types import SimpleNamespace
 
 import pytest
 
+from app.ai.adapters.openai_adapter import OpenAIAdapter
 from app.ai.adapters.openai_compatible.protocol_runtime_context import (
     prepare_protocol_execution_context,
 )
@@ -57,6 +58,46 @@ class _RuntimeContextAdapterStub:
         if timeout is None:
             return None
         return float(timeout)
+
+
+@pytest.mark.structural
+async def test_gpt6_fast_turn_preserves_configured_max_reasoning():
+    adapter = OpenAIAdapter(api_key="local-fixture")
+    try:
+        context_without_config = prepare_protocol_execution_context(
+            adapter=adapter,
+            wire_api="chat_completions",
+            model="gpt-6.2-sol",
+            stream=False,
+            kwargs={"_runtime_reasoning_effort_default": "low"},
+            default_stream_timeout_seconds=20,
+        )
+        context_with_config = prepare_protocol_execution_context(
+            adapter=adapter,
+            wire_api="chat_completions",
+            model="gpt-6.2-sol",
+            stream=False,
+            kwargs={
+                "_runtime_reasoning_effort_default": "low",
+                "model_config": {
+                    "runtime_overrides": {
+                        "openai_compatible": {
+                            "chat_completions": {"reasoning_effort": "max"}
+                        }
+                    }
+                },
+            },
+            default_stream_timeout_seconds=20,
+        )
+        assert context_without_config["effective_request"]["effective_params"] == {
+            "reasoning_effort": "low"
+        }
+        assert context_with_config["effective_request"]["effective_params"] == {
+            "reasoning_effort": "max"
+        }
+        assert "_runtime_reasoning_effort_default" not in context_with_config["kwargs"]
+    finally:
+        await adapter.client.close()
 
 
 def test_prepare_protocol_execution_context_pops_runtime_flags_and_applies_default_timeout() -> (
