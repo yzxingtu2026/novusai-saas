@@ -462,12 +462,14 @@ export const usePublicConfigStore = defineStore('publicConfig', {
         const platformConfig =
           this.platformConfig ??
           (await this.loadPlatformConfig({ applyBrand: false }));
+        if (!platformConfig) return null;
+
         const config = await prepareTenantCaptchaPlugin(
           await getTenantPublicConfigApi(),
         );
         const mergedConfig: TenantPublicConfig = {
           ...config,
-          brand: mergeBrandConfig(platformConfig?.brand, config.brand),
+          brand: mergeBrandConfig(platformConfig.brand, config.brand),
         };
         this.tenantConfig = mergedConfig;
         this.tenantConfigLoaded = true;
@@ -488,8 +490,8 @@ export const usePublicConfigStore = defineStore('publicConfig', {
      * Three-layer deterministic domain detection / 三层确定性域名检测
      *
      * Layer 1: Env var fast match (zero network requests) / 环境变量快速匹配
-     * Layer 2: Platform public config API (1 request, matches platformDomains / tenantDomainSuffix)
-     * Layer 3: Tenant config API fallback (custom domain: 200=tenant | 4040=unknown)
+     * Layer 2: Match platformDomains after platform config loads successfully.
+     * Layer 3: Confirm tenant registration with tenant config.
      *
      * Idempotent: no repeat after detection. Network errors don't mark complete to allow retry.
      * 幂等：检测完成后不再重复。
@@ -533,7 +535,7 @@ export const usePublicConfigStore = defineStore('publicConfig', {
         ''
       )
         .split(',')
-        .map(normalizeDomainHostname)
+        .map((domain: string) => normalizeDomainHostname(domain))
         .filter(Boolean);
 
       if (hostname && envDomains.includes(hostname)) {
@@ -545,11 +547,12 @@ export const usePublicConfigStore = defineStore('publicConfig', {
       const platformConfig = await this.loadPlatformConfig({
         applyBrand: false,
       });
+      if (!platformConfig) return;
+
       if (
-        platformConfig &&
         hostname &&
         platformConfig.platformDomains
-          .map(normalizeDomainHostname)
+          .map((domain) => normalizeDomainHostname(domain))
           .includes(hostname)
       ) {
         this.isDomainTenantDomain = false;
@@ -566,7 +569,7 @@ export const usePublicConfigStore = defineStore('publicConfig', {
         if (!this.tenantConfig) {
           this.tenantConfig = {
             ...tenantConfig,
-            brand: mergeBrandConfig(platformConfig?.brand, tenantConfig.brand),
+            brand: mergeBrandConfig(platformConfig.brand, tenantConfig.brand),
           };
           this.tenantConfigLoaded = true;
           applyBrandConfig(this.tenantConfig.brand);
@@ -575,9 +578,7 @@ export const usePublicConfigStore = defineStore('publicConfig', {
         this.error = null;
       } catch (error: unknown) {
         this.isDomainTenantDomain = null;
-        this.isDomainDetected = Boolean(
-          platformConfig && isUnknownTenantDomainError(error),
-        );
+        this.isDomainDetected = isUnknownTenantDomainError(error);
         this.error =
           error instanceof Error ? error.message : 'Failed to detect domain';
       }

@@ -40,6 +40,7 @@ interface NotificationListResponse {
 
 /** Socket.IO pushed notification data / Socket.IO 推送的通知数据 */
 interface NotificationPushData {
+  id?: null | number;
   type: string;
   category: string;
   title: string;
@@ -84,6 +85,10 @@ export const useNotificationStore = defineStore('notification', () => {
   const unreadCount = ref(notifications.value.filter((n) => !n.is_read).length);
   const loading = ref(false);
   const initialized = ref(false);
+  const seenPushIds = new Set<number>();
+  const pendingPushIds = new Set<number>();
+  let sessionGeneration = 0;
+  let listGeneration = 0;
 
   /** Explicit endpoint override (fallback only) / 显式端覆盖（仅作为兜底） */
   let currentEndpoint: 'admin' | 'tenant' | null = null;
@@ -92,12 +97,28 @@ export const useNotificationStore = defineStore('notification', () => {
     const data = raw as NotificationPushData;
     if (!data?.title) return;
 
+    const id =
+      typeof data.id === 'number' &&
+      Number.isSafeInteger(data.id) &&
+      data.id > 0
+        ? data.id
+        : null;
+    if (id !== null) {
+      if (seenPushIds.has(id)) return;
+      seenPushIds.add(id);
+      if (notifications.value.some((item) => item.id === id)) {
+        void loadUnreadCount();
+        return;
+      }
+      pendingPushIds.add(id);
+    }
+
     // Increment unread count / 增加未读计数
     unreadCount.value++;
 
-    // Add to top of list (temp ID, will be updated on refresh) / 添加到列表顶部
+    // Use the inbox ID when the push has a persisted row. / 有站内信时使用其 ID。
     notifications.value.unshift({
-      id: -Date.now(),
+      id: id ?? -Date.now(),
       template_code: data.type,
       category: data.category,
       title: data.title,
@@ -168,11 +189,17 @@ export const useNotificationStore = defineStore('notification', () => {
     if (!apiPrefix) {
       return;
     }
+    const generation = sessionGeneration;
     try {
       const data = await requestClient.get<{ count: number }>(
         `${apiPrefix}/notifications/unread-count`,
       );
-      if (data && typeof data.count === 'number') {
+      if (
+        generation === sessionGeneration &&
+        apiPrefix === getApiPrefix() &&
+        data &&
+        typeof data.count === 'number'
+      ) {
         unreadCount.value = data.count;
       }
     } catch {
@@ -189,6 +216,9 @@ export const useNotificationStore = defineStore('notification', () => {
     if (!apiPrefix) {
       return;
     }
+    const generation = sessionGeneration;
+    if (page === 1) listGeneration++;
+    const list = listGeneration;
     loading.value = true;
     try {
       const params = new URLSearchParams();
@@ -199,19 +229,34 @@ export const useNotificationStore = defineStore('notification', () => {
       const data = await requestClient.get<NotificationListResponse>(
         `${apiPrefix}/notifications?${params.toString()}`,
       );
+      if (
+        generation !== sessionGeneration ||
+        list !== listGeneration ||
+        apiPrefix !== getApiPrefix()
+      )
+        return;
       if (data?.items) {
         if (page === 1) {
-          // Keep local temp notifications (negative ID = real-time pushed, not persisted) / 保留本地临时通知
-          const localOnly = notifications.value.filter((n) => n.id < 0);
-          notifications.value = [...localOnly, ...data.items];
-        } else {
-          notifications.value.push(...data.items);
+          for (const item of data.items) pendingPushIds.delete(item.id);
         }
+        // A list snapshot taken before delivery can omit a just-pushed inbox row.
+        const retained = notifications.value.filter(
+          (item) => page !== 1 || item.id < 0 || pendingPushIds.has(item.id),
+        );
+        const incoming = new Map(data.items.map((item) => [item.id, item]));
+        const merged = retained.map((item) => {
+          const current = incoming.get(item.id) ?? item;
+          incoming.delete(item.id);
+          return current;
+        });
+        notifications.value = [...merged, ...incoming.values()];
       }
     } catch {
       console.error('[Notification] Failed to load notifications');
     } finally {
-      loading.value = false;
+      if (generation === sessionGeneration && list === listGeneration) {
+        loading.value = false;
+      }
     }
   }
 
@@ -305,6 +350,7 @@ export const useNotificationStore = defineStore('notification', () => {
     if (idx !== -1) {
       const removed = notifications.value[idx];
       notifications.value.splice(idx, 1);
+      pendingPushIds.delete(id);
       if (!removed?.is_read && unreadCount.value > 0) {
         unreadCount.value--;
       }
@@ -354,6 +400,9 @@ export const useNotificationStore = defineStore('notification', () => {
     unreadCount.value = 0;
     loading.value = false;
     initialized.value = false;
+    seenPushIds.clear();
+    pendingPushIds.clear();
+    sessionGeneration++;
     localStorage.removeItem(LOCAL_NOTIF_KEY);
     try {
       useNotificationToast().clearAll();

@@ -36,6 +36,12 @@ from app.ai.tools.executors.base import BaseToolExecutor
 from app.ai.tools.types import ExecutionContext, ToolDefinition, ToolResult
 from app.core.config import settings
 from app.core.logging import LogManager
+from app.core.security import (
+    normalize_nonnegative_integer,
+    normalize_positive_subject_id,
+)
+from app.enums.common import UserRoleEnum
+from app.repositories.system.tenant_repository import TenantRepository
 
 logger = LogManager.get_logger("ai.tool.internal_api")
 
@@ -90,6 +96,7 @@ class InternalApiExecutor(BaseToolExecutor):
         arguments: dict[str, Any],
     ) -> bool:
         # JSON Schema validation already runs in ToolSandbox / 沙箱已做 Schema 校验
+        del definition, arguments
         return True
 
     async def execute(
@@ -119,9 +126,7 @@ class InternalApiExecutor(BaseToolExecutor):
             if name == TOOL_LIST_OPERATIONS:
                 return self._list_operations(tool_call_id, arguments, context, scope)
             if name == TOOL_DESCRIBE_OPERATION:
-                return self._describe_operation(
-                    tool_call_id, arguments, context, scope
-                )
+                return self._describe_operation(tool_call_id, arguments, context, scope)
             if name == TOOL_INVOKE_OPERATION:
                 return await self._invoke_operation(
                     tool_call_id, arguments, context, scope
@@ -261,9 +266,7 @@ class InternalApiExecutor(BaseToolExecutor):
             )
         resolved_path = op.path
         for p in placeholders:
-            resolved_path = resolved_path.replace(
-                "{" + p + "}", str(path_params[p])
-            )
+            resolved_path = resolved_path.replace("{" + p + "}", str(path_params[p]))
 
         # Write operations require a server-armed confirmation
         # 写操作需要服务端布防的确认
@@ -411,12 +414,46 @@ class InternalApiExecutor(BaseToolExecutor):
         query_params: dict[str, Any],
         body: dict[str, Any] | None,
     ) -> ToolResult:
+        user_role = str(context.user_role).strip()
+        tenant_id = context.tenant_id
+        tenant_session_epoch = None
+        if user_role in (
+            UserRoleEnum.TENANT_ADMIN.value,
+            UserRoleEnum.TENANT_USER.value,
+        ):
+            tenant_id = normalize_positive_subject_id(tenant_id)
+            if context.db is None or tenant_id is None:
+                return ToolResult.error_result(
+                    tool_call_id,
+                    "Internal API call denied: tenant session context unavailable",
+                    name=TOOL_INVOKE_OPERATION,
+                )
+            try:
+                tenant_session_epoch = normalize_nonnegative_integer(
+                    await TenantRepository(context.db).get_active_session_epoch(
+                        tenant_id
+                    )
+                )
+            except Exception as exc:
+                logger.warning(
+                    "AI proxy token tenant epoch lookup failed: tenant={} error_type={}",
+                    tenant_id,
+                    type(exc).__name__,
+                )
+            if tenant_session_epoch is None:
+                return ToolResult.error_result(
+                    tool_call_id,
+                    "Internal API call denied: tenant session validation failed",
+                    name=TOOL_INVOKE_OPERATION,
+                )
+
         token = issue_ai_proxy_token(
             user_id=int(context.user_id or 0),
-            user_role=str(context.user_role),
-            tenant_id=context.tenant_id,
+            user_role=user_role,
+            tenant_id=tenant_id,
             agent_id=context.agent_id,
             conversation_id=context.conversation_id,
+            tenant_session_epoch=tenant_session_epoch,
         )
         headers = {
             "Authorization": f"Bearer {token}",

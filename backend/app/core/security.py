@@ -57,13 +57,14 @@ def normalize_positive_subject_id(value: object) -> int | None:
 
 
 def tenant_session_epoch_matches(payload: dict[str, Any] | None, epoch: object) -> bool:
-    """无代际声明时仅接受初始版本 / Legacy credentials are valid at epoch zero."""
+    """令牌必须携带当前会话代际 / Require an explicit current tenant epoch."""
     current = normalize_nonnegative_integer(epoch)
     if current is None or payload is None:
         return False
-    if TENANT_SESSION_EPOCH_CLAIM not in payload:
-        return current == 0
-    return normalize_nonnegative_integer(payload[TENANT_SESSION_EPOCH_CLAIM]) == current
+    return (
+        normalize_nonnegative_integer(payload.get(TENANT_SESSION_EPOCH_CLAIM))
+        == current
+    )
 
 
 def create_access_token(
@@ -378,7 +379,8 @@ def create_token_pair(
     Args:
         subject: Token 主体 / Token subject
         scope: Token 作用域（用户类型） / Token scope (user type)
-        extra_claims: 额外的 claims（仅添加到 access_token） / Extra claims (access_token only)
+        extra_claims: 附加访问声明，企业会话代际也写入刷新令牌 /
+            Extra access claims. The tenant session epoch also goes on the refresh token.
 
     Returns:
         包含 access_token、refresh_token、access_jti、refresh_jti 的字典
@@ -387,7 +389,14 @@ def create_token_pair(
     access_token, access_jti = create_access_token(
         subject, scope=scope, extra_claims=extra_claims
     )
-    refresh_token, refresh_jti = create_refresh_token(subject, scope=scope)
+    refresh_claims = None
+    if extra_claims is not None and TENANT_SESSION_EPOCH_CLAIM in extra_claims:
+        refresh_claims = {
+            TENANT_SESSION_EPOCH_CLAIM: extra_claims[TENANT_SESSION_EPOCH_CLAIM]
+        }
+    refresh_token, refresh_jti = create_refresh_token(
+        subject, scope=scope, extra_claims=refresh_claims
+    )
     return {
         "access_token": access_token,
         "refresh_token": refresh_token,

@@ -236,17 +236,17 @@ async def test_epoch_blocks_old_access_refresh_and_socket_sessions(
     monkeypatch.setattr(ConfigService, "get_platform_config", platform_config)
     scopes = {"tenant": "tenant_admin", "user": "tenant_user"}
     credentials = {}
+    tenant_claims = {"tenant_id": identity_id, TENANT_SESSION_EPOCH_CLAIM: 0}
     for surface, scope in scopes.items():
         credentials[surface] = {
             "access_token": create_access_token(
-                identity_id, scope, extra_claims={"tenant_id": identity_id}
+                identity_id, scope, extra_claims=tenant_claims
             )[0],
             "refresh_token": create_refresh_token(
-                identity_id, scope, extra_claims={"tenant_id": identity_id}
+                identity_id, scope, extra_claims=tenant_claims
             )[0],
         }
-    legacy_user = credentials["user"]["access_token"]
-    payload = await decode_token(legacy_user)
+    payload = await decode_token(credentials["user"]["access_token"])
     session = {
         "user_type": "tenant_user",
         "user_id": identity_id,
@@ -263,6 +263,23 @@ async def test_epoch_blocks_old_access_refresh_and_socket_sessions(
         base_url="http://epoch-api.fixture.invalid",
     ) as client:
         for surface, pair in credentials.items():
+            scope = scopes[surface]
+            legacy_access = create_access_token(
+                identity_id, scope, extra_claims={"tenant_id": identity_id}
+            )[0]
+            legacy_refresh = create_refresh_token(
+                identity_id, scope, extra_claims={"tenant_id": identity_id}
+            )[0]
+            missing_epoch = await client.get(
+                f"/probe/{surface}",
+                headers={"Authorization": f"Bearer {legacy_access}"},
+            )
+            assert missing_epoch.status_code == 401
+            legacy_refresh_denied = await client.post(
+                f"/api/{surface}/auth/refresh",
+                json={"refresh_token": legacy_refresh},
+            )
+            assert legacy_refresh_denied.status_code == 401
             response = await client.get(
                 f"/probe/{surface}",
                 headers={"Authorization": f"Bearer {pair['access_token']}"},
@@ -275,8 +292,10 @@ async def test_epoch_blocks_old_access_refresh_and_socket_sessions(
                 json={"refresh_token": pair["refresh_token"]},
             )
             assert refreshed.status_code == 200
-            claims = await decode_token(refreshed.json()["data"]["access_token"])
-            assert claims[TENANT_SESSION_EPOCH_CLAIM] == 0
+            rotated = refreshed.json()["data"]
+            for token_type in ("access_token", "refresh_token"):
+                claims = await decode_token(rotated[token_type])
+                assert claims[TENANT_SESSION_EPOCH_CLAIM] == 0
 
         async with factory() as db:
             stopped = await TenantService(db).toggle_status(identity_id, False)
@@ -326,6 +345,13 @@ async def test_epoch_blocks_old_access_refresh_and_socket_sessions(
                 f"/probe/{surface}", headers={"Authorization": f"Bearer {access}"}
             )
             assert current.status_code == 200 and current.json()["id"] == identity_id
+            refreshed = await client.post(
+                f"/api/{surface}/auth/refresh",
+                json={"refresh_token": pair["refresh_token"]},
+            )
+            assert refreshed.status_code == 200
+            claims = await decode_token(refreshed.json()["data"]["refresh_token"])
+            assert claims[TENANT_SESSION_EPOCH_CLAIM] == 2
 
 
 async def assert_current_socket(session, *, expected):
@@ -366,9 +392,16 @@ async def test_socket_admission_matches_tenant_and_epoch(
     legacy_token = create_access_token(
         identity_id, scope, extra_claims={"tenant_id": identity_id}
     )[0]
+    initial_token = create_access_token(
+        identity_id,
+        scope,
+        extra_claims={"tenant_id": identity_id, TENANT_SESSION_EPOCH_CLAIM: 0},
+    )[0]
 
     with pytest.raises(SocketRefused):
-        await namespace.on_connect("cross-host", denied, {"token": legacy_token})
+        await namespace.on_connect("cross-host", denied, {"token": initial_token})
+    with pytest.raises(SocketRefused):
+        await namespace.on_connect("legacy", allowed, {"token": legacy_token})
     namespace.enter_room.assert_not_awaited()
     delegate.on_connect.assert_not_awaited()
     assert await redis.scard(epoch_socket_key) == 0
@@ -377,7 +410,7 @@ async def test_socket_admission_matches_tenant_and_epoch(
         tenant = await db.get(Tenant, identity_id)
         tenant.session_revocation_epoch = 2
     with pytest.raises(SocketRefused):
-        await namespace.on_connect("stale", allowed, {"token": legacy_token})
+        await namespace.on_connect("stale", allowed, {"token": initial_token})
     namespace.enter_room.assert_not_awaited()
     delegate.on_connect.assert_not_awaited()
     assert await redis.scard(epoch_socket_key) == 0

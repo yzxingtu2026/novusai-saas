@@ -12,3 +12,8 @@ description: Issue、PR、GitHub CLI
 - 使用 `gh` 处理远端：`gh issue view`、`gh issue create`、`gh pr create`、`gh pr checks`、`gh pr view`。
 - 长正文用临时 markdown 文件和 `--body-file`，避免 shell 转义破坏内容。
 - 不编造 Issue/PR 编号；不把认证信息写入仓库。
+
+## 自动编码
+
+自动编码以仓库的 Actions 变量 `OPENAI_API_BASE` 和 `OPENAI_MODEL` 选择模型，
+使用 Actions 密钥 `OPENAI_API_KEY` 鉴权。该网关需要支持 Codex 的 Responses 流式协议和工具调用。

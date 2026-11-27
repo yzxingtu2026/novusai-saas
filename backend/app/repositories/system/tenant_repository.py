@@ -20,6 +20,17 @@ class TenantRepository(BaseRepository[Tenant]):
 
     model = Tenant
 
+    async def get_active_session_epoch(self, tenant_id: int) -> int | None:
+        """读取有效租户的当前会话代际 / Read the active tenant's session epoch."""
+        result = await self.db.execute(
+            select(Tenant.session_revocation_epoch).where(
+                Tenant.id == tenant_id,
+                Tenant.is_active.is_(True),
+                Tenant.is_deleted.is_(False),
+            )
+        )
+        return result.scalar_one_or_none()
+
     async def get_for_lifecycle_update(
         self, tenant_id: int, *, include_deleted: bool = False
     ) -> Tenant | None:

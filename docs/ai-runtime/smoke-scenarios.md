@@ -60,3 +60,13 @@ satisfy `ai_real_dialogue_smoke_execution` and cannot make production acceptance
     capabilities
   - runtime diagnostics do not expose retired current-page or online-search
     capability as a live tool unless explicitly supported by the manifest
+
+## 2026-11-28 共享能力验收
+
+本地隔离环境通过三个必验对话、三个工具场景、一项原生 WAV 音频和两项检索后台任务。三个对话均使用真实通义千问模型，经 Chat Completions 协议完成并生成成功调用记录。PostgreSQL 和 Redis 为本次专用。
+
+- 验收前后运行时文件指纹均为 `deb6054ed8548ae604ae047ae9debdc9b4c36e2fc62daac568d54d19cd33ddd3`。
+- 验收回执 SHA-256 为 `15d5624467dc900d86b904effc898fc9c2ca442eb91ab3775ec765f3d1b5ce97`。
+- 执行所用场景清单 SHA-256 为 `cd51f7fe0d7edbbd204de5af19215b8961cb9a70f834c6469f02de50ab001c15`。
+
+另通过 126 项模型接口专项测试，使用真实客户端处理合成的错误响应。错误响应测试覆盖实际状态、错误分类、部分输出及终止事件。

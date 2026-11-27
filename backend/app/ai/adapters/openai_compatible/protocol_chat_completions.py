@@ -5,14 +5,19 @@ from __future__ import annotations
 from collections.abc import AsyncIterator, Awaitable, Callable
 from typing import Any, Protocol
 
+from openai import APIError
+
 from app.ai.adapters.openai_compatible.support.client_options import (
     with_client_retry_override,
 )
 from app.ai.adapters.openai_compatible.support.protocol_chat_completions_helpers import (
+    build_chat_completion_error,
     convert_chat_chunk,
     convert_chat_response,
 )
+from app.ai.exceptions import ProviderError
 from app.ai.types import ChatChunk, ChatMessage, ChatResponse
+from app.core.i18n import _
 from app.core.logging import LogManager
 
 logger = LogManager.get_logger("ai")
@@ -67,17 +72,30 @@ async def execute_chat_via_chat_completions(
         adapter.client,
         max_retries=client_max_retries,
     )
-    response = await client.chat.completions.create(**request_params)
+    raw_response = await client.chat.completions.with_raw_response.create(
+        **request_params
+    )
+    response = raw_response.parse()
 
     if isinstance(response, str):
         logger.error(
-            "Chat response returned invalid string payload: model={} preview={}",
+            "Chat response returned invalid string payload: model={} status_code={}",
             model,
-            response[:200],
+            raw_response.status_code,
         )
-        raise ValueError(f"Upstream returned invalid string response: {response[:100]}")
+        raise ProviderError(
+            _("ai.request_failed"),
+            provider_code="openai",
+            model_code=model,
+            upstream_status_code=raw_response.status_code,
+        )
 
-    return convert_chat_response(adapter=adapter, response=response, model=model)
+    return convert_chat_response(
+        adapter=adapter,
+        response=response,
+        model=model,
+        upstream_status_code=raw_response.status_code,
+    )
 
 
 async def execute_stream_chat_via_chat_completions(
@@ -104,35 +122,13 @@ async def execute_stream_chat_via_chat_completions(
         max_retries=client_max_retries,
     )
     stream = await client.chat.completions.create(**request_params)
-    stream_closed = False
     stream_iter = aiter(stream)
     stream_timeout_seconds = normalize_timeout(request_params.get("timeout"))
+    upstream_status_code = getattr(
+        getattr(stream, "response", None), "status_code", 200
+    )
 
     try:
-        try:
-            first_chunk = await adapter._next_stream_event_with_timeout(
-                stream_iter,
-                timeout_seconds=stream_timeout_seconds,
-                model=effective_model,
-                wire_api="chat_completions",
-            )
-        except StopAsyncIteration:
-            return
-
-        first_chat_chunk = convert_chat_chunk(
-            adapter=adapter,
-            chunk=first_chunk,
-            model=model,
-        )
-        yield first_chat_chunk
-        if first_chat_chunk.finish_reason is not None:
-            logger.info(
-                "Stream finish_reason on first chunk, closing upstream: model={} finish_reason={} wire_api=chat_completions",
-                model,
-                first_chat_chunk.finish_reason,
-            )
-            return
-
         while True:
             try:
                 chunk = await adapter._next_stream_event_with_timeout(
@@ -142,12 +138,13 @@ async def execute_stream_chat_via_chat_completions(
                     wire_api="chat_completions",
                 )
             except StopAsyncIteration:
-                break
+                return
 
             chat_chunk = convert_chat_chunk(
                 adapter=adapter,
                 chunk=chunk,
                 model=model,
+                upstream_status_code=upstream_status_code,
             )
             yield chat_chunk
             if chat_chunk.finish_reason is not None:
@@ -156,7 +153,16 @@ async def execute_stream_chat_via_chat_completions(
                     model,
                     chat_chunk.finish_reason,
                 )
-                break
+                return
+    except APIError as exc:
+        # The SDK raises APIError with the raw body for an SSE error envelope.
+        if type(exc) is not APIError or exc.body is None:
+            raise
+        error = build_chat_completion_error(
+            exc.body, model=model, upstream_status_code=upstream_status_code
+        )
     finally:
-        if not stream_closed:
-            await aclose_stream(stream)
+        await aclose_stream(stream)
+
+    # Raise outside the SDK exception handler so the provider body cannot leak via chaining.
+    raise error
