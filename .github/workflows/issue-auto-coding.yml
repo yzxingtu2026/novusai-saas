@@ -1,0 +1,646 @@
+name: Issue auto coding
+
+on:
+  issues:
+    types: [assigned, labeled]
+  issue_comment:
+    types: [created]
+  # ci-fix 模式暂处于休眠状态：本仓库目前没有 PR CI workflow。
+  # 将来新增 CI workflow 后，在此恢复 workflow_run 触发器并对齐其 name，例如：
+  # workflow_run:
+  #   workflows: [<CI workflow 的 name>]
+  #   types: [completed]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: auto-coding-${{ github.event.issue.number || github.event.workflow_run.head_branch || github.run_id }}
+  cancel-in-progress: false
+
+jobs:
+  implement:
+    # labeled fires for every label. Only auto-coding may start the initial entry;
+    # reasoning:* and any other label must not launch a Codex run. unlabeled is not a trigger.
+    if: github.event_name != 'issues' || github.event.action != 'labeled' || github.event.label.name == 'auto-coding'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ secrets.AUTO_CODING_GITHUB_TOKEN }}
+      TARGET_NUMBER: ${{ github.event.issue.number }}
+      REPOSITORY: ${{ github.repository }}
+      EVENT_NAME: ${{ github.event_name }}
+      EVENT_ACTION: ${{ github.event.action }}
+      EVENT_LABEL: ${{ github.event.label.name }}
+      AUTO_CODING_ASSIGNEE: ${{ vars.AUTO_CODING_ASSIGNEE }}
+      # 复用仓库已有的 AI 网关 secrets，内部仍沿用 OPENAI_* 环境变量名
+      OPENAI_API_BASE: ${{ secrets.AI_API_BASE }}
+      OPENAI_API_KEY: ${{ secrets.AI_API_KEY }}
+      OPENAI_MODEL: ${{ secrets.AI_MODEL }}
+      OPENAI_REASONING_EFFORT: ${{ vars.OPENAI_REASONING_EFFORT }}
+      CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
+      CI_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
+      CI_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+    steps:
+      - name: Recheck eligibility and existing PR
+        id: eligibility
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?Configure AUTO_CODING_GITHUB_TOKEN}"
+          : "${AUTO_CODING_ASSIGNEE:?Configure AUTO_CODING_ASSIGNEE}"
+          checkout_ref=$(jq -er '.repository.default_branch' "$GITHUB_EVENT_PATH")
+          mode=initial
+          work_issue=
+          branch=
+          comment_id=
+          pr_number=
+          target_type=Issue
+
+          if [[ "$EVENT_NAME" == issue_comment ]]; then
+            mode=comment
+            # The comment body is never interpolated into a shell command or the Codex prompt.
+            if ! jq -e --arg login "$AUTO_CODING_ASSIGNEE" '
+              .comment.body | test("(^|[^[:alnum:]_-])@" + $login + "([^[:alnum:]_-]|$)"; "i")
+            ' "$GITHUB_EVENT_PATH" >/dev/null; then
+              echo 'Agent was not mentioned; skipping.'
+              exit 0
+            fi
+            author=$(jq -er '.comment.user.login' "$GITHUB_EVENT_PATH")
+            if [[ "${author,,}" == "${AUTO_CODING_ASSIGNEE,,}" ]]; then
+              echo 'Ignoring agent self-comment.'
+              exit 0
+            fi
+            # Only repository writers may start a credentialed Codex run.
+            if ! author_permission=$(gh api "repos/$REPOSITORY/collaborators/$author/permission" --jq '.permission' 2>/dev/null); then
+              echo 'Comment author has no verifiable repository write permission; skipping.'
+              exit 0
+            fi
+            if [[ "$author_permission" != write && "$author_permission" != admin ]]; then
+              echo 'Comment author is not a repository writer; skipping.'
+              exit 0
+            fi
+            comment_id=$(jq -er '.comment.id' "$GITHUB_EVENT_PATH")
+            if [[ $(jq -r '.issue.pull_request != null' "$GITHUB_EVENT_PATH") == true ]]; then
+              target_type=PR
+            fi
+          elif [[ "$EVENT_NAME" == workflow_run ]]; then
+            # 休眠逻辑：workflow_run 触发器已移除，新增 PR CI workflow 后恢复
+            mode=ci-fix
+            if [[ "${CI_CONCLUSION:-}" != failure ]]; then
+              echo 'CI run did not fail; skipping.'
+              exit 0
+            fi
+            branch=$CI_HEAD_BRANCH
+            if [[ ! "$branch" =~ ^feat/issue-([0-9]+)-auto-coding$ ]]; then
+              echo 'Failed CI is not on an auto-coding branch; skipping.'
+              exit 0
+            fi
+            work_issue=${BASH_REMATCH[1]}
+            checkout_ref=$branch
+            pr_number=$(gh api --paginate "repos/$REPOSITORY/pulls?state=open&head=${REPOSITORY%%/*}:$branch&per_page=100" --jq '.[0].number')
+            if [[ -z "$pr_number" ]]; then
+              echo 'No open PR for the failed auto-coding branch; skipping.'
+              exit 0
+            fi
+            pr=$(gh api "repos/$REPOSITORY/pulls/$pr_number")
+            if ! jq -e --arg repo "$REPOSITORY" --arg login "$AUTO_CODING_ASSIGNEE" '
+              .state == "open" and .head.repo.full_name == $repo and .base.repo.full_name == $repo
+              and (.user.login | ascii_downcase) == ($login | ascii_downcase)
+            ' <<<"$pr" >/dev/null; then
+              echo 'PR is not an open same-repository agent PR; skipping.'
+              exit 0
+            fi
+            if [[ $(jq -er '.head.sha' <<<"$pr") != "$CI_HEAD_SHA" ]]; then
+              echo 'PR head already moved past the failed commit; skipping stale trigger.'
+              exit 0
+            fi
+          else
+            if [[ "$EVENT_NAME" == "issues" && "${EVENT_ACTION:-}" == "labeled" && "${EVENT_LABEL:-}" != "auto-coding" ]]; then
+              echo 'Initial entry only starts for the auto-coding label; skipping.'
+              exit 0
+            fi
+            work_issue=$TARGET_NUMBER
+            branch="feat/issue-${work_issue}-auto-coding"
+            issue=$(gh api "repos/$REPOSITORY/issues/$work_issue")
+            if ! jq -e --arg login "$AUTO_CODING_ASSIGNEE" '
+              .state == "open" and any(.assignees[]; .login | ascii_downcase == ($login | ascii_downcase))
+              and any(.labels[]; .name == "auto-coding")' <<<"$issue" >/dev/null; then
+              echo 'Issue is not eligible; skipping.'
+              exit 0
+            fi
+            prs=$(gh api --paginate "repos/$REPOSITORY/pulls?state=all&head=${REPOSITORY%%/*}:$branch&per_page=100" --jq '.[].number')
+            if [[ -n "$prs" ]]; then
+              echo "A PR already exists for $branch; skipping. PR number(s): $prs"
+              exit 0
+            fi
+          fi
+          {
+            echo "branch=$branch"
+            echo "checkout_ref=$checkout_ref"
+            echo "issue_number=$work_issue"
+            echo "comment_id=$comment_id"
+            echo "pr_number=$pr_number"
+            echo "target_type=$target_type"
+            echo "mode=$mode"
+            echo 'eligible=true'
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Verify agent repository write access
+        if: steps.eligibility.outputs.eligible == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth status
+          login=$(gh api user --jq '.login')
+          if [[ "${login,,}" != "${AUTO_CODING_ASSIGNEE,,}" ]]; then
+            echo "::error::Agent token belongs to $login, expected $AUTO_CODING_ASSIGNEE."
+            exit 1
+          fi
+          permission=$(gh api "repos/$REPOSITORY/collaborators/$login/permission" --jq '.permission')
+          if [[ "$permission" != write && "$permission" != admin ]]; then
+            echo "::error::Agent $login needs repository write access (current: $permission)."
+            exit 1
+          fi
+          echo "Agent $login has repository role: $permission."
+
+      - uses: actions/checkout@v4
+        if: steps.eligibility.outputs.eligible == 'true'
+        with:
+          path: novusai-saas
+          ref: ${{ steps.eligibility.outputs.checkout_ref }}
+          token: ${{ secrets.AUTO_CODING_GITHUB_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - uses: actions/setup-node@v4
+        if: steps.eligibility.outputs.eligible == 'true'
+        with:
+          node-version: '22'
+
+      - name: Resolve reasoning effort
+        id: reasoning
+        if: steps.eligibility.outputs.eligible == 'true'
+        env:
+          MODE: ${{ steps.eligibility.outputs.mode }}
+          WORK_ISSUE: ${{ steps.eligibility.outputs.issue_number }}
+          PR_NUMBER: ${{ steps.eligibility.outputs.pr_number }}
+          TARGET_TYPE: ${{ steps.eligibility.outputs.target_type }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import os
+          import pathlib
+          import re
+          import subprocess
+
+          EFFORTS = ("minimal", "low", "medium", "high", "xhigh")
+          RANK = {name: index for index, name in enumerate(EFFORTS)}
+          DEFAULT_EFFORT = "high"
+          SOURCE_RE = re.compile(r"^(?:variable|default|label:(?:issue|pr)#[1-9][0-9]*)$")
+          TOKEN_RE = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+          KEYWORD_NUMBER_RE = re.compile(
+              r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|refs?)\s+#(\d+)"
+          )
+
+
+          def canonical(raw):
+              if not isinstance(raw, str):
+                  raw = "" if raw is None else str(raw)
+              value = raw.strip().lower()
+              if value in RANK:
+                  return value
+              return None
+
+
+          def display_token(raw):
+              text = "" if raw is None else str(raw).strip()
+              if TOKEN_RE.fullmatch(text):
+                  return text
+              return f"redacted(len={len(text)})"
+
+
+          def warn(message):
+              text = " ".join(str(message).split())
+              print(f"::warning::{text}", flush=True)
+
+
+          def select_from_labels(kind, number, labels):
+              warnings = []
+              matched = []
+              reasoning_count = 0
+              for name in labels or []:
+                  if not isinstance(name, str):
+                      continue
+                  if not name.lower().startswith("reasoning:"):
+                      continue
+                  reasoning_count += 1
+                  suffix = name.split(":", 1)[1]
+                  chosen = canonical(suffix)
+                  owner = f"{kind} #{number}"
+                  if chosen is None:
+                      warnings.append(
+                          f"Ignoring non-whitelisted reasoning label {display_token(name)} on {owner}"
+                      )
+                      continue
+                  matched.append(chosen)
+              if reasoning_count > 1:
+                  if matched:
+                      best = max(matched, key=lambda item: RANK[item])
+                      warnings.append(
+                          f"Multiple reasoning:* labels on {kind} #{number}; using highest {best}"
+                      )
+                  else:
+                      warnings.append(
+                          f"Multiple reasoning:* labels on {kind} #{number}; none are whitelisted"
+                      )
+              if not matched:
+                  return None, warnings
+              return max(matched, key=lambda item: RANK[item]), warnings
+
+
+          def resolve(objects, variable):
+              if not isinstance(objects, list):
+                  raise SystemExit("reasoning objects must be a list")
+              warnings = []
+              for obj in objects:
+                  if not isinstance(obj, dict):
+                      raise SystemExit("reasoning object must be an object")
+                  kind = obj.get("kind")
+                  if kind not in {"issue", "pr"}:
+                      raise SystemExit("unexpected reasoning object kind")
+                  number = int(obj.get("number"))
+                  if number <= 0:
+                      raise SystemExit("unexpected reasoning object number")
+                  effort, obj_warnings = select_from_labels(kind, number, obj.get("labels") or [])
+                  warnings.extend(obj_warnings)
+                  if effort:
+                      return {
+                          "effort": effort,
+                          "source": f"label:{kind}#{number}",
+                          "warnings": warnings,
+                      }
+              raw_variable = "" if variable is None else str(variable)
+              if raw_variable.strip():
+                  chosen = canonical(raw_variable)
+                  if chosen is None:
+                      warnings.append(
+                          f"Ignoring non-whitelisted OPENAI_REASONING_EFFORT={display_token(raw_variable)}"
+                      )
+                  else:
+                      return {"effort": chosen, "source": "variable", "warnings": warnings}
+              return {"effort": DEFAULT_EFFORT, "source": "default", "warnings": warnings}
+
+
+          def repository_parts():
+              repo = os.environ.get("REPOSITORY", "")
+              owner, sep, name = repo.partition("/")
+              if not sep or not owner or not name or "/" in name:
+                  raise SystemExit("REPOSITORY must be owner/name")
+              if not re.fullmatch(r"[A-Za-z0-9_.-]+", owner) or not re.fullmatch(r"[A-Za-z0-9_.-]+", name):
+                  raise SystemExit("REPOSITORY contains unexpected characters")
+              return repo, owner, name
+
+
+          def require_number(name, value):
+              text = "" if value is None else str(value).strip()
+              if not re.fullmatch(r"[1-9][0-9]*", text):
+                  raise SystemExit(f"{name} is not a positive integer")
+              return int(text)
+
+
+          def gh_api(path, required):
+              result = subprocess.run(
+                  ["gh", "api", path],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if result.returncode != 0:
+                  if required:
+                      raise SystemExit(f"gh api failed for {path}")
+                  return None
+              return json.loads(result.stdout)
+
+
+          def labels_from(payload):
+              names = []
+              for label in payload.get("labels") or []:
+                  if isinstance(label, dict) and isinstance(label.get("name"), str):
+                      names.append(label["name"])
+              return names
+
+
+          def load_issue(number, required):
+              payload = gh_api(f"repos/{os.environ['REPOSITORY']}/issues/{number}", required)
+              if payload is None:
+                  warn(f"Could not read issue #{number}; skipping that candidate")
+                  return None
+              if payload.get("pull_request"):
+                  if required:
+                      raise SystemExit(f"#{number} is not an issue")
+                  return None
+              return {
+                  "kind": "issue",
+                  "number": int(payload["number"]),
+                  "labels": labels_from(payload),
+              }
+
+
+          def load_pr(number):
+              payload = gh_api(f"repos/{os.environ['REPOSITORY']}/issues/{number}", True)
+              if not payload.get("pull_request"):
+                  raise SystemExit(f"#{number} is not a pull request")
+              return {"kind": "pr", "number": int(payload["number"]), "labels": labels_from(payload)}
+
+
+          def graphql_pr(owner, name, pr_number):
+              query = (
+                  "query($owner:String!, $name:String!, $number:Int!) {"
+                  " repository(owner:$owner, name:$name) {"
+                  " pullRequest(number:$number) {"
+                  " body headRefName"
+                  " closingIssuesReferences(first:20) { nodes { number } }"
+                  " } } }"
+              )
+              result = subprocess.run(
+                  [
+                      "gh", "api", "graphql",
+                      "-f", f"query={query}",
+                      "-f", f"owner={owner}",
+                      "-f", f"name={name}",
+                      "-F", f"number={pr_number}",
+                  ],
+                  check=False,
+                  capture_output=True,
+                  text=True,
+              )
+              if result.returncode != 0:
+                  return None
+              payload = json.loads(result.stdout)
+              if payload.get("errors"):
+                  return None
+              return ((payload.get("data") or {}).get("repository") or {}).get("pullRequest")
+
+
+          def pr_metadata(pr_number):
+              repo, owner, name = repository_parts()
+              pr = graphql_pr(owner, name, pr_number)
+              if isinstance(pr, dict):
+                  closing = []
+                  nodes = (pr.get("closingIssuesReferences") or {}).get("nodes") or []
+                  for node in nodes:
+                      if isinstance(node, dict) and isinstance(node.get("number"), int):
+                          closing.append(node["number"])
+                  return pr.get("body") or "", pr.get("headRefName") or "", closing
+              warn("Could not read PR closing issue references; continuing with body and branch")
+              payload = gh_api(f"repos/{repo}/pulls/{pr_number}", True)
+              head = (payload.get("head") or {}).get("ref") or ""
+              return payload.get("body") or "", head, []
+
+
+          def associated_issue_numbers(repo, pr_number, body, head, closing_numbers):
+              numbers = []
+              seen = set()
+
+              def add(num):
+                  try:
+                      value = int(num)
+                  except (TypeError, ValueError):
+                      return
+                  if value <= 0 or value == pr_number or value in seen or len(numbers) >= 10:
+                      return
+                  seen.add(value)
+                  numbers.append(value)
+
+              for num in closing_numbers or []:
+                  add(num)
+              text = body or ""
+              keyword_url = re.compile(
+                  r"(?i)\b(?:fix(?:es|ed)?|close[sd]?|resolve[sd]?|refs?)\s+https://github\.com/"
+                  + re.escape(repo)
+                  + r"/issues/(\d+)"
+              )
+              issue_url = re.compile(r"https://github\.com/" + re.escape(repo) + r"/issues/(\d+)")
+              for match in KEYWORD_NUMBER_RE.finditer(text):
+                  add(match.group(1))
+              for match in keyword_url.finditer(text):
+                  add(match.group(1))
+              for match in issue_url.finditer(text):
+                  add(match.group(1))
+              branch_match = re.fullmatch(r"feat/issue-(\d+)-auto-coding", head or "")
+              if branch_match:
+                  add(branch_match.group(1))
+              return numbers
+
+
+          def build_objects():
+              mode = os.environ.get("MODE", "")
+              target_type = os.environ.get("TARGET_TYPE", "")
+              if mode == "ci-fix":
+                  pr_number = require_number("PR_NUMBER", os.environ.get("PR_NUMBER"))
+                  work_issue = require_number("WORK_ISSUE", os.environ.get("WORK_ISSUE"))
+                  issue = load_issue(work_issue, True)
+                  if issue is None:
+                      raise SystemExit(f"Issue #{work_issue} was not found")
+                  return [load_pr(pr_number), issue]
+              if mode == "comment" and target_type == "PR":
+                  pr_number = require_number("TARGET_NUMBER", os.environ.get("TARGET_NUMBER"))
+                  objects = [load_pr(pr_number)]
+                  body, head, closing = pr_metadata(pr_number)
+                  repo, _, _ = repository_parts()
+                  for number in associated_issue_numbers(repo, pr_number, body, head, closing):
+                      issue = load_issue(number, False)
+                      if issue is not None:
+                          objects.append(issue)
+                  return objects
+              if mode == "comment":
+                  number = require_number("TARGET_NUMBER", os.environ.get("TARGET_NUMBER"))
+              elif mode == "initial":
+                  number = require_number("WORK_ISSUE", os.environ.get("WORK_ISSUE"))
+              else:
+                  raise SystemExit("unexpected auto-coding mode")
+              issue = load_issue(number, True)
+              if issue is None:
+                  raise SystemExit(f"Issue #{number} was not found")
+              return [issue]
+
+
+          def write_output(effort, source):
+              if effort not in RANK:
+                  raise SystemExit("refusing to publish non-whitelisted effort")
+              if not SOURCE_RE.fullmatch(source):
+                  raise SystemExit("refusing to publish unexpected reasoning source")
+              output_path = os.environ.get("GITHUB_OUTPUT", "")
+              if not output_path:
+                  raise SystemExit("GITHUB_OUTPUT is not set")
+              with open(output_path, "a", encoding="utf-8") as handle:
+                  handle.write(f"effort={effort}\n")
+                  handle.write(f"source={source}\n")
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY", "")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as handle:
+                      handle.write("## Auto-coding reasoning effort\n\n")
+                      handle.write(f"- effort: `{effort}`\n")
+                      handle.write(f"- source: `{source}`\n")
+              print(f"Reasoning effort: {effort} (source: {source})", flush=True)
+
+
+          def main():
+              fixture = os.environ.get("REASONING_FIXTURE", "").strip()
+              if fixture:
+                  data = json.loads(pathlib.Path(fixture).read_text(encoding="utf-8"))
+                  result = resolve(data["objects"], data.get("variable", ""))
+              else:
+                  result = resolve(build_objects(), os.environ.get("OPENAI_REASONING_EFFORT", ""))
+              for message in result["warnings"]:
+                  warn(message)
+              write_output(result["effort"], result["source"])
+
+
+          if __name__ == "__main__":
+              main()
+          PY
+
+      - name: Install and configure Codex
+        if: steps.eligibility.outputs.eligible == 'true'
+        env:
+          REASONING_EFFORT: ${{ steps.reasoning.outputs.effort }}
+          REASONING_SOURCE: ${{ steps.reasoning.outputs.source }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          : "${OPENAI_API_BASE:?Configure secret AI_API_BASE}"
+          : "${OPENAI_API_KEY:?Configure secret AI_API_KEY}"
+          : "${OPENAI_MODEL:?Configure secret AI_MODEL}"
+          if [[ ! "$REASONING_EFFORT" =~ ^(minimal|low|medium|high|xhigh)$ ]]; then
+            echo '::error::refusing reasoning effort outside the whitelist'
+            exit 1
+          fi
+          if [[ ! "$REASONING_SOURCE" =~ ^(variable|default|label:(issue|pr)#[1-9][0-9]*)$ ]]; then
+            echo '::error::refusing unexpected reasoning source'
+            exit 1
+          fi
+          npm install --global @openai/codex@latest
+          codex_version=$(codex --version 2>&1 | head -n 1 | tr -cd '[:alnum:][:space:].+()_-' | cut -c 1-80)
+          echo "Codex version: $codex_version"
+          git --version
+          gh --version
+          gh auth setup-git
+          CODEX_BIN=$(command -v codex)
+          export CODEX_BIN
+          python3 - <<'PY'
+          import os, pathlib, subprocess
+          needle = b"model_reasoning_effort"
+          roots = []
+          npm = subprocess.run(["npm", "root", "-g"], check=True, capture_output=True, text=True)
+          npm_root = pathlib.Path(npm.stdout.strip()) / "@openai"
+          if npm_root.exists():
+              roots.append(npm_root)
+          codex_bin = os.environ.get("CODEX_BIN", "")
+          if codex_bin:
+              roots.append(pathlib.Path(codex_bin).resolve().parent)
+          found = None
+          for root in roots:
+              if not root.exists():
+                  continue
+              for path in root.rglob("*"):
+                  if not path.is_file() or path.name not in {"codex", "codex.exe"}:
+                      continue
+                  try:
+                      size = path.stat().st_size
+                  except OSError:
+                      continue
+                  if size < 1000000:
+                      continue
+                  with path.open("rb") as handle:
+                      prev = b""
+                      while True:
+                          chunk = handle.read(1024 * 1024)
+                          if not chunk:
+                              break
+                          blob = prev + chunk
+                          if needle in blob:
+                              found = path
+                              break
+                          prev = blob[-len(needle):]
+                  if found is not None:
+                      break
+              if found is not None:
+                  break
+          if found is None:
+              raise SystemExit("Installed Codex does not contain model_reasoning_effort; refusing to continue")
+          print("Codex binary contains model_reasoning_effort")
+          PY
+          export CODEX_HOME="$RUNNER_TEMP/codex-home"
+          mkdir -p "$CODEX_HOME"
+          chmod 700 "$CODEX_HOME"
+          python3 - <<'PY'
+          import json, os, pathlib, urllib.parse
+          allowed = {"minimal", "low", "medium", "high", "xhigh"}
+          effort = os.environ["REASONING_EFFORT"]
+          if effort not in allowed:
+              raise SystemExit("refusing to write reasoning effort outside the whitelist")
+          base = os.environ["OPENAI_API_BASE"]
+          parsed = urllib.parse.urlsplit(base)
+          if parsed.scheme != "https" or not parsed.hostname or parsed.username or parsed.password or parsed.query or parsed.fragment:
+              raise SystemExit("OPENAI_API_BASE must be an HTTPS URL without credentials, query or fragment")
+          config = (
+              'model_provider = "team_gateway"\n'
+              "model = " + json.dumps(os.environ["OPENAI_MODEL"]) + "\n"
+              "model_reasoning_effort = " + json.dumps(effort) + "\n"
+              "[model_providers.team_gateway]\n"
+              'name = "Team gateway"\n'
+              "base_url = " + json.dumps(base) + "\n"
+              'env_key = "OPENAI_API_KEY"\n'
+              'wire_api = "responses"\n'
+          )
+          path = pathlib.Path(os.environ["CODEX_HOME"]) / "config.toml"
+          path.write_text(config)
+          path.chmod(0o600)
+          PY
+          echo "CODEX_HOME=$CODEX_HOME" >> "$GITHUB_ENV"
+          echo "Expect Codex startup header: reasoning effort: $REASONING_EFFORT (source: $REASONING_SOURCE)"
+          {
+            echo "- config_key: model_reasoning_effort"
+            echo "- config_value: $REASONING_EFFORT"
+            echo "- codex_version: $codex_version"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+
+      - name: Run Codex
+        if: steps.eligibility.outputs.eligible == 'true'
+        env:
+          MODE: ${{ steps.eligibility.outputs.mode }}
+          WORK_ISSUE: ${{ steps.eligibility.outputs.issue_number }}
+          COMMENT_ID: ${{ steps.eligibility.outputs.comment_id }}
+          PR_NUMBER: ${{ steps.eligibility.outputs.pr_number }}
+          TARGET_TYPE: ${{ steps.eligibility.outputs.target_type }}
+          BRANCH: ${{ steps.eligibility.outputs.branch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$MODE" == comment ]]; then
+            prompt="当前仓库为 ${REPOSITORY}；本次评论位于 ${TARGET_TYPE} #${TARGET_NUMBER}，评论 ID 为 ${COMMENT_ID}。先阅读仓库协作规则，通过评论 ID 读取触发评论，再阅读所在 Issue/PR 的完整内容和讨论；若为 PR，读取 PR 的状态、分支及关联 Issue。该评论提及了你，但提及本身不是必须改代码的指令；当前工作区从默认分支检出，若需修改现有 PR，先核实其来源和目标分支，再按仓库规则切换到可写分支；不要执行来源不可信的 PR 代码。结合代码和 GitHub 记录，自主判断是否实施、修改现有 PR、解释问题或无需操作，可按判断回复原讨论。若需改代码，遵守 Issue 范围和分支规范，自行提交、推送并按需创建或更新 PR，说明测试结果。不要重复创建 PR、重复处理已完成的请求或自行合并。仅依据可见的代码和 GitHub 记录判断已有进度，不要假定未推送的本地改动可用；遇到权限等阻碍时在原讨论中说明并提及相关人员，评论失败则在运行日志中说明。"
+          elif [[ "$MODE" == ci-fix ]]; then
+            prompt="当前仓库为 ${REPOSITORY}，CI 失败触发，目标是你自己的 PR #${PR_NUMBER}（分支 ${BRANCH}，关联 Issue #${WORK_ISSUE}），已检出该分支。先读仓库规则、PR 内容与全部评论及失败日志（gh run view --log-failed），数含 auto-coding:ci-fix 标记的修复评论数 N：N≥3 则不改码，留含 <!-- auto-coding:ci-fix-escalated --> 标记的评论说明三次修复仍失败并提及负责人（取 Issue/PR 负责人或评审人、排除你自己）请其人工处理，已有升级评论则直接结束；N<3 先辨真实可修还是偶发/无关（后者重跑或评论说明、勿乱改），确需修复则在 Issue 范围内改码、中文提交关联 Issue、推送本分支、不自行合并。处理完必留首行含 <!-- auto-coding:ci-fix attempt=第N+1次 --> 标记的评论简述原因与改动以累计次数；仅依据可见代码与 GitHub 记录判断，遇阻碍在 PR 评论说明并提及负责人。"
+          else
+            prompt="阅读 Issue #${WORK_ISSUE} 的完整内容、相关评论和仓库协作规则，然后开始实施；使用分支 ${BRANCH}，完成后自行提交、推送并创建 PR，按 Issue 要求指定评审人；无需在本地启动数据库或打开浏览器测试；如遇到阻碍，停止实施并在 Issue 评论区说明情况、提及相关人员，评论失败则在运行日志中说明。"
+          fi
+          prompt+=" 当前运行环境是临时容器；如果已修改代码，即使后续遇到阻碍，也要先将已完成的改动提交并推送到远端分支，再在 Issue 评论中说明阻碍、验证情况和分支名称；推送失败时明确说明原因，避免把未推送的改动当作已保存。"
+          codex exec --cd "$GITHUB_WORKSPACE/novusai-saas" --dangerously-bypass-approvals-and-sandbox "$prompt"
+
+      - name: Verify PR exists
+        if: steps.eligibility.outputs.eligible == 'true' && steps.eligibility.outputs.mode == 'initial'
+        env:
+          BRANCH: ${{ steps.eligibility.outputs.branch }}
+        run: |
+          set -euo pipefail
+          prs=$(gh api --paginate "repos/$REPOSITORY/pulls?state=all&head=${REPOSITORY%%/*}:$BRANCH&per_page=100" --jq '.[].number')
+          if [[ -z "$prs" ]]; then
+            echo '::error::Codex finished without creating a PR; inspect its output and Issue comments.'
+            exit 1
+          fi
+          echo "PR created: $prs"

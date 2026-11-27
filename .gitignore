@@ -68,7 +68,6 @@ backend/ruff_full_report.txt
 !/.agent/
 !/.agent/rules/
 !/.agent/rules/**
-/AGENTS.md
 
 # The website is developed as a separate repository checked out locally here.
 /website/
