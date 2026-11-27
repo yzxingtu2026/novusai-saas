@@ -24,6 +24,7 @@ import { setupDocumentTitleSync } from './layouts/document-title-sync';
 import { router } from './router';
 import { TokenStorage } from './store/shared/token-storage';
 import { setupAriaHiddenFix, setupConsoleFilter } from './utils/console-filter';
+import { trackSharedSessionRefresh } from './utils/request/instance';
 
 import './styles/vxe-table-modern.css';
 
@@ -94,6 +95,7 @@ async function bootstrap(namespace: string) {
 
   // 配置路由及路由守卫 / router + navigation guards
   app.use(router);
+  app.onUnmount(trackSharedSessionRefresh());
 
   // 配置Motion插件
   const { MotionPlugin } = await import('@vben/plugins/motion');

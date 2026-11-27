@@ -10,11 +10,19 @@ from sqlalchemy.exc import MultipleResultsFound
 
 from app.core.config import settings
 from app.core.i18n import _
-from app.core.security import TOKEN_SCOPE_ADMIN, TOKEN_TYPE_REFRESH
+from app.core.security import (
+    REFRESH_TOKEN_FAMILY_CLAIM,
+    TOKEN_SCOPE_ADMIN,
+    TOKEN_TYPE_REFRESH,
+    create_refresh_token_family_id,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
+)
 from app.enums import ErrorCode
 from app.exceptions import AuthenticationException, BusinessException, NotFoundException
 from app.models import Admin
 from app.services.common.auth_domains.login_security import password_login_query
+from app.services.common.auth_domains.refresh_rotation import rotate_refresh_token
 
 if TYPE_CHECKING:
     from app.services.common.auth_service import AuthService
@@ -40,14 +48,19 @@ class AuthAdminDomain:
             "session_timeout_minutes",
             default=120,
         )
+        family_claims = {
+            REFRESH_TOKEN_FAMILY_CLAIM: create_refresh_token_family_id(),
+        }
         access_token, access_jti = self._service._create_access_token(
             admin.id,
             scope=TOKEN_SCOPE_ADMIN,
             expires_delta=timedelta(minutes=session_timeout),
+            extra_claims=family_claims,
         )
         refresh_token, refresh_jti = self._service._create_refresh_token(
             admin.id,
             scope=TOKEN_SCOPE_ADMIN,
+            extra_claims=family_claims,
         )
 
         await self._service._record_active_tokens(
@@ -250,11 +263,10 @@ class AuthAdminDomain:
         )
 
     async def refresh_token(self, refresh_token: str) -> dict[str, Any]:
-        admin_id, _scope = await self._service._verify_token_with_scope(
-            refresh_token,
-            TOKEN_SCOPE_ADMIN,
-            TOKEN_TYPE_REFRESH,
+        payload = await get_token_payload_with_scope(
+            refresh_token, TOKEN_SCOPE_ADMIN, TOKEN_TYPE_REFRESH
         )
+        admin_id = normalize_positive_subject_id((payload or {}).get("sub"))
         if admin_id is None:
             self._service._log_auth_warning(
                 "admin.token.refresh.failed",
@@ -264,7 +276,7 @@ class AuthAdminDomain:
 
         result = await self._service.db.execute(
             select(Admin).where(
-                Admin.id == int(admin_id),
+                Admin.id == admin_id,
                 Admin.is_deleted.is_(False),
             )
         )
@@ -287,12 +299,12 @@ class AuthAdminDomain:
             )
             raise AuthenticationException(message=_("auth.account_disabled"))
 
-        tokens = self._service._create_token_pair(admin.id, scope=TOKEN_SCOPE_ADMIN)
-        await self._service._record_active_tokens(
-            "admin",
-            str(admin.id),
-            tokens["access_jti"],
-            tokens["refresh_jti"],
+        tokens = await rotate_refresh_token(
+            self._service,
+            payload,
+            subject=admin.id,
+            scope=TOKEN_SCOPE_ADMIN,
+            user_type="admin",
         )
         self._service._log_auth_info(
             "admin.token.refresh.success",

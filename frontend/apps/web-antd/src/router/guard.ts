@@ -271,6 +271,7 @@ function setupAccessGuard(router: Router) {
       accessStore.setAccessRoutes([]);
       // 清除权限码，避免使用旧端的权限 / drop stale access codes
       accessStore.setAccessCodes([]);
+      userStore.setUserInfo(null);
 
       const { resetPluginRoutesReady } =
         await import('#/composables/use-plugin-frontend-init');

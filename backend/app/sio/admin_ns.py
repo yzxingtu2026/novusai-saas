@@ -14,9 +14,11 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 
 from app.core.logging import LogManager
 from app.core.security import (
+    REFRESH_TOKEN_FAMILY_CLAIM,
     TOKEN_SCOPE_ADMIN,
     TokenExpiredError,
-    verify_token_with_scope,
+    get_token_payload_with_scope,
+    normalize_positive_subject_id,
 )
 from app.middleware.trace import trace_id_var
 from app.sio.error_utils import socket_connect_refusal
@@ -66,7 +68,7 @@ class AdminNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 raise socket_connect_refusal("token_required")
 
             try:
-                user_id_str, scope = await verify_token_with_scope(
+                payload = await get_token_payload_with_scope(
                     token,
                     TOKEN_SCOPE_ADMIN,
                     raise_on_expired=True,
@@ -74,10 +76,11 @@ class AdminNamespace(SocketTraceMixin, socketio.AsyncNamespace):
             except TokenExpiredError as exc:
                 raise socket_connect_refusal("token_expired") from exc
 
-            if not user_id_str:
+            if payload is None:
                 raise socket_connect_refusal("authentication_failed")
-
-            user_id = int(user_id_str)
+            user_id = normalize_positive_subject_id(payload.get("sub"))
+            if user_id is None:
+                raise socket_connect_refusal("authentication_failed")
 
             # Connection rate limiting / 连接频率限制
             from app.sio.presence import check_connect_rate
@@ -121,6 +124,9 @@ class AdminNamespace(SocketTraceMixin, socketio.AsyncNamespace):
                 "user_type": "admin",
                 "tenant_id": None,
                 "username": username,
+                "token_jti": payload.get("jti"),
+                "token_exp": payload.get("exp"),
+                REFRESH_TOKEN_FAMILY_CLAIM: payload.get(REFRESH_TOKEN_FAMILY_CLAIM),
                 "trace_id": trace_id_var.get(),
             }
             await self.save_session(sid, session_data)

@@ -70,3 +70,11 @@ satisfy `ai_real_dialogue_smoke_execution` and cannot make production acceptance
 - 执行所用场景清单 SHA-256 为 `cd51f7fe0d7edbbd204de5af19215b8961cb9a70f834c6469f02de50ab001c15`。
 
 另通过 126 项模型接口专项测试，使用真实客户端处理合成的错误响应。错误响应测试覆盖实际状态、错误分类、部分输出及终止事件。
+
+
+## 2026-11-28 共享会话与内部接口复验
+
+候选修订 `82bab8aacde8defe8f16eb82202e1f9a10bfdd26` 的三个标准对话、三个工具场景、原生 WAV 音频和两项平台检索任务均通过。隔离 PostgreSQL、Redis 和工作进程均通过启动检查。
+运行时文件 SHA-256 为 `e9382a32c3ab4114bf4607df632b3aa64623208bb03e8956e505b6fd4df899d5`，验收回执 SHA-256 为 `41870a2d8a6f6bbce52728b79cc02ca853c541561e1c8841b8f01e4228e7e51b`。
+
+内部接口的单次写确认、路径参数和响应限额由独立结构及行为回归验证。认证行为测试另外使用真实的本地 Redis 和 PostgreSQL，覆盖三个身份端。

@@ -257,10 +257,18 @@ const currentEndpointPrefix = computed(() => {
 
 usePluginFrontendInit(currentEndpointPrefix.value);
 
+function loadEndpointNotifications(endpoint: 'admin' | 'tenant') {
+  socketIOStore.connect(endpoint);
+  notificationStore.setEndpoint(endpoint);
+  notificationStore.initSocketHandlers();
+  void notificationStore.loadUnreadCount();
+}
+
 watch(currentEndpointPrefix, async (endpoint, previousEndpoint) => {
   if (!previousEndpoint || endpoint === previousEndpoint) {
     return;
   }
+  loadEndpointNotifications(endpoint === '/tenant' ? 'tenant' : 'admin');
   resetPluginRoutesReady(router);
   await refreshPluginSlots(endpoint, router, { reloadAssets: false });
 });
@@ -312,14 +320,8 @@ onMounted(async () => {
     onAIAvailabilityInvalidated,
   );
 
-  socketIOStore.connect();
-  // 设置通知端类型后再加载未读数（避免默认 admin 端导致 401）
-  const ep = router.currentRoute.value.path.startsWith('/admin')
-    ? 'admin'
-    : 'tenant';
-  notificationStore.setEndpoint(ep);
-  notificationStore.loadUnreadCount();
-  notificationStore.initSocketHandlers();
+  const ep = currentEndpointPrefix.value === '/tenant' ? 'tenant' : 'admin';
+  loadEndpointNotifications(ep);
   announcementStore.setEndpoint(ep);
   announcementStore.loadPending();
   announcementStore.initSocketHandlers();

@@ -19,6 +19,7 @@ from socketio.exceptions import ConnectionRefusedError as SocketConnectionRefuse
 from app.core.logging import LogManager
 from app.core.response import build_error_event, build_exception_debug
 from app.core.security import (
+    REFRESH_TOKEN_FAMILY_CLAIM,
     TENANT_SESSION_EPOCH_CLAIM,
     TOKEN_SCOPE_ADMIN,
     TOKEN_SCOPE_TENANT_ADMIN,
@@ -37,6 +38,7 @@ from app.middleware.trace import (
 from app.sio.error_utils import socket_connect_refusal
 from app.sio.socket_trace import (
     register_tenant_socket_session,
+    socket_token_is_current,
     tenant_socket_session_is_current,
     unregister_tenant_socket_session,
 )
@@ -236,6 +238,7 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
                 TENANT_SESSION_EPOCH_CLAIM: session_epoch,
                 "token_jti": payload.get("jti"),
                 "token_exp": payload.get("exp"),
+                REFRESH_TOKEN_FAMILY_CLAIM: payload.get(REFRESH_TOKEN_FAMILY_CLAIM),
             }
             await self.save_session(sid, session_data)
             self._sid_sessions[sid] = session_data
@@ -386,9 +389,12 @@ class PluginAuthNamespaceWrapper(socketio.AsyncNamespace):
         try:
             if session is None:
                 return None
-            if session.get("user_type") != TOKEN_SCOPE_ADMIN and not (
-                await tenant_socket_session_is_current(session)
-            ):
+            is_current = (
+                socket_token_is_current
+                if session.get("user_type") == TOKEN_SCOPE_ADMIN
+                else tenant_socket_session_is_current
+            )
+            if not await is_current(session):
                 if sid:
                     await self.disconnect(sid)
                 return None

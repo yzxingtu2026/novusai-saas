@@ -159,12 +159,15 @@ class AuthService(AuthCaptchaVerificationMixin):
         user_id: str,
         access_jti: str,
         refresh_jti: str,
+        *,
+        source_refresh_jti: str | None = None,
     ) -> None:
         await self._session_domain.record_active_tokens(
             user_type,
             user_id,
             access_jti,
             refresh_jti,
+            source_refresh_jti=source_refresh_jti,
         )
 
     async def revoke_on_logout(

@@ -34,6 +34,11 @@ const NAMESPACE_MAP: Record<string, string> = {
   user: '/user',
 };
 
+interface VerifiedSocketSession {
+  principal: string;
+  token: string;
+}
+
 export const useSocketIOStore = defineStore('socketio', () => {
   // 中文: 连接和状态监听由 Pinia 管理，生命周期独立于使用它的布局组件。
   // EN: Pinia owns the connection and status watcher across layout unmounts.
@@ -55,6 +60,8 @@ export const useSocketIOStore = defineStore('socketio', () => {
   /** Socket.IO composable instance (lazy-created) / Socket.IO composable 实例 */
   let sioInstance: null | ReturnType<typeof useSocketIO> = null;
   let connectionScope: EffectScope | null = null;
+  let connectionToken: null | string = null;
+  let connectionPrincipal: null | string = null;
 
   // ============================================================
   // Connection management / 连接管理
@@ -68,24 +75,31 @@ export const useSocketIOStore = defineStore('socketio', () => {
    *
    * @param endpoint - API endpoint type ('admin' | 'tenant' | 'user') / API 端类型
    */
-  function connect(endpoint?: string) {
+  function connect(endpoint?: string, verifiedSession?: VerifiedSocketSession) {
     if (!storeScope?.active) return;
 
     const ep = endpoint || _detectEndpoint();
     if (!ep) return;
 
     const token = TokenStorage.getToken(ep as 'admin' | 'tenant' | 'user');
-    if (!token) return;
+    if (!token || (verifiedSession && verifiedSession.token !== token)) return;
 
     const ns = NAMESPACE_MAP[ep];
     if (!ns) return;
 
-    // If already connected to same endpoint, ignore / 已连接到同一 endpoint 则忽略
+    // 同一账号和租户的令牌轮换沿用连接，保留其他订阅。
+    const samePrincipal =
+      !verifiedSession ||
+      (connectionPrincipal === null
+        ? connectionToken === token
+        : connectionPrincipal === verifiedSession.principal);
     if (
       sioInstance &&
       currentEndpoint.value === ep &&
-      status.value === 'connected'
+      samePrincipal &&
+      (verifiedSession || status.value === 'connected')
     ) {
+      if (verifiedSession) connectionPrincipal = verifiedSession.principal;
       return;
     }
 
@@ -93,6 +107,8 @@ export const useSocketIOStore = defineStore('socketio', () => {
     const scope = storeScope.run(() => effectScope());
     if (!scope) return;
     connectionScope = scope;
+    connectionToken = token;
+    connectionPrincipal = verifiedSession?.principal ?? null;
 
     currentEndpoint.value = ep;
 
@@ -124,6 +140,8 @@ export const useSocketIOStore = defineStore('socketio', () => {
     const scope = connectionScope;
     connectionScope = null;
     sioInstance = null;
+    connectionToken = null;
+    connectionPrincipal = null;
     scope?.stop();
   }
 

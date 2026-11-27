@@ -1,4 +1,8 @@
-import type { ApiEndpoint, RefreshTokenResultRaw } from './types';
+import type {
+  ApiEndpoint,
+  AuthRequestSession,
+  RefreshTokenResultRaw,
+} from './types';
 
 /**
  * Request instance configuration
@@ -27,6 +31,11 @@ import {
   USER_HOME_PATH,
 } from '#/constants/endpoints';
 import { resolveRuntimeLocale } from '#/locales/runtime-locale';
+import {
+  readSharedRefreshSuccessor,
+  refreshEndpointTokens,
+  RefreshSessionChangedError,
+} from '#/store/shared/token-refresh';
 import { TokenStorage } from '#/store/shared/token-storage';
 import { getAppApiUrl } from '#/utils/api-url';
 
@@ -72,13 +81,19 @@ const tokenGetter = {
  * Re-authenticate (called when Token refresh fails)
  * 重新认证（Token 刷新失败时调用）
  */
-async function doReAuthenticate() {
+async function doReAuthenticate(session?: AuthRequestSession, cause?: unknown) {
+  const currentPath = currentPagePath();
+  const endpoint = resolveEndpointByPath(currentPath, window.location.hostname);
+  if (
+    cause instanceof RefreshSessionChangedError ||
+    (session &&
+      (session.endpoint !== endpoint ||
+        session.accessToken !== TokenStorage.getToken(endpoint)))
+  ) {
+    return;
+  }
   console.warn('Access token or refresh token is invalid or expired.');
   const accessStore = useAccessStore();
-
-  // 根据当前路由获取端类型 / resolve endpoint from current route
-  const currentPath = window.location.pathname;
-  const endpoint = resolveEndpointByPath(currentPath, window.location.hostname);
   const isPublicRootPath = currentPath === USER_HOME_PATH;
 
   // 仅清除当前端的 Token
@@ -104,7 +119,11 @@ async function doReAuthenticate() {
       return;
     }
     const redirect = `?redirect=${encodeURIComponent(currentPath)}`;
-    window.location.href = loginPath + redirect;
+    if (import.meta.env.VITE_ROUTER_HISTORY === 'hash') {
+      window.location.hash = loginPath + redirect;
+    } else {
+      window.location.href = loginPath + redirect;
+    }
   }
 }
 
@@ -112,16 +131,10 @@ async function doReAuthenticate() {
  * Refresh Token
  * 刷新 Token
  */
-async function doRefreshToken(): Promise<string> {
-  const accessStore = useAccessStore();
-  const currentPath = window.location.pathname;
-  const endpoint = resolveEndpointByPath(currentPath, window.location.hostname);
-
-  const refreshToken = TokenStorage.getRefreshToken(endpoint);
-  if (!refreshToken) {
-    throw new Error('No refresh token available');
-  }
-
+async function exchangeRefreshToken(
+  endpoint: ApiEndpoint,
+  refreshToken: string,
+) {
   // 使用 baseRequestClient 避免循环依赖
   // baseRequestClient 没有拦截器，返回原始 AxiosResponse
   // AxiosResponse.data = HttpResponse { code, message, data: RefreshTokenResultRaw }
@@ -141,22 +154,73 @@ async function doRefreshToken(): Promise<string> {
     throw new Error(httpResponse.message || 'Failed to refresh token');
   }
   const result = httpResponse.data;
-  const newToken = result.access_token;
+  return {
+    accessToken: result.access_token,
+    refreshToken: result.refresh_token,
+  };
+}
 
-  // 更新 TokenStorage
-  TokenStorage.setToken(endpoint, newToken);
-  if (result.refresh_token) {
-    TokenStorage.setRefreshToken(endpoint, result.refresh_token);
+function currentPagePath(): string {
+  const { hash, pathname } = window.location;
+  return import.meta.env.VITE_ROUTER_HISTORY === 'hash'
+    ? hash.slice(1).split(/[?#]/, 1)[0] || '/'
+    : pathname;
+}
+
+function currentPageEndpoint(): ApiEndpoint {
+  return resolveEndpointByPath(currentPagePath(), window.location.hostname);
+}
+
+export function trackSharedSessionRefresh(): () => void {
+  const accessStore = useAccessStore();
+  const synchronize = (event: StorageEvent) => {
+    if (event.storageArea !== localStorage) return;
+    const successor = readSharedRefreshSuccessor(currentPageEndpoint(), {
+      accessToken: accessStore.accessToken,
+      refreshToken: accessStore.refreshToken,
+    });
+    if (successor?.refreshToken) {
+      accessStore.setAccessToken(successor.accessToken);
+      accessStore.setRefreshToken(successor.refreshToken);
+    }
+  };
+  window.addEventListener('storage', synchronize);
+  return () => window.removeEventListener('storage', synchronize);
+}
+
+export async function refreshEndpointToken(
+  endpoint: ApiEndpoint,
+  failedAccessToken?: null | string,
+): Promise<string> {
+  const pageEndpoint = currentPageEndpoint();
+  const tokens = await refreshEndpointTokens(
+    endpoint,
+    (refreshToken) => exchangeRefreshToken(endpoint, refreshToken),
+    () => currentPageEndpoint() === pageEndpoint,
+    failedAccessToken,
+  );
+  if (
+    currentPageEndpoint() !== pageEndpoint ||
+    TokenStorage.getToken(endpoint) !== tokens.accessToken ||
+    (tokens.refreshToken &&
+      TokenStorage.getRefreshToken(endpoint) !== tokens.refreshToken)
+  ) {
+    throw new RefreshSessionChangedError();
   }
 
-  // 更新 accessStore
-  accessStore.setAccessToken(newToken);
-  if (result.refresh_token) {
-    accessStore.setRefreshToken(result.refresh_token);
+  if (endpoint === pageEndpoint) {
+    const accessStore = useAccessStore();
+    accessStore.setAccessToken(tokens.accessToken);
+    if (tokens.refreshToken) accessStore.setRefreshToken(tokens.refreshToken);
   }
+  return tokens.accessToken;
+}
 
-  // Socket.IO 的 token getter 会自动从 TokenStorage 读取最新值，无需手动通知
-  return newToken;
+async function doRefreshToken(session: AuthRequestSession): Promise<string> {
+  if (session.endpoint !== currentPageEndpoint()) {
+    throw new RefreshSessionChangedError();
+  }
+  return refreshEndpointToken(session.endpoint, session.accessToken);
 }
 
 const authHandler = {

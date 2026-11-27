@@ -14,12 +14,17 @@
 import type { AxiosResponse, InternalAxiosRequestConfig } from 'axios';
 
 import type { RequestClient } from './request-client';
-import type { ApiEndpoint, RequestOptions } from './types';
+import type { ApiEndpoint, AuthRequestSession, RequestOptions } from './types';
 
 import { h } from 'vue';
 
 import { Button, notification } from 'ant-design-vue';
-import axios from 'axios';
+import axios, { AxiosHeaders } from 'axios';
+
+import {
+  readBearerToken,
+  RefreshSessionChangedError,
+} from '#/store/shared/token-refresh';
 
 import { notifyAIAccessDenied } from './ai-availability-events';
 import { isDevErrorMode } from './app-env';
@@ -57,8 +62,11 @@ export interface TokenGetter {
 
 /** Authentication handler / 认证处理器 */
 export interface AuthHandler {
-  doRefreshToken: () => Promise<string>;
-  doReAuthenticate: () => Promise<void>;
+  doRefreshToken: (session: AuthRequestSession) => Promise<string>;
+  doReAuthenticate: (
+    session?: AuthRequestSession,
+    cause?: unknown,
+  ) => Promise<void>;
 }
 
 /** Message handler / 消息处理器 */
@@ -162,6 +170,15 @@ export function createRequestInterceptor(
     fulfilled: async (config: ExtendedConfig) => {
       const options = config?.__options || {};
 
+      const endpoint = getEndpointByUrl(config.url || '');
+      const token = tokenGetter.getToken(endpoint);
+      if (
+        config.__isRetryRequest &&
+        readBearerToken(config.headers.get('Authorization')) !== token
+      ) {
+        throw new RefreshSessionChangedError();
+      }
+
       // 0. 注入 X-Trace-ID（用于请求关联与问题反馈）/ Inject for request correlation
       ensureTraceIdHeader(config.headers as never);
 
@@ -172,9 +189,6 @@ export function createRequestInterceptor(
       }
 
       // 2. 自动携带 Token（根据 URL 判断端类型）/ attach Bearer by endpoint
-      const requestUrl = config.url || '';
-      const endpoint = getEndpointByUrl(requestUrl);
-      const token = tokenGetter.getToken(endpoint);
       if (token) {
         config.headers.Authorization = formatToken(token);
       }
@@ -369,56 +383,38 @@ export function createAuthInterceptor(
         throw error;
       }
 
+      const session: AuthRequestSession = {
+        accessToken: readBearerToken(
+          AxiosHeaders.from(config?.headers).get('Authorization'),
+        ),
+        endpoint: getEndpointByUrl(config?.url || ''),
+      };
+
       // 4010 UNAUTHORIZED 或未启用刷新或已是重试请求 -> 直接重新认证 / re-auth path
       if (
         businessCode === 4010 ||
         !enableRefreshToken ||
         config?.__isRetryRequest
       ) {
-        await authHandler.doReAuthenticate();
+        await authHandler.doReAuthenticate(session);
         throw error;
       }
 
       // 4011 TOKEN_EXPIRED 或 4012 TOKEN_INVALID -> 尝试刷新 Token / refresh token path
-
-      // 正在刷新中，加入队列等待 / queue while refresh in progress
-      if (client.isRefreshing) {
-        return new Promise((resolve, reject) => {
-          client.refreshTokenQueue.push({
-            resolve: (newToken: string) => {
-              config.headers.Authorization = formatToken(newToken);
-              resolve(client.instance.request(config));
-            },
-            reject: (err: any) => {
-              reject(err);
-            },
-          });
-        });
-      }
-
-      // 开始刷新 / start token refresh
-      client.isRefreshing = true;
-      config.__isRetryRequest = true;
-
+      let newToken: string;
       try {
-        const newToken = await authHandler.doRefreshToken();
-
-        // 刷新成功，处理队列中的请求 / flush queued retries
-        client.refreshTokenQueue.forEach((item) => item.resolve(newToken));
-        client.refreshTokenQueue = [];
-
-        // 重试原请求 / retry original request
-        config.headers.Authorization = formatToken(newToken);
-        return client.instance.request(config);
+        newToken = await client.refreshForRequest(
+          session,
+          authHandler.doRefreshToken,
+        );
       } catch (refreshError) {
-        // 刷新失败，reject 队列中所有等待的请求 / reject queued on refresh failure
-        client.refreshTokenQueue.forEach((item) => item.reject(refreshError));
-        client.refreshTokenQueue = [];
-        await authHandler.doReAuthenticate();
+        await authHandler.doReAuthenticate(session, refreshError);
+        if (refreshError instanceof RefreshSessionChangedError) throw error;
         throw refreshError;
-      } finally {
-        client.isRefreshing = false;
       }
+      config.__isRetryRequest = true;
+      config.headers.Authorization = formatToken(newToken);
+      return client.instance.request(config);
     },
   };
 }

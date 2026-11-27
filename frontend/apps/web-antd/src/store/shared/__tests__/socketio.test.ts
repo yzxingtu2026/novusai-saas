@@ -13,16 +13,19 @@ import { TokenStorage } from '../token-storage';
 
 vi.mock('socket.io-client', () => ({ io: vi.fn() }));
 
+// eslint-disable-next-line unicorn/prefer-event-target -- Socket.IO 客户端使用 on/off 事件接口。
 class InertSocket extends EventEmitter {
   active = false;
   connected = false;
-  readonly io = new EventEmitter();
 
   readonly disconnect = vi.fn(() => {
     this.active = false;
     this.connected = false;
     this.emit('disconnect', 'io client disconnect');
   });
+
+  // eslint-disable-next-line unicorn/prefer-event-target -- 重连事件使用同一套 on/off 接口。
+  readonly io = new EventEmitter();
 
   connect() {
     this.active = true;
@@ -156,6 +159,59 @@ describe('shared Socket.IO store lifetime', () => {
     socketAt(2).emit('notification', { id: 44 });
 
     expect(handler.mock.calls).toEqual([[{ id: 42 }], [{ id: 44 }]]);
+  });
+
+  it('[behavioral] preserves the verified room during token rotation and replaces it for another tenant', () => {
+    const { store } = mountConsumer();
+    const onPresence = vi.fn();
+    store.registerHandler('presence:online', onPresence);
+    store.connect('tenant');
+    const firstTenant = socketAt(1);
+    store.connect('tenant', {
+      principal: 'tenant:17:user:42',
+      token: 'fictional-tenant-token',
+    });
+
+    TokenStorage.setToken('tenant', 'rotated-tenant-token');
+    store.connect('tenant', {
+      principal: 'tenant:17:user:42',
+      token: 'rotated-tenant-token',
+    });
+    firstTenant.emit('presence:online', { userId: 42 });
+
+    expect(sockets).toHaveLength(2);
+    expect(firstTenant.disconnect.mock.calls).toEqual([]);
+
+    TokenStorage.setToken('tenant', 'another-tenant-token');
+    store.connect('tenant', {
+      principal: 'tenant:18:user:42',
+      token: 'another-tenant-token',
+    });
+    firstTenant.emit('presence:online', { userId: 43 });
+    socketAt(2).emit('presence:online', { userId: 44 });
+
+    expect(firstTenant.disconnect).toHaveBeenCalledTimes(1);
+    expect(onPresence.mock.calls).toEqual([[{ userId: 42 }], [{ userId: 44 }]]);
+  });
+
+  it('[behavioral] replaces the unverified socket when the verified token belongs to a later login', () => {
+    const { store } = mountConsumer();
+    const original = socketAt(0);
+    TokenStorage.setToken('admin', 'another-admin-token');
+    store.connect('admin', {
+      principal: 'admin:user:41',
+      token: 'fictional-admin-token',
+    });
+    expect(sockets).toHaveLength(1);
+
+    store.connect('admin', {
+      principal: 'admin:user:52',
+      token: 'another-admin-token',
+    });
+
+    expect(sockets).toHaveLength(2);
+    expect(original.disconnect).toHaveBeenCalledTimes(1);
+    expect(socketAt(1).connected).toBe(true);
   });
 
   it('[behavioral] disposes the active transport and clears the retained Pinia state', () => {

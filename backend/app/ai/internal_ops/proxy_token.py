@@ -58,6 +58,9 @@ def issue_ai_proxy_token(
     if not scope:
         raise ValueError(f"Cannot issue AI proxy token for user_role={user_role!r}")
 
+    if isinstance(user_id, bool) or not isinstance(user_id, int) or user_id < 1:
+        raise ValueError("user_id must be a positive integer")
+
     extra_claims: dict[str, Any] = {
         "actor": AI_PROXY_ACTOR,
         "ai_proxy": {

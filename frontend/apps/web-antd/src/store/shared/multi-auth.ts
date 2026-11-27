@@ -29,7 +29,6 @@ import {
   adminChangePasswordApi,
   adminLoginApi,
   adminLogoutApi,
-  adminRefreshTokenApi,
   getAdminInfoApi,
 } from '#/api/admin/auth';
 import {
@@ -37,7 +36,6 @@ import {
   tenantChangePasswordApi,
   tenantLoginApi,
   tenantLogoutApi,
-  tenantRefreshTokenApi,
 } from '#/api/tenant/auth';
 import {
   getUserInfoApi,
@@ -45,7 +43,6 @@ import {
   userLoginApi,
   userLoginByCodeApi,
   userLogoutApi,
-  userRefreshTokenApi,
   userSendLoginCodeApi,
 } from '#/api/user/auth';
 import {
@@ -58,6 +55,7 @@ import {
 import { $t } from '#/locales';
 import { getEndpointFromPath } from '#/utils';
 import { toAvatarDisplayUrl } from '#/utils/image';
+import { refreshEndpointToken } from '#/utils/request/instance';
 import { clearPersistedTabbarStorage } from '#/utils/tabbar-storage';
 
 import { TokenStorage } from './token-storage';
@@ -143,7 +141,6 @@ export const useMultiAuthStore = defineStore('multi-auth', () => {
           getUserInfo: getAdminInfoApi,
           login: adminLoginApi,
           logout: adminLogoutApi,
-          refreshToken: adminRefreshTokenApi,
         };
       }
       case 'tenant': {
@@ -152,7 +149,6 @@ export const useMultiAuthStore = defineStore('multi-auth', () => {
           getUserInfo: getTenantAdminInfoApi,
           login: tenantLoginApi,
           logout: tenantLogoutApi,
-          refreshToken: tenantRefreshTokenApi,
         };
       }
       default: {
@@ -162,7 +158,6 @@ export const useMultiAuthStore = defineStore('multi-auth', () => {
           login: userLoginApi,
           loginByCode: userLoginByCodeApi,
           logout: userLogoutApi,
-          refreshToken: userRefreshTokenApi,
           sendLoginCode: userSendLoginCodeApi,
         };
       }
@@ -487,31 +482,7 @@ export const useMultiAuthStore = defineStore('multi-auth', () => {
    * @param endpoint Endpoint type (optional) / 指定端类型
    */
   async function refreshToken(endpoint?: ApiEndpoint) {
-    const ep = endpoint || currentEndpoint.value;
-    const api = getAuthApi(ep);
-
-    // Get current endpoint's refresh token from TokenStorage / 获取当前端 Refresh Token
-    const currentRefreshToken = TokenStorage.getRefreshToken(ep);
-
-    if (!currentRefreshToken) {
-      throw new Error('No refresh token available');
-    }
-
-    const result = await api.refreshToken(currentRefreshToken);
-
-    // Update TokenStorage / 更新 TokenStorage
-    TokenStorage.setToken(ep, result.accessToken);
-    if (result.refreshToken) {
-      TokenStorage.setRefreshToken(ep, result.refreshToken);
-    }
-
-    // Also update accessStore (Vben compat) / 同时更新 accessStore
-    accessStore.setAccessToken(result.accessToken);
-    if (result.refreshToken) {
-      accessStore.setRefreshToken(result.refreshToken);
-    }
-
-    return result.accessToken;
+    return refreshEndpointToken(endpoint || currentEndpoint.value);
   }
 
   // ============================================================

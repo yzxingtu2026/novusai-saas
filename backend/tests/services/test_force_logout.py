@@ -18,19 +18,15 @@ class TestAuthServiceForceLogout:
     """AuthService.force_logout 测试 / AuthService.force_logout tests."""
 
     @pytest.mark.asyncio
-    async def test_force_logout_revokes_tokens_and_emits_event(
+    @pytest.mark.structural
+    async def test_force_logout_submits_atomic_revocation_and_emits_event(
         self, mock_db, mock_redis
     ):
-        """强制下线应吊销 Redis 中所有 Token 并发送 force_logout 事件 / Force logout revokes tokens and emits event."""
+        """Test type: structural. Dispatch the atomic revocation for the exact identity."""
+        from app.core.config import settings
         from app.services.common.auth_service import AuthService
 
-        mock_redis.hgetall = AsyncMock(
-            return_value={
-                "access-jti-1": "refresh-jti-1",
-                "access-jti-2": "refresh-jti-2",
-            }
-        )
-        mock_redis.delete = AsyncMock(return_value=1)
+        mock_redis.eval = AsyncMock(return_value=2)
 
         with (
             patch(
@@ -51,8 +47,20 @@ class TestAuthServiceForceLogout:
             service = AuthService(mock_db)
             await service.force_logout("tenant_admin", user_id=5, tenant_id=10)
 
-            # 应吊销 4 个 token（2 access + 2 refresh）
-            assert mock_revoke.call_count == 4
+            script, numkeys, key, prefix, ttl = mock_redis.eval.await_args.args
+            assert "-- revoke_active_tokens" in script
+            assert (numkeys, key, prefix) == (
+                1,
+                "active_tokens:tenant_admin:5",
+                "token_blacklist:",
+            )
+            assert int(ttl) == max(
+                86400,
+                settings.ACCESS_TOKEN_EXPIRE_MINUTES * 60,
+                settings.REFRESH_TOKEN_EXPIRE_DAYS * 86400,
+            )
+            mock_redis.eval.assert_awaited_once()
+            mock_revoke.assert_not_awaited()
             # 应清除 presence
             mock_offline.assert_called_once_with("tenant_admin", 5, tenant_id=10)
             # 应仅向 /tenant namespace 发送（tenant_admin）
@@ -87,7 +95,7 @@ class TestAuthServiceForceLogout:
         """无活跃 Token 时仍应清除 presence 并发送事件 / No tokens still clears presence and emits."""
         from app.services.common.auth_service import AuthService
 
-        mock_redis.hgetall = AsyncMock(return_value={})
+        mock_redis.eval = AsyncMock(return_value=0)
         with (
             patch(
                 "app.services.common.auth_domains.session_password.get_redis_client",

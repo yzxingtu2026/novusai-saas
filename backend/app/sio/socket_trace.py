@@ -86,6 +86,30 @@ async def disconnect_tenant_socket_sessions(tenant_id: int, current_epoch: int) 
     return complete
 
 
+async def socket_token_is_current(session: dict[str, Any] | None) -> bool:
+    """Verify stored token and family state for an authenticated socket."""
+    from app.core.security import (
+        REFRESH_TOKEN_FAMILY_CLAIM,
+        is_refresh_token_family_revoked,
+        is_token_revoked,
+    )
+
+    if not isinstance(session, dict):
+        return False
+    jti, expires = session.get("token_jti"), session.get("token_exp")
+    if (
+        not isinstance(jti, str)
+        or not jti
+        or type(expires) is not int
+        or expires <= time.time()
+    ):
+        return False
+    if await is_token_revoked(jti):
+        return False
+    family_id = session.get(REFRESH_TOKEN_FAMILY_CLAIM)
+    return family_id is None or not await is_refresh_token_family_revoked(family_id)
+
+
 async def tenant_socket_session_is_current(session: dict[str, Any] | None) -> bool:
     """复核当前租户会话 / Check the tenant session for the next inbound or outbound event."""
     from sqlalchemy import select
@@ -95,7 +119,6 @@ async def tenant_socket_session_is_current(session: dict[str, Any] | None) -> bo
         TENANT_SESSION_EPOCH_CLAIM,
         TOKEN_SCOPE_TENANT_ADMIN,
         TOKEN_SCOPE_TENANT_USER,
-        is_token_revoked,
         normalize_positive_subject_id,
         tenant_session_epoch_matches,
     )
@@ -110,19 +133,10 @@ async def tenant_socket_session_is_current(session: dict[str, Any] | None) -> bo
     }.get(user_type)
     user_id = normalize_positive_subject_id(session.get("user_id"))
     tenant_id = normalize_positive_subject_id(session.get("tenant_id"))
-    jti, expires = session.get("token_jti"), session.get("token_exp")
-    if (
-        identity is None
-        or user_id is None
-        or tenant_id is None
-        or not isinstance(jti, str)
-        or not jti
-        or type(expires) is not int
-        or expires <= time.time()
-    ):
+    if identity is None or user_id is None or tenant_id is None:
         return False
     try:
-        if await is_token_revoked(jti):
+        if not await socket_token_is_current(session):
             return False
         async with async_session_factory() as db:
             epoch = await db.scalar(
@@ -161,6 +175,11 @@ class SocketTraceMixin:
         try:
             if sid:
                 session = await self.bind_socket_trace(sid, payload)
+                if self.namespace == "/admin" and not await socket_token_is_current(
+                    session
+                ):
+                    await self.disconnect(sid)
+                    return None
                 if self.namespace in {"/tenant", "/user"} and not (
                     await tenant_socket_session_is_current(session)
                 ):

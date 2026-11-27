@@ -113,9 +113,9 @@ async def test_tenant_admin_service_builds_plan_scoped_auth_profile(
     assert response.plan_name == "Catalog Pro"
     assert response.tenant_ai_enabled is True
     assert response.effective_ai_enabled is True
-    assert response.permissions == [
-        "tenant.catalog:read",
+    assert sorted(response.permissions) == [
         "menu:tenant.catalog",
+        "tenant.catalog:read",
     ]
     assert "*" not in response.permissions
 
@@ -217,11 +217,7 @@ async def test_tenant_auth_profile_delegates_enriched_profile_response(
     payload = await tenant_auth.update_profile(
         db,
         current_admin,
-        SimpleNamespace(
-            model_dump=lambda exclude_unset=True: {
-                "nickname": "New Owner",
-            }
-        ),
+        tenant_auth.TenantAdminUpdateProfileRequest(nickname="New Owner"),
     )
 
     assert update_calls == [
