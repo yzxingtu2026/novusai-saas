@@ -13,6 +13,17 @@ vi.mock('@vben/stores', () => ({ useAccessStore: () => accessStore }));
 vi.mock('@vben/preferences', () => ({
   preferences: { app: { enableRefreshToken: true } },
 }));
+vi.mock('@vben/locales', () => ({ $t: (key: string) => key }));
+vi.mock('ant-design-vue', () => ({
+  Button: 'button',
+  message: { error: vi.fn() },
+  notification: { error: vi.fn() },
+}));
+vi.mock('#/locales/runtime-locale', () => ({
+  resolveRuntimeLocale: () => 'zh-CN',
+}));
+vi.mock('#/utils/api-url', () => ({ getAppApiUrl: () => '' }));
+vi.mock('#/utils/common', () => ({ generateUUID: () => 'auth-fixture-trace' }));
 
 const namespace = 'vitest_refresh';
 const endpoint = 'tenant';
@@ -328,8 +339,16 @@ describe('browser refresh coordination', () => {
       });
 
       const messages: string[] = [];
+      const recovery = vi.spyOn(requestClient, 'refreshForRequest');
       const http = requestClient.get('/tenant/fixture');
-      await started.promise;
+      await Promise.race([
+        started.promise,
+        http.then(() => {
+          throw new Error(
+            'The HTTP request completed without starting refresh',
+          );
+        }),
+      ]);
       const manual = refreshEndpointToken(endpoint);
       const sse = requestClient.requestSSE(
         '/tenant/fixture-stream',
@@ -340,9 +359,27 @@ describe('browser refresh coordination', () => {
           },
         },
       );
-      release.resolve(undefined);
+      const results = Promise.all([http, manual, sse]);
+      try {
+        await Promise.race([
+          vi.waitFor(() => {
+            const sessions = recovery.mock.calls.map(([session]) => session);
+            expect(sessions).toEqual([
+              { accessToken: original.accessToken, endpoint },
+              { accessToken: original.accessToken, endpoint },
+            ]);
+          }),
+          results.then(() => {
+            throw new Error(
+              'Refresh completed before HTTP and SSE were waiting',
+            );
+          }),
+        ]);
+      } finally {
+        release.resolve(undefined);
+      }
 
-      await expect(Promise.all([http, manual, sse])).resolves.toEqual([
+      await expect(results).resolves.toEqual([
         { account: '7' },
         rotated.accessToken,
         undefined,
