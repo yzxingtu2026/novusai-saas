@@ -125,7 +125,8 @@ describe('usePublicConfigStore tenant config guard', () => {
 
       expect(store.isDomainTenantDomain).toBe(true);
       expect(store.isDomainDetected).toBe(true);
-      expect((await store.loadTenantConfig())?.brand.siteName).toBe('Acme Tenant');
+      const tenantConfig = await store.loadTenantConfig();
+      expect(tenantConfig?.brand.siteName).toBe('Acme Tenant');
       expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
     },
   );
@@ -143,26 +144,28 @@ describe('usePublicConfigStore tenant config guard', () => {
     expect(getTenantPublicConfigApi).not.toHaveBeenCalled();
   });
 
-  it.each([
-    { code: 4040 },
-    { response: { status: 404 } },
-  ])('keeps an unregistered suffix host out of both entry points', async (error) => {
-    vi.stubGlobal('location', { hostname: 'unregistered.novus.local' });
-    getTenantPublicConfigApi.mockRejectedValueOnce(error);
-    const store = usePublicConfigStore();
+  it.each([{ code: 4040 }, { response: { status: 404 } }])(
+    'keeps an unregistered suffix host out of both entry points',
+    async (error) => {
+      vi.stubGlobal('location', { hostname: 'unregistered.novus.local' });
+      getTenantPublicConfigApi.mockRejectedValueOnce(error);
+      const store = usePublicConfigStore();
 
-    await store.detectDomainType();
+      await store.detectDomainType();
 
-    expect(store.isDomainDetected).toBe(true);
-    expect(store.isDomainTenantDomain).toBeNull();
-    expect(store.tenantConfigLoaded).toBe(false);
-    expect(await store.loadTenantConfig()).toBeNull();
-    expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
-  });
+      expect(store.isDomainDetected).toBe(true);
+      expect(store.isDomainTenantDomain).toBeNull();
+      expect(store.tenantConfigLoaded).toBe(false);
+      expect(await store.loadTenantConfig()).toBeNull();
+      expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
+    },
+  );
 
   it('rechecks temporary tenant lookup failure and restores the registered entry', async () => {
     vi.stubGlobal('location', { hostname: 'acme.novus.local' });
-    getTenantPublicConfigApi.mockRejectedValueOnce({ response: { status: 503 } });
+    getTenantPublicConfigApi.mockRejectedValueOnce({
+      response: { status: 503 },
+    });
     const store = usePublicConfigStore();
 
     await store.detectDomainType();
@@ -186,6 +189,56 @@ describe('usePublicConfigStore tenant config guard', () => {
     expect(result).toBeNull();
     expect(getTenantPublicConfigApi).not.toHaveBeenCalled();
     expect(store.tenantConfigLoaded).toBe(false);
+  });
+
+  it('retries a platform outage before loading and applying tenant configuration', async () => {
+    vi.stubGlobal('location', { hostname: 'acme.novus.local' });
+    getPlatformPublicConfigApi.mockRejectedValueOnce(
+      new Error('Temporary platform outage'),
+    );
+    const store = usePublicConfigStore();
+
+    await store.detectDomainType();
+
+    expect(store.isDomainDetected).toBe(false);
+    expect(store.isDomainTenantDomain).toBeNull();
+    expect(store.tenantConfigLoaded).toBe(false);
+    expect(store.tenantConfig).toBeNull();
+    expect(store.error).toBe('Temporary platform outage');
+    expect(getTenantPublicConfigApi).not.toHaveBeenCalled();
+
+    await Promise.all([
+      store.retryDomainDetection(),
+      store.retryDomainDetection(),
+    ]);
+
+    expect(store.isDomainDetected).toBe(true);
+    expect(store.isDomainTenantDomain).toBe(true);
+    expect(store.tenantConfig?.brand.logo).toBe('/platform-logo.png');
+    expect(store.error).toBeNull();
+    expect(getPlatformPublicConfigApi).toHaveBeenCalledTimes(2);
+    expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
+  });
+
+  it('waits for platform configuration even when skipping tenant domain detection', async () => {
+    getPlatformPublicConfigApi.mockRejectedValueOnce(
+      new Error('Temporary platform outage'),
+    );
+    const store = usePublicConfigStore();
+    const options = { skipDomainCheck: true };
+
+    expect(await store.loadTenantConfig(options)).toBeNull();
+    expect(store.tenantConfigLoaded).toBe(false);
+    expect(store.tenantConfig).toBeNull();
+    expect(store.error).toBe('Temporary platform outage');
+    expect(getTenantPublicConfigApi).not.toHaveBeenCalled();
+
+    const tenantConfig = await store.loadTenantConfig(options);
+    expect(tenantConfig?.brand.logo).toBe('/platform-logo.png');
+    expect(store.tenantConfigLoaded).toBe(true);
+    expect(store.error).toBeNull();
+    expect(getPlatformPublicConfigApi).toHaveBeenCalledTimes(2);
+    expect(getTenantPublicConfigApi).toHaveBeenCalledTimes(1);
   });
 
   it('still allows tenant config loading when domain guard is intentionally skipped', async () => {
