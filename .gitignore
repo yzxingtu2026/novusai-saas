@@ -56,8 +56,6 @@ backend/ruff_full_report.txt
 /production.env
 
 # Local AI, agent, IDE, and repository workflow configs
-/.agent/
-/.agents/
 /.claude/
 /.codex/
 /.cursor/
