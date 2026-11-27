@@ -33,10 +33,10 @@ jobs:
       EVENT_ACTION: ${{ github.event.action }}
       EVENT_LABEL: ${{ github.event.label.name }}
       AUTO_CODING_ASSIGNEE: ${{ vars.AUTO_CODING_ASSIGNEE }}
-      # 复用仓库已有的 AI 网关 secrets，内部仍沿用 OPENAI_* 环境变量名
-      OPENAI_API_BASE: ${{ secrets.AI_API_BASE }}
-      OPENAI_API_KEY: ${{ secrets.AI_API_KEY }}
-      OPENAI_MODEL: ${{ secrets.AI_MODEL }}
+      # 使用自动编码的 Responses 网关配置。
+      OPENAI_API_BASE: ${{ vars.OPENAI_API_BASE }}
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
       OPENAI_REASONING_EFFORT: ${{ vars.OPENAI_REASONING_EFFORT }}
       CI_CONCLUSION: ${{ github.event.workflow_run.conclusion }}
       CI_HEAD_BRANCH: ${{ github.event.workflow_run.head_branch }}
@@ -512,9 +512,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          : "${OPENAI_API_BASE:?Configure secret AI_API_BASE}"
-          : "${OPENAI_API_KEY:?Configure secret AI_API_KEY}"
-          : "${OPENAI_MODEL:?Configure secret AI_MODEL}"
+          : "${OPENAI_API_BASE:?Configure the OPENAI_API_BASE repository variable}"
+          : "${OPENAI_API_KEY:?Configure the OPENAI_API_KEY repository secret}"
+          : "${OPENAI_MODEL:?Configure the OPENAI_MODEL repository variable}"
           if [[ ! "$REASONING_EFFORT" =~ ^(minimal|low|medium|high|xhigh)$ ]]; then
             echo '::error::refusing reasoning effort outside the whitelist'
             exit 1
