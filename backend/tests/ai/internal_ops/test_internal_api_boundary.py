@@ -249,3 +249,21 @@ def test_proxy_signer_requires_a_positive_integer_subject(user_id):
             agent_id=11,
             conversation_id=13,
         )
+
+
+@pytest.mark.parametrize("user_id", [0, -1, True, 1.5])
+async def test_invalid_conversation_identity_never_reaches_transport(
+    invoke_fixture, user_id
+):
+    def endpoint(_request):
+        pytest.fail("Invalid identity reached the synthetic transport")
+
+    invoke, clients = invoke_fixture(endpoint, user_id=user_id)
+    result = await invoke()
+
+    assert result.success is False
+    assert (
+        result.error
+        == "Internal operations require an authenticated conversation user."
+    )
+    assert clients == []

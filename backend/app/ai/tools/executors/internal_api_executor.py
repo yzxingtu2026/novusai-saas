@@ -16,6 +16,7 @@ import hashlib
 import json
 import re
 from typing import Any
+from urllib.parse import quote
 
 import httpx
 
@@ -51,8 +52,25 @@ _PENDING_KEY_PREFIX = "ai:internal_ops:pending"
 
 # Cap for non-JSON response bodies relayed to the LLM / 非 JSON 响应体转发上限
 _MAX_TEXT_BODY_CHARS = 2000
+_MAX_RESPONSE_BYTES = 2 * 1024 * 1024
 
 _PATH_PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+_MAX_PATH_PARAM_LENGTH = 2048
+
+
+def _normalize_path_param(name: str, value: object) -> str:
+    if not isinstance(value, (str, int, float)):
+        raise ValueError(f"Path parameter '{name}' must be a scalar")
+    text = str(value)
+    if (
+        not text
+        or len(text) > _MAX_PATH_PARAM_LENGTH
+        or text in {".", ".."}
+        or any(char in text for char in "/\\?#%")
+        or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text)
+    ):
+        raise ValueError(f"Path parameter '{name}' contains an invalid segment")
+    return text
 
 
 def _json_output(payload: dict[str, Any]) -> str:
@@ -107,7 +125,7 @@ class InternalApiExecutor(BaseToolExecutor):
         context: ExecutionContext | None = None,
     ) -> ToolResult:
         name = definition.name
-        if context is None or not context.user_id:
+        if context is None or normalize_positive_subject_id(context.user_id) is None:
             return ToolResult.error_result(
                 tool_call_id,
                 "Internal operations require an authenticated conversation user.",
@@ -244,7 +262,17 @@ class InternalApiExecutor(BaseToolExecutor):
             )
         assert op is not None
 
-        path_params = dict(arguments.get("path_params") or {})
+        path_params = arguments.get("path_params")
+        if path_params is None:
+            path_params = {}
+        if not isinstance(path_params, dict) or any(
+            not isinstance(key, str) for key in path_params
+        ):
+            return ToolResult.error_result(
+                tool_call_id,
+                "Argument 'path_params' must be a JSON object.",
+                name=TOOL_INVOKE_OPERATION,
+            )
         query_params = dict(arguments.get("query_params") or {})
         body = arguments.get("body")
         if body is not None and not isinstance(body, dict):
@@ -264,9 +292,24 @@ class InternalApiExecutor(BaseToolExecutor):
                 "Call describe_internal_operation for the parameter spec.",
                 name=TOOL_INVOKE_OPERATION,
             )
-        resolved_path = op.path
-        for p in placeholders:
-            resolved_path = resolved_path.replace("{" + p + "}", str(path_params[p]))
+        unknown = sorted(set(path_params) - set(placeholders))
+        if unknown:
+            return ToolResult.error_result(
+                tool_call_id,
+                f"Unknown path params: {unknown}. Use describe_internal_operation for the parameter spec.",
+                name=TOOL_INVOKE_OPERATION,
+            )
+        try:
+            resolved_path = _PATH_PLACEHOLDER_RE.sub(
+                lambda match: quote(
+                    _normalize_path_param(match[1], path_params[match[1]]), safe=""
+                ),
+                op.path,
+            )
+        except ValueError as exc:
+            return ToolResult.error_result(
+                tool_call_id, str(exc), name=TOOL_INVOKE_OPERATION
+            )
 
         # Write operations require a server-armed confirmation
         # 写操作需要服务端布防的确认
@@ -286,11 +329,15 @@ class InternalApiExecutor(BaseToolExecutor):
                 },
             )
             if gate is not None:
+                if "error" in gate:
+                    return ToolResult.error_result(
+                        tool_call_id, gate["error"], name=TOOL_INVOKE_OPERATION
+                    )
                 return ToolResult(
                     tool_call_id=tool_call_id,
                     name=TOOL_INVOKE_OPERATION,
                     success=True,
-                    output=gate,
+                    output=_json_output(gate),
                     summary=f"Awaiting confirmation: {op.method} {resolved_path}",
                 )
 
@@ -336,11 +383,8 @@ class InternalApiExecutor(BaseToolExecutor):
         digest: str,
         confirmed: bool,
         preview: dict[str, Any],
-    ) -> str | None:
-        """
-        Returns a confirmation-preview output, or None when execution may
-        proceed. 返回确认预览输出；返回 None 表示放行执行。
-        """
+    ) -> dict[str, Any] | None:
+        """Return a preview or an error. None permits the write."""
         from app.core.redis import get_redis_client
 
         key = (
@@ -349,22 +393,27 @@ class InternalApiExecutor(BaseToolExecutor):
         )
         try:
             client = get_redis_client()
-            if confirmed and await client.exists(key):
-                await client.delete(key)
-                return None
+            if confirmed:
+                # DEL consumes the sentinel and reports whether it existed.
+                if await client.delete(key) == 1:
+                    return None
+                return {
+                    "error": (
+                        "Internal API confirmation is missing, expired, or already used. "
+                        "Request a new preview."
+                    )
+                }
             await client.setex(key, _PENDING_CONFIRMATION_TTL_SECONDS, "1")
         except Exception as exc:  # noqa: BLE001
             # Fail closed: never run unverified writes without the Redis gate
             # 故障关闭：Redis 不可用时绝不执行未经验证的写操作
             logger.error("Write confirmation gate unavailable: {}", exc)
-            return _json_output(
-                {
-                    "error": (
-                        "Write confirmation service is unavailable; "
-                        "the operation was NOT executed. Try again later."
-                    ),
-                }
-            )
+            return {
+                "error": (
+                    "Write confirmation service is unavailable; "
+                    "the operation was NOT executed. Try again later."
+                )
+            }
 
         # Build user-readable approval presentation / 构建用户可读确认展示
         from app.ai.internal_ops.approval_presentation import (
@@ -384,25 +433,23 @@ class InternalApiExecutor(BaseToolExecutor):
             query_params=preview.get("query_params"),
         )
 
-        return _json_output(
-            {
-                "requires_confirmation": True,
-                "action": f"{op.method} {op.path}",
-                "operation_id": op.operation_id,
-                "summary": op.summary,
-                "permission": op.permission_code,
-                "preview": preview,
-                "approval_presentation": presentation.to_dict(),
-                "message": (
-                    "This is a write operation and it was NOT executed yet. "
-                    "Present the preview to the user and wait. If the user "
-                    "explicitly approves in a later message, call "
-                    "invoke_internal_operation again with the exact same "
-                    "arguments plus confirmed=true. If the user rejects, do "
-                    "not retry."
-                ),
-            }
-        )
+        return {
+            "requires_confirmation": True,
+            "action": f"{op.method} {op.path}",
+            "operation_id": op.operation_id,
+            "summary": op.summary,
+            "permission": op.permission_code,
+            "preview": preview,
+            "approval_presentation": presentation.to_dict(),
+            "message": (
+                "This is a write operation and it was NOT executed yet. "
+                "Present the preview to the user and wait. If the user "
+                "explicitly approves in a later message, call "
+                "invoke_internal_operation again with the exact same "
+                "arguments plus confirmed=true. If the user rejects, do "
+                "not retry."
+            ),
+        }
 
     async def _perform_http_call(
         self,
@@ -448,7 +495,7 @@ class InternalApiExecutor(BaseToolExecutor):
                 )
 
         token = issue_ai_proxy_token(
-            user_id=int(context.user_id or 0),
+            user_id=normalize_positive_subject_id(context.user_id) or 0,
             user_role=user_role,
             tenant_id=tenant_id,
             agent_id=context.agent_id,
@@ -467,35 +514,57 @@ class InternalApiExecutor(BaseToolExecutor):
         if context.tool_timeout_seconds:
             timeout = max(min(float(context.tool_timeout_seconds) - 1.0, 55.0), 5.0)
 
+        response_content = bytearray()
         async with httpx.AsyncClient(
             base_url=settings.APP_INTERNAL_BASE_URL,
             timeout=timeout,
             follow_redirects=False,
+            trust_env=False,
         ) as client:
             try:
-                response = await client.request(
+                async with client.stream(
                     op.method,
                     resolved_path,
                     params=query_params or None,
                     json=body if op.method in ("POST", "PUT", "PATCH") else None,
                     headers=headers,
-                )
+                ) as response:
+                    response_status = response.status_code
+                    response_encoding = response.encoding or "utf-8"
+                    try:
+                        content_length = int(response.headers.get("content-length", ""))
+                    except ValueError:
+                        content_length = 0
+                    if content_length > _MAX_RESPONSE_BYTES:
+                        return ToolResult.error_result(
+                            tool_call_id,
+                            "Internal API response too large",
+                            name=TOOL_INVOKE_OPERATION,
+                        )
+                    async for chunk in response.aiter_bytes():
+                        if len(response_content) + len(chunk) > _MAX_RESPONSE_BYTES:
+                            return ToolResult.error_result(
+                                tool_call_id,
+                                "Internal API response too large",
+                                name=TOOL_INVOKE_OPERATION,
+                            )
+                        response_content.extend(chunk)
             except httpx.HTTPError as exc:
                 return ToolResult.error_result(
                     tool_call_id,
-                    f"Internal API call failed: {exc}",
+                    f"Internal API call failed: {type(exc).__name__}",
                     name=TOOL_INVOKE_OPERATION,
                 )
 
         try:
-            response_body: Any = response.json()
+            response_body: Any = json.loads(response_content)
         except ValueError:
-            text = response.text or ""
+            text = response_content.decode(response_encoding, errors="replace")
             response_body = text[:_MAX_TEXT_BODY_CHARS]
 
         payload = {
-            "status_code": response.status_code,
-            "ok": 200 <= response.status_code < 300,
+            "status_code": response_status,
+            "ok": 200 <= response_status < 300,
             "operation_id": op.operation_id,
             "body": response_body,
         }
@@ -504,7 +573,7 @@ class InternalApiExecutor(BaseToolExecutor):
             name=TOOL_INVOKE_OPERATION,
             success=True,
             output=_json_output(payload),
-            summary=f"{op.method} {resolved_path} → {response.status_code}",
+            summary=f"{op.method} {resolved_path} → {response_status}",
         )
 
 
