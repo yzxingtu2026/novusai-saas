@@ -7,6 +7,7 @@ from uuid import uuid4
 from sqlalchemy import and_, func, or_, select, text
 
 from app.core.base_repository import BaseRepository
+from app.models.common.notification import Notification
 from app.models.common.notification_delivery import NotificationDelivery
 from app.models.system.admin import Admin
 from app.models.system.task_definition import TaskDefinition
@@ -246,7 +247,7 @@ class NotificationDeliveryClaimRepository:
                 row.attempt,
             )
 
-    async def mark_submitting(self, claim, *, email=None):
+    async def mark_submitting(self, claim, *, email=None) -> int | None:
         async with self.sessions() as db, db.begin():
             await self._bounded(db)
             row = await db.scalar(
@@ -265,11 +266,27 @@ class NotificationDeliveryClaimRepository:
             await NotificationDeliveryRepository(db).delivery_email(
                 row, expected_email=email
             )
+            notification_id = None
+            if claim.channel == "ws" and row.notification_id is not None:
+                notification_id = await db.scalar(
+                    select(Notification.id).where(
+                        Notification.id == row.notification_id,
+                        Notification.recipient_type == claim.recipient_type,
+                        Notification.recipient_id == claim.recipient_id,
+                        Notification.tenant_id == claim.tenant_id,
+                        Notification.template_code == claim.template_code,
+                        Notification.is_deleted.is_(False),
+                    )
+                )
+                if notification_id is None:
+                    raise ValueError("notification_inbox_unavailable")
             now = await db.scalar(select(func.clock_timestamp()))
             row.status = "submitting"
             row.submission_started_at = now
             row.lease_expires_at = now + timedelta(seconds=120)
         # 中文: begin 上下文已成功提交后才允许调用 SMTP。 EN: Permit SMTP only after begin has successfully committed.
+
+        return notification_id
 
     async def finish(self, claim, status, error=None, *, retryable=False):
         async with self.sessions() as db, db.begin():

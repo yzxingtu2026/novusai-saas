@@ -162,7 +162,7 @@ class NotificationDeliveryService:
             template = await planner._get_template(claim.template_code, claim.tenant_id)
             if template is None:
                 raise ValueError("notification_template_unavailable")
-            if task_recipient and "email" not in (template.channels or ()):
+            if claim.channel not in (template.channels or ("ws", "inbox")):
                 raise ValueError("notification_channel_disabled")
             if task_recipient or not payload["force"]:
                 if not task_recipient:
@@ -221,7 +221,7 @@ class NotificationDeliveryService:
         smtp = await self._validate(claim, payload)
         if prepared is not None and smtp != prepared[0]:
             raise ValueError("notification_destination_changed")
-        await self.claims.mark_submitting(claim, email=payload.get("email"))
+        return await self.claims.mark_submitting(claim, email=payload.get("email"))
 
     async def _finish(self, claim, status, error=None, *, retryable=False):
         try:
@@ -326,7 +326,7 @@ class NotificationDeliveryService:
                 )
             from app.services.common.channels import get_channel
 
-            await self._mark_submitting(claim, payload, prepared)
+            notification_id = await self._mark_submitting(claim, payload, prepared)
             submitted = True
             channel = get_channel(claim.channel)
             if channel is None:
@@ -342,6 +342,7 @@ class NotificationDeliveryService:
                 priority=payload["priority"],
                 template_code=claim.template_code,
                 tenant_id=claim.tenant_id,
+                notification_id=notification_id,
                 _worker_write_only=True,
                 _prepared_webhook_url=payload.get("webhook_url"),
             )
@@ -356,6 +357,7 @@ class NotificationDeliveryService:
                 "notification_recipient_changed",
                 "notification_disabled",
                 "notification_template_unavailable",
+                "notification_inbox_unavailable",
                 "notification_preference_disabled",
                 "notification_channel_disabled",
                 "tenant_email_notification_disabled",

@@ -332,6 +332,7 @@ async def test_definite_temporary_rejection_retries_only_when_due_and_max_three(
         "tenant_disabled",
         "preference",
         "template_disabled",
+        "template_channel",
         "foreign_tenant",
     ],
 )
@@ -365,6 +366,12 @@ async def test_current_boundaries_can_only_narrow_delivery(monkeypatch, change):
                 )
             elif change == "template_disabled":
                 await db.execute(update(NotificationTemplate).values(is_enabled=False))
+            elif change == "template_channel":
+                await db.execute(
+                    update(NotificationTemplate)
+                    .where(NotificationTemplate.code == "fixture.notice")
+                    .values(channels=["inbox"])
+                )
             else:
                 await db.execute(
                     update(NotificationDelivery)
@@ -378,7 +385,10 @@ async def test_current_boundaries_can_only_narrow_delivery(monkeypatch, change):
         )
         assert status == ("failed" if change == "foreign_tenant" else "skipped")
         assert submissions == []
-        assert (await delivery_row(fixture, delivery_id)).submission_started_at is None
+        row = await delivery_row(fixture, delivery_id)
+        assert row.submission_started_at is None
+        if change == "template_channel":
+            assert row.last_error == "notification_channel_disabled"
 
 
 async def test_frozen_content_locale_and_force_survive_worker_context_change(
@@ -506,6 +516,137 @@ async def test_external_adapters_are_deferred_and_failure_is_uncertain(
                 calls[0]["_prepared_webhook_url"]
                 == "https://hooks.example.test/fixture"
             )
+
+
+@pytest.fixture
+def capture_websocket_pushes(monkeypatch):
+    from app.services.common.channels import ws_channel
+
+    fake_notification_configuration(monkeypatch)
+    pushes = []
+
+    async def emit(payload, user_id, namespace):
+        pushes.append((payload, user_id, namespace))
+
+    monkeypatch.setattr(ws_channel, "_emit_worker_notification", emit)
+    return pushes
+
+
+@pytest.mark.parametrize("channels", [["ws", "inbox"], ["ws"]])
+async def test_websocket_push_uses_its_own_persisted_inbox_id(
+    capture_websocket_pushes, channels
+):
+    async with notification_database() as fixture:
+        await seed_notification_fixture(fixture, channels=channels)
+        for recipient, tenant in (("admin", None), ("tenant_admin", 77)):
+            options = {
+                "recipient_type": recipient,
+                "tenant_id": tenant,
+                "dedupe_key": "shared-event",
+                "link": "/fixture/detail",
+            }
+            await plan_notification(fixture, **options)
+            await plan_notification(fixture, **options)
+
+        async with fixture.sessions() as db:
+            inbox_ids = {
+                row.recipient_type: row.id
+                for row in (await db.scalars(select(Notification))).all()
+            }
+            ws_deliveries = (
+                await db.scalars(
+                    select(NotificationDelivery)
+                    .where(NotificationDelivery.channel == "ws")
+                    .order_by(NotificationDelivery.id)
+                )
+            ).all()
+
+        assert len(ws_deliveries) == 2
+        assert len(inbox_ids) == (2 if "inbox" in channels else 0)
+        assert {row.recipient_type: row.notification_id for row in ws_deliveries} == {
+            recipient: inbox_ids.get(recipient)
+            for recipient in ("admin", "tenant_admin")
+        }
+        assert capture_websocket_pushes == []
+        worker = NotificationDeliveryService(fixture.sessions)
+        assert await worker.recover() == {"processed": 2, "outcomes": {"sent": 2}}
+        assert await worker.recover() == {"processed": 0, "outcomes": {}}
+        assert [
+            (payload.get("id"), recipient_id, namespace, payload["link"])
+            for payload, recipient_id, namespace in capture_websocket_pushes
+        ] == [
+            (inbox_ids.get("admin"), 42, "/admin", "/fixture/detail"),
+            (inbox_ids.get("tenant_admin"), 42, "/tenant", "/fixture/detail"),
+        ]
+
+
+async def test_websocket_push_skips_a_deleted_linked_inbox_notification(
+    capture_websocket_pushes,
+):
+    from app.services.common.notification_service import NotificationService
+
+    async with notification_database() as fixture:
+        await seed_notification_fixture(fixture, channels=["ws", "inbox"])
+        await plan_notification(fixture)
+        async with fixture.sessions() as db, db.begin():
+            inbox_id = await db.scalar(select(Notification.id))
+            ws_id = await db.scalar(
+                select(NotificationDelivery.id).where(
+                    NotificationDelivery.channel == "ws"
+                )
+            )
+            assert await NotificationService(db).delete_notification(
+                inbox_id, "admin", 42
+            )
+
+        assert await NotificationDeliveryService(fixture.sessions).dispatch(ws_id) == (
+            "skipped"
+        )
+        row = await delivery_row(fixture, ws_id)
+        assert (row.last_error, row.submission_started_at) == (
+            "notification_inbox_unavailable",
+            None,
+        )
+        assert capture_websocket_pushes == []
+
+
+@pytest.mark.parametrize(
+    ("channel", "updated_channels"),
+    [("ws", ["inbox"]), ("webhook", [])],
+)
+async def test_removed_template_channel_stops_forced_delivery(
+    monkeypatch, channel, updated_channels
+):
+    from app.services.common.channels import get_channel
+
+    fake_notification_configuration(monkeypatch)
+    submissions = []
+
+    async def deliver(self, **kwargs):
+        submissions.append(kwargs["template_code"])
+        return True
+
+    monkeypatch.setattr(type(get_channel(channel)), "deliver", deliver)
+    async with notification_database() as fixture:
+        await seed_notification_fixture(fixture, channels=[channel])
+        [delivery_id] = await plan_notification(fixture, force=True)
+        async with fixture.sessions() as db, db.begin():
+            await db.execute(
+                update(NotificationTemplate)
+                .where(NotificationTemplate.code == "fixture.notice")
+                .values(channels=updated_channels)
+            )
+
+        worker = NotificationDeliveryService(fixture.sessions)
+        assert await worker.recover() == {"processed": 1, "outcomes": {"skipped": 1}}
+        row = await delivery_row(fixture, delivery_id)
+        assert (row.status, row.last_error, row.submission_started_at) == (
+            "skipped",
+            "notification_channel_disabled",
+            None,
+        )
+        assert submissions == []
+        assert await worker.claims.due_ids() == []
 
 
 async def test_legacy_payloadless_rows_are_quarantined_without_replay(monkeypatch):

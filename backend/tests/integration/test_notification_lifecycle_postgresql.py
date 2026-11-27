@@ -65,6 +65,7 @@ def fake_smtp(monkeypatch, *, connect=lambda: None, submit=lambda: {}):
         ("tenant", "notification_recipient_scope_mismatch"),
         ("recipient", "notification_recipient_changed"),
         ("template", "notification_template_unavailable"),
+        ("template_channel", "notification_channel_disabled"),
         ("master", "notification_disabled"),
         ("email", "notification_channel_disabled"),
         ("tenant_email", "tenant_email_notification_disabled"),
@@ -110,6 +111,12 @@ async def test_smtp_handshake_rechecks_current_authority(
                         update(NotificationTemplate)
                         .where(NotificationTemplate.code == "fixture.notice")
                         .values(is_enabled=False)
+                    )
+                elif change == "template_channel":
+                    db.execute(
+                        update(NotificationTemplate)
+                        .where(NotificationTemplate.code == "fixture.notice")
+                        .values(channels=["inbox"])
                     )
                 elif change == "lease":
                     db.execute(

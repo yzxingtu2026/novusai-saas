@@ -131,7 +131,9 @@ class NotificationService:
         title, body = self._render_template_content(
             template, data, default_copy=default_copy
         )
-        template_channels = template.channels or ["ws", "inbox"]
+        template_channels = sorted(
+            template.channels or ["ws", "inbox"], key=lambda code: code != "inbox"
+        )
 
         email_body = None
         if (
@@ -174,6 +176,7 @@ class NotificationService:
 
         sent = 0
         for user_type, user_id in recipients:
+            inbox_notification_id = None
             try:
                 await NotificationDeliveryRepository(self.db).recipient_email(
                     user_type, user_id, tenant_id
@@ -271,6 +274,8 @@ class NotificationService:
                     dedupe_key=dedupe_key,
                 )
                 if not should_deliver:
+                    if channel_code == "inbox":
+                        inbox_notification_id = delivery.notification_id
                     continue
                 created_notifications: list[Notification] = []
                 arguments = {
@@ -289,6 +294,8 @@ class NotificationService:
                         prepare_external_delivery,
                     )
 
+                    if channel_code == "ws":
+                        delivery.notification_id = inbox_notification_id
                     delivered = await prepare_external_delivery(
                         self.db,
                         delivery,
@@ -319,6 +326,8 @@ class NotificationService:
                     delivered=delivered,
                     created_notifications=created_notifications,
                 )
+                if channel_code == "inbox":
+                    inbox_notification_id = delivery.notification_id
                 if isinstance(external_created_notifications, list):
                     external_created_notifications.extend(created_notifications)
 
